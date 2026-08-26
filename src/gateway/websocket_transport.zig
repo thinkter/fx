@@ -173,12 +173,13 @@ pub fn stream(
     const reader = http_request.reader.in;
     const connection = http_request.connection orelse return error.WebSocketConnectionMissing;
     const writer = connection.writer();
-    defer {
+    var close_sent = false;
+    defer if (!close_sent) {
         // The watcher bounds this write and forces release if the peer does not
         // cooperate. A fresh Phase 1 socket is never returned to the HTTP pool.
         writeFrame(writer, .close, &.{ 0x03, 0xe8 }) catch {};
         connection.flush() catch {};
-    }
+    };
     writeFrame(writer, .text, request.payload) catch |err| {
         if (timeout_fired.load(.seq_cst)) return error.Timeout;
         return err;
@@ -223,7 +224,11 @@ pub fn stream(
                 const opcode = fragmented_opcode.?;
                 fragmented_opcode = null;
                 if (opcode != .text) return error.WebSocketUnexpectedBinary;
-                if (try dispatchTextMessage(context, on_event, message.items)) return;
+                if (try dispatchTextMessage(context, on_event, message.items)) {
+                    try closeAfterCompletion(alloc, reader, writer, connection);
+                    close_sent = true;
+                    return;
+                }
                 message.clearRetainingCapacity();
             },
             .text => {
@@ -233,7 +238,11 @@ pub fn stream(
                     fragmented_opcode = .text;
                     continue;
                 }
-                if (try dispatchTextMessage(context, on_event, message.items)) return;
+                if (try dispatchTextMessage(context, on_event, message.items)) {
+                    try closeAfterCompletion(alloc, reader, writer, connection);
+                    close_sent = true;
+                    return;
+                }
                 message.clearRetainingCapacity();
             },
         }
@@ -279,6 +288,22 @@ fn appendMessage(message: *std.ArrayList(u8), alloc: Allocator, payload: []const
 fn dispatchTextMessage(context: *anyopaque, on_event: EventHandler, message: []const u8) !bool {
     if (!std.unicode.utf8ValidateSlice(message)) return error.WebSocketInvalidUtf8;
     return on_event(context, message);
+}
+
+fn closeAfterCompletion(
+    alloc: Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    connection: anytype,
+) !void {
+    try writeFrame(writer, .close, &.{ 0x03, 0xe8 });
+    try connection.flush();
+    const frame = try readFrame(alloc, reader);
+    defer alloc.free(frame.payload);
+    switch (frame.opcode) {
+        .close => _ = try validateClosePayload(frame.payload),
+        else => return error.WebSocketProtocolViolation,
+    }
 }
 
 fn closeError(code: ?u16) anyerror {
