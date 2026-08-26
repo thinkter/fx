@@ -260,11 +260,11 @@ This review applies to the Phase 1 implementation. It is not production-ready an
 
 ### Implementation progress
 
-- [x] Frame parsing and UTF-8 validation: regression tests pass in the repository test target. Close-payload validation is implemented; the bounded close handshake remains below.
+- [x] Frame parsing and UTF-8 validation: regression tests pass in the repository test target, including a 127-byte extended frame followed by another frame. Close payloads and malformed text are also validated at the frame boundary.
 - [x] Provider admission, transport-neutral request construction, shared Codex preparation, and shared stream limits: covered by unit assertions in the repository test target.
-- [~] Bounded upgrade, write, and event-idle I/O with cancellation unblocking: bounded upgrade plus a socket-shutdown watcher are implemented; loopback cancellation coverage remains.
-- [~] Bounded close handshake and close-code reporting: client close emission, peer close validation, and policy-close classification are implemented; loopback close-sequence coverage remains.
-- [ ] Loopback WebSocket fixture, reducer-parity, delivery-certainty, and real-binary smoke coverage.
+- [~] Bounded upgrade, write, and event-idle I/O with cancellation unblocking: bounded upgrade plus a socket-shutdown watcher are implemented. A tmux loopback test proves cancellation unblocks an idle frame read; connect- and write-block cancellation remain untested.
+- [~] Bounded close handshake and close-code reporting: normal completion sends and receives a close frame in the loopback smoke test; malformed close payloads are unit-tested, and an early policy close is classified without retry. Cancellation-close sequencing remains untested.
+- [~] Loopback WebSocket fixture and real-binary smoke coverage: `tests/e2e/tui-auth-source-selection.test.ts` runs `./zig-out/bin/fx` against Bun's local WebSocket server for a completion, early policy close, and idle cancellation. Full SSE/WebSocket reducer-parity and delivery-certainty matrix coverage remain.
 - [ ] Authenticated Phase 0 evidence: requires an explicit maintainer-run probe and is not satisfied by automated tests.
 
 ### Release blockers
@@ -328,4 +328,4 @@ This review applies to the Phase 1 implementation. It is not production-ready an
 
 ## Current status
 
-fx has robust Codex HTTPS/SSE request generation and Responses reduction. The uncommitted Phase 1 branch adds a fresh-socket WebSocket experiment behind `FX_CODEX_TRANSPORT=websocket`; SSE remains the default and `auto` maps to SSE. The experiment is blocked from broad use by the required fixes above.
+fx has robust Codex HTTPS/SSE request generation and Responses reduction. Phase 1 adds a fresh-socket WebSocket experiment behind `FX_CODEX_TRANSPORT=websocket`; SSE remains the default and `auto` maps to SSE. The experiment is intentionally blocked from broad use until the remaining coverage and authenticated Phase 0 evidence are complete.
