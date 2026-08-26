@@ -12,6 +12,7 @@ pub const Error = error{
     WebSocketProtocolViolation,
     WebSocketUnexpectedBinary,
     WebSocketMessageTooLarge,
+    WebSocketInvalidUtf8,
     WebSocketClosedBeforeCompletion,
 };
 
@@ -92,9 +93,10 @@ pub fn stream(
 
     // `receiveHead` leaves any already-buffered WebSocket bytes on this reader.
     const reader = http_request.reader.in;
-    const writer = http_request.connection.?.writer();
+    const connection = http_request.connection orelse return error.WebSocketConnectionMissing;
+    const writer = connection.writer();
     try writeFrame(writer, .text, request.payload);
-    try http_request.connection.?.flush();
+    try connection.flush();
 
     var message: std.ArrayList(u8) = .empty;
     defer message.deinit(alloc);
@@ -106,10 +108,13 @@ pub fn stream(
         switch (frame.opcode) {
             .ping => {
                 try writeFrame(writer, .pong, frame.payload);
-                try http_request.connection.?.flush();
+                try connection.flush();
             },
             .pong => {},
-            .close => return error.WebSocketClosedBeforeCompletion,
+            .close => {
+                try validateClosePayload(frame.payload);
+                return error.WebSocketClosedBeforeCompletion;
+            },
             .binary => return error.WebSocketUnexpectedBinary,
             .continuation => {
                 if (fragmented_opcode == null) return error.WebSocketProtocolViolation;
@@ -118,7 +123,7 @@ pub fn stream(
                 const opcode = fragmented_opcode.?;
                 fragmented_opcode = null;
                 if (opcode != .text) return error.WebSocketUnexpectedBinary;
-                if (try on_event(context, message.items)) return;
+                if (try dispatchTextMessage(context, on_event, message.items)) return;
                 message.clearRetainingCapacity();
             },
             .text => {
@@ -128,7 +133,7 @@ pub fn stream(
                     fragmented_opcode = .text;
                     continue;
                 }
-                if (try on_event(context, message.items)) return;
+                if (try dispatchTextMessage(context, on_event, message.items)) return;
                 message.clearRetainingCapacity();
             },
         }
@@ -171,6 +176,21 @@ fn appendMessage(message: *std.ArrayList(u8), alloc: Allocator, payload: []const
     try message.appendSlice(alloc, payload);
 }
 
+fn dispatchTextMessage(context: *anyopaque, on_event: EventHandler, message: []const u8) !bool {
+    if (!std.unicode.utf8ValidateSlice(message)) return error.WebSocketInvalidUtf8;
+    return on_event(context, message);
+}
+
+fn validateClosePayload(payload: []const u8) !void {
+    if (payload.len == 1) return error.WebSocketProtocolViolation;
+    if (payload.len < 2) return;
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    if (code < 1000 or code >= 5000 or code == 1004 or code == 1005 or code == 1006 or code == 1015) {
+        return error.WebSocketProtocolViolation;
+    }
+    if (!std.unicode.utf8ValidateSlice(payload[2..])) return error.WebSocketInvalidUtf8;
+}
+
 fn writeFrame(writer: *std.Io.Writer, opcode: Opcode, payload: []const u8) !void {
     if (payload.len > max_message_bytes) return error.WebSocketMessageTooLarge;
     var mask: [4]u8 = undefined;
@@ -203,8 +223,7 @@ fn readFrame(alloc: Allocator, reader: *std.Io.Reader) !Frame {
     const fin = first & 0x80 != 0;
     const opcode = std.enums.fromInt(Opcode, first & 0x0f) orelse return error.WebSocketProtocolViolation;
     var length: u64 = second & 0x7f;
-    if (length == 126) length = try reader.takeInt(u16, .big);
-    if (length == 127) {
+    if (length == 126) length = try reader.takeInt(u16, .big) else if (length == 127) {
         length = try reader.takeInt(u64, .big);
         if (length & (@as(u64, 1) << 63) != 0) return error.WebSocketProtocolViolation;
     }
@@ -226,4 +245,42 @@ test "fragment aggregation limits message size" {
     defer message.deinit(std.testing.allocator);
     try appendMessage(&message, std.testing.allocator, "hello");
     try std.testing.expectEqualStrings("hello", message.items);
+}
+
+test "extended 127-byte frame keeps the following frame aligned" {
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try encoded.writer.writeAll(&.{ 0x81, 126, 0, 127 });
+    try encoded.writer.splatByteAll('a', 127);
+    try encoded.writer.writeAll(&.{ 0x81, 2, 'o', 'k' });
+
+    var reader = std.Io.Reader.fixed(encoded.written());
+    const first = try readFrame(std.testing.allocator, &reader);
+    defer std.testing.allocator.free(first.payload);
+    try std.testing.expectEqual(Opcode.text, first.opcode);
+    try std.testing.expectEqual(@as(usize, 127), first.payload.len);
+
+    const second = try readFrame(std.testing.allocator, &reader);
+    defer std.testing.allocator.free(second.payload);
+    try std.testing.expectEqual(Opcode.text, second.opcode);
+    try std.testing.expectEqualStrings("ok", second.payload);
+}
+
+test "text messages reject malformed UTF-8 before event dispatch" {
+    const Handler = struct {
+        fn handle(_: *anyopaque, _: []const u8) !bool {
+            return false;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(
+        error.WebSocketInvalidUtf8,
+        dispatchTextMessage(@ptrCast(&context), Handler.handle, &.{ 0xc3, 0x28 }),
+    );
+}
+
+test "close payload rejects reserved codes and malformed UTF-8 reasons" {
+    try std.testing.expectError(error.WebSocketProtocolViolation, validateClosePayload(&.{ 0x03, 0xed }));
+    try std.testing.expectError(error.WebSocketInvalidUtf8, validateClosePayload(&.{ 0x03, 0xe8, 0xc3, 0x28 }));
+    try validateClosePayload(&.{ 0x03, 0xe8, 'o', 'k' });
 }
