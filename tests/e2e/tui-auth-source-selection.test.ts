@@ -837,6 +837,52 @@ function startFakeCodexToolLoop(options: {
   };
 }
 
+function startFakeCodexWebSocket(options: { holdOpen?: boolean; closeOnOpen?: number } = {}) {
+  const requests: string[] = [];
+  const closeCodes: number[] = [];
+  const accessToken = chatgptAccessToken("acct_websocket");
+  const server = Bun.serve<{ opened: boolean }>({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, server) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return Response.json({ models: [
+          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
+        ] });
+      }
+      if (path === "/responses" && server.upgrade(request, { data: { opened: true } })) return;
+      return new Response("not found", { status: 404 });
+    },
+    websocket: {
+      open(ws) {
+        if (options.closeOnOpen !== undefined) ws.close(options.closeOnOpen, "fixture close");
+      },
+      message(ws, message) {
+        const payload = String(message);
+        requests.push(payload);
+        if (options.holdOpen) return;
+        ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "CODEX_WEBSOCKET_OK" }));
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          response: { id: "resp_websocket", status: "completed", usage: { input_tokens: 5, output_tokens: 2 } },
+        }));
+      },
+      close(_ws, code) {
+        closeCodes.push(code);
+      },
+    },
+  });
+  return {
+    accessToken,
+    requests,
+    closeCodes,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    stop() { server.stop(true); },
+  };
+}
+
 function startFakeCodexCapacityLoop() {
   const bodies: string[] = [];
   const accessToken = chatgptAccessToken("acct_capacity_loop");
@@ -2757,6 +2803,133 @@ tmuxTest(
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex WebSocket streams a completion through the freshly built binary",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use the WebSocket transport."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-websocket-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_CODEX_TRANSPORT: "websocket",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("CODEX_WEBSOCKET_OK");
+      expect(codex.requests).toHaveLength(1);
+      expect(codex.requests[0]).toContain('"type":"response.create"');
+      expect(codex.requests[0]).not.toContain('"stream"');
+      expect(codex.closeCodes).toContain(1000);
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex WebSocket policy close is not retried as a transport failure",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-policy-close-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeOnOpen: 1008 });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Reject this request by policy."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-websocket-policy-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_CODEX_TRANSPORT: "websocket",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code).toBe(1);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("WebSocketPolicyClosed");
+      expect(codex.requests).toHaveLength(0);
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket cancellation unblocks an idle response",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-cancel-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ holdOpen: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Wait for a held WebSocket response.");
+      const requestDeadline = Date.now() + TIMEOUT;
+      while (codex.requests.length === 0) {
+        if (Date.now() >= requestDeadline) throw new Error("Codex WebSocket request did not arrive");
+        await Bun.sleep(25);
+      }
+      await session.sendKeys("C-c");
+      await session.waitForComposer(TIMEOUT);
+      expect(session.isAlive()).toBe(true);
+      expect(codex.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
     }
   },
   60_000,
