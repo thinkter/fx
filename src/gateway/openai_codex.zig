@@ -7,6 +7,7 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const websocket_transport = @import("websocket_transport.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
@@ -22,6 +23,16 @@ const max_tool_arguments_bytes: usize = 4 * 1024 * 1024;
 const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
+const transport_env = "FX_CODEX_TRANSPORT";
+
+const Transport = enum { sse, websocket };
+
+fn selectedTransport() !Transport {
+    const value = io_mod.getenv(transport_env) orelse return .sse;
+    if (std.mem.eql(u8, value, "sse") or std.mem.eql(u8, value, "auto")) return .sse;
+    if (std.mem.eql(u8, value, "websocket")) return .websocket;
+    return error.InvalidOpenAICodexTransport;
+}
 
 const CodexLimits = struct {
     aggregate_bytes: usize = max_sse_aggregate_bytes,
@@ -140,7 +151,14 @@ fn streamCompletion(
     try validateModel(request.model);
     const payload = try buildRequest(alloc, request.data());
     defer alloc.free(payload);
-    return streamPrepared(alloc, request, payload) catch |err| {
+    return switch (try selectedTransport()) {
+        .sse => streamPrepared(alloc, request, payload),
+        .websocket => blk: {
+            const websocket_payload = try buildWebSocketRequest(alloc, payload);
+            defer alloc.free(websocket_payload);
+            break :blk streamWebSocketPrepared(alloc, request, websocket_payload);
+        },
+    } catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
         return err;
@@ -321,6 +339,100 @@ pub fn streamPrepared(
     } };
 }
 
+fn buildWebSocketRequest(alloc: Allocator, sse_payload: []const u8) ![]u8 {
+    const stream_fields = ",\"store\":false,\"stream\":true";
+    if (sse_payload.len < 2 or sse_payload[0] != '{') return error.InvalidOpenAICodexWebSocketRequest;
+    const index = std.mem.find(u8, sse_payload, stream_fields) orelse return error.InvalidOpenAICodexWebSocketRequest;
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    errdefer output.deinit();
+    try output.writer.writeAll("{\"type\":\"response.create\",");
+    try output.writer.writeAll(sse_payload[1..index]);
+    try output.writer.writeAll(sse_payload[index + stream_fields.len ..]);
+    return output.toOwnedSlice();
+}
+
+fn streamWebSocketPrepared(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+) !stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
+    defer alloc.free(account_id);
+    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
+    defer secret.zeroAndFree(alloc, auth_header);
+    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
+        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
+        break :endpoint override;
+    } else endpoint;
+
+    var reducer = responses_protocol.Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var bridge = WebSocketBridge{
+        .alloc = alloc,
+        .reducer = &reducer,
+        .events = request.events,
+        .cancel_flag = request.cancel_flag,
+        .content_capture_limit = request.content_capture_limit,
+    };
+    // The WebSocket transport does not replay after this point. Marking before
+    // the upgrade remains conservative if an intermediary accepts then drops it.
+    request.delivery.markPossiblySent();
+    try websocket_transport.stream(alloc, .{
+        .endpoint = request_endpoint,
+        .authorization = auth_header,
+        .account_id = account_id,
+        .session_id = request.session_id,
+        .payload = payload,
+        .cancel_flag = request.cancel_flag,
+    }, &bridge, WebSocketBridge.event);
+    const completion = reducer.finish(alloc, request.cancel_flag, bridge.streamLimits()) catch |err|
+        return mapReducerError(err);
+    return .{ .completed = .{
+        .completion = completion,
+        .usage = .{ .immediate = null },
+        .ownership = .owned,
+    } };
+}
+
+const WebSocketBridge = struct {
+    alloc: Allocator,
+    reducer: *responses_protocol.Reducer,
+    events: stream_provider.EventSink,
+    cancel_flag: *std.atomic.Value(bool),
+    content_capture_limit: ?usize,
+
+    fn streamLimits(self: @This()) responses_protocol.StreamLimits {
+        _ = self;
+        return .{
+            .aggregate_bytes = max_sse_aggregate_bytes,
+            .events = max_sse_events,
+            .tool_calls = max_tool_calls,
+            .tool_identity_bytes = max_tool_identity_bytes,
+            .tool_arguments_bytes = max_tool_arguments_bytes,
+            .provider_state_bytes = max_provider_state_bytes,
+        };
+    }
+
+    fn event(raw: *anyopaque, json_text: []const u8) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.reducer.applyJson(
+            self.alloc,
+            json_text,
+            .{
+                .context = &self.events,
+                .on_content = EventBridge.content,
+                .on_tool_start = EventBridge.toolStart,
+                .on_reasoning = EventBridge.reasoning,
+                .on_tool_input = EventBridge.toolInput,
+            },
+            self.cancel_flag,
+            self.content_capture_limit,
+            self.streamLimits(),
+        ) catch |err| return mapReducerError(err);
+    }
+};
+
 const EventBridge = struct {
     fn sink(raw: *anyopaque) *stream_provider.EventSink {
         return @ptrCast(@alignCast(raw));
@@ -471,6 +583,31 @@ fn mapReducerError(err: anyerror) anyerror {
         error.ResourceLimitExceeded => error.OpenAICodexResourceLimitExceeded,
         else => err,
     };
+}
+
+test "OpenAI Codex WebSocket request uses response create framing" {
+    const sse_payload = "{\"model\":\"gpt-5.4\",\"store\":false,\"stream\":true,\"input\":[]}";
+    const websocket_payload = try buildWebSocketRequest(std.testing.allocator, sse_payload);
+    defer std.testing.allocator.free(websocket_payload);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"response.create\",\"model\":\"gpt-5.4\",\"input\":[]}",
+        websocket_payload,
+    );
+}
+
+test "OpenAI Codex transport policy keeps auto on SSE during Phase 1" {
+    // Environment-dependent selection is covered by integration launch tests.
+    // This assertion records the Phase 1 default when no override is present.
+    if (io_mod.getenv(transport_env) == null) {
+        try std.testing.expectEqual(Transport.sse, try selectedTransport());
+    }
+}
+
+test "OpenAI Codex WebSocket request rejects a non-SSE payload" {
+    try std.testing.expectError(
+        error.InvalidOpenAICodexWebSocketRequest,
+        buildWebSocketRequest(std.testing.allocator, "{\"model\":\"gpt-5.4\"}"),
+    );
 }
 
 test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas" {
