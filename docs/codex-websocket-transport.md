@@ -261,7 +261,7 @@ This review applies to the Phase 1 implementation. It is not production-ready an
 ### Implementation progress
 
 - [x] Frame parsing and UTF-8 validation: regression tests pass in the repository test target. Close-payload validation is implemented; the bounded close handshake remains below.
-- [ ] Provider admission and shared Codex preparation.
+- [x] Provider admission, transport-neutral request construction, shared Codex preparation, and shared stream limits: covered by unit assertions in the repository test target.
 - [ ] Bounded upgrade, write, and event-idle I/O with cancellation unblocking.
 - [ ] Bounded close handshake and close-code reporting.
 - [ ] Loopback WebSocket fixture, reducer-parity, delivery-certainty, and real-binary smoke coverage.
