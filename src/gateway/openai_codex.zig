@@ -43,6 +43,17 @@ const CodexLimits = struct {
     provider_state_bytes: usize = max_provider_state_bytes,
 };
 
+fn codexStreamLimits(limits: CodexLimits) responses_protocol.StreamLimits {
+    return .{
+        .aggregate_bytes = limits.aggregate_bytes,
+        .events = limits.events,
+        .tool_calls = limits.tool_calls,
+        .tool_identity_bytes = limits.tool_identity_bytes,
+        .tool_arguments_bytes = limits.tool_arguments_bytes,
+        .provider_state_bytes = limits.provider_state_bytes,
+    };
+}
+
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
 };
@@ -58,11 +69,47 @@ pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
 ) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeResponseRequestStart(&out.writer, alloc, request, null);
+    try out.writer.writeAll(",\"store\":false,\"stream\":true");
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn buildWebSocketRequest(
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeResponseRequestStart(&out.writer, alloc, request, "response.create");
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+/// Writes the fields shared by SSE and WebSocket Responses envelopes. The
+/// caller owns the opening and closing JSON object delimiters.
+fn writeResponseRequestStart(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    websocket_type: ?[]const u8,
+) !void {
     try validateModel(request.model);
     if (request.budget) |budget| {
         if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
         _ = budget.deadline;
     }
+
+    try writer.writeByte('{');
+    if (websocket_type) |value| {
+        try writer.writeAll("\"type\":");
+        try std.json.Stringify.value(value, .{}, writer);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"model\":");
+    try std.json.Stringify.value(request.model, .{}, writer);
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
@@ -75,12 +122,7 @@ pub fn buildRequest(
     }
     if (instructions.written().len == 0) try instructions.writer.writeAll("You are a helpful assistant.");
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+    try writer.writeAll(",\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
     try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
@@ -115,8 +157,6 @@ pub fn buildRequest(
     }
     // The ChatGPT Codex endpoint chooses the model's output limit and rejects
     // the public Responses API max_output_tokens parameter.
-    try writer.writeByte('}');
-    return out.toOwnedSlice();
 }
 
 fn writeResponsesInput(
@@ -149,20 +189,26 @@ fn streamCompletion(
         return stream_provider.failResult(error.CodexSubscriptionCredentialRequired);
     }
     try validateModel(request.model);
-    const payload = try buildRequest(alloc, request.data());
-    defer alloc.free(payload);
     return switch (try selectedTransport()) {
-        .sse => streamPrepared(alloc, request, payload),
+        .sse => blk: {
+            const payload = try buildRequest(alloc, request.data());
+            defer alloc.free(payload);
+            break :blk streamPrepared(alloc, request, payload);
+        },
         .websocket => blk: {
-            const websocket_payload = try buildWebSocketRequest(alloc, payload);
-            defer alloc.free(websocket_payload);
-            break :blk streamWebSocketPrepared(alloc, request, websocket_payload);
+            const payload = try buildWebSocketRequest(alloc, request.data());
+            defer alloc.free(payload);
+            break :blk streamWebSocketPrepared(alloc, request, payload);
         },
     } catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
         return err;
     };
+}
+
+fn admitCodexTransport(admission: stream_provider.Admission) !void {
+    try admission.admit();
 }
 
 const OpenedRequest = struct {
@@ -207,21 +253,13 @@ pub fn streamPrepared(
     payload: []const u8,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
-    defer alloc.free(account_id);
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
-    defer secret.zeroAndFree(alloc, auth_header);
-    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) {
-            return stream_provider.failResult(error.InvalidE2EOpenAICodexEndpoint);
-        }
-        break :endpoint override;
-    } else endpoint;
-    const uri = try std.Uri.parse(request_endpoint);
+    var prepared = try prepareCodexTransport(alloc, request);
+    defer prepared.deinit(alloc);
+    const uri = try std.Uri.parse(prepared.endpoint);
 
     var extra_headers_buf: [7]std.http.Header = undefined;
     var extra_count: usize = 0;
-    extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
+    extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = prepared.account_id };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
     extra_count += 1;
@@ -241,14 +279,14 @@ pub fn streamPrepared(
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_header,
+        .auth_header = prepared.authorization,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
-    try request.admission.admit();
+    try admitCodexTransport(request.admission);
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,
@@ -339,16 +377,35 @@ pub fn streamPrepared(
     } };
 }
 
-fn buildWebSocketRequest(alloc: Allocator, sse_payload: []const u8) ![]u8 {
-    const stream_fields = ",\"store\":false,\"stream\":true";
-    if (sse_payload.len < 2 or sse_payload[0] != '{') return error.InvalidOpenAICodexWebSocketRequest;
-    const index = std.mem.find(u8, sse_payload, stream_fields) orelse return error.InvalidOpenAICodexWebSocketRequest;
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    errdefer output.deinit();
-    try output.writer.writeAll("{\"type\":\"response.create\",");
-    try output.writer.writeAll(sse_payload[1..index]);
-    try output.writer.writeAll(sse_payload[index + stream_fields.len ..]);
-    return output.toOwnedSlice();
+const PreparedCodexTransport = struct {
+    account_id: []u8,
+    authorization: []u8,
+    endpoint: []const u8,
+
+    fn deinit(self: *PreparedCodexTransport, alloc: Allocator) void {
+        alloc.free(self.account_id);
+        secret.zeroAndFree(alloc, self.authorization);
+        self.* = undefined;
+    }
+};
+
+fn prepareCodexTransport(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+) !PreparedCodexTransport {
+    const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
+    errdefer alloc.free(account_id);
+    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
+    errdefer secret.zeroAndFree(alloc, authorization);
+    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
+        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
+        break :endpoint override;
+    } else endpoint;
+    return .{
+        .account_id = account_id,
+        .authorization = authorization,
+        .endpoint = request_endpoint,
+    };
 }
 
 fn streamWebSocketPrepared(
@@ -357,14 +414,8 @@ fn streamWebSocketPrepared(
     payload: []const u8,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
-    defer alloc.free(account_id);
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
-    defer secret.zeroAndFree(alloc, auth_header);
-    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
-        break :endpoint override;
-    } else endpoint;
+    var prepared = try prepareCodexTransport(alloc, request);
+    defer prepared.deinit(alloc);
 
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
@@ -374,19 +425,21 @@ fn streamWebSocketPrepared(
         .events = request.events,
         .cancel_flag = request.cancel_flag,
         .content_capture_limit = request.content_capture_limit,
+        .stream_limits = codexStreamLimits(.{}),
     };
-    // The WebSocket transport does not replay after this point. Marking before
-    // the upgrade remains conservative if an intermediary accepts then drops it.
+    // Admission is shared with SSE and happens before the upgrade can make
+    // delivery possible. Once frame writing begins, this transport never replays.
+    try admitCodexTransport(request.admission);
     request.delivery.markPossiblySent();
     try websocket_transport.stream(alloc, .{
-        .endpoint = request_endpoint,
-        .authorization = auth_header,
-        .account_id = account_id,
+        .endpoint = prepared.endpoint,
+        .authorization = prepared.authorization,
+        .account_id = prepared.account_id,
         .session_id = request.session_id,
         .payload = payload,
         .cancel_flag = request.cancel_flag,
     }, &bridge, WebSocketBridge.event);
-    const completion = reducer.finish(alloc, request.cancel_flag, bridge.streamLimits()) catch |err|
+    const completion = reducer.finish(alloc, request.cancel_flag, bridge.stream_limits) catch |err|
         return mapReducerError(err);
     return .{ .completed = .{
         .completion = completion,
@@ -401,18 +454,7 @@ const WebSocketBridge = struct {
     events: stream_provider.EventSink,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-
-    fn streamLimits(self: @This()) responses_protocol.StreamLimits {
-        _ = self;
-        return .{
-            .aggregate_bytes = max_sse_aggregate_bytes,
-            .events = max_sse_events,
-            .tool_calls = max_tool_calls,
-            .tool_identity_bytes = max_tool_identity_bytes,
-            .tool_arguments_bytes = max_tool_arguments_bytes,
-            .provider_state_bytes = max_provider_state_bytes,
-        };
-    }
+    stream_limits: responses_protocol.StreamLimits,
 
     fn event(raw: *anyopaque, json_text: []const u8) !bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -428,7 +470,7 @@ const WebSocketBridge = struct {
             },
             self.cancel_flag,
             self.content_capture_limit,
-            self.streamLimits(),
+            self.stream_limits,
         ) catch |err| return mapReducerError(err);
     }
 };
@@ -550,14 +592,7 @@ fn consumeSse(
         .on_reasoning = on_reasoning_chunk,
         .on_tool_input = on_tool_input_chunk,
     };
-    const stream_limits = responses_protocol.StreamLimits{
-        .aggregate_bytes = limits.aggregate_bytes,
-        .events = limits.events,
-        .tool_calls = limits.tool_calls,
-        .tool_identity_bytes = limits.tool_identity_bytes,
-        .tool_arguments_bytes = limits.tool_arguments_bytes,
-        .provider_state_bytes = limits.provider_state_bytes,
-    };
+    const stream_limits = codexStreamLimits(limits);
     while (try sse.next(alloc, reader)) |json_text| {
         defer sse.release();
         if (reducer.applyJson(
@@ -585,14 +620,43 @@ fn mapReducerError(err: anyerror) anyerror {
     };
 }
 
-test "OpenAI Codex WebSocket request uses response create framing" {
-    const sse_payload = "{\"model\":\"gpt-5.4\",\"store\":false,\"stream\":true,\"input\":[]}";
-    const websocket_payload = try buildWebSocketRequest(std.testing.allocator, sse_payload);
+test "OpenAI Codex WebSocket request uses the shared response request fields" {
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "Be concise." },
+        .{ .role = .user, .content = "Read it." },
+    };
+    const request: stream_provider.RequestData = .{
+        .model = "gpt-5.4",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    };
+    const sse_payload = try buildRequest(std.testing.allocator, request);
+    defer std.testing.allocator.free(sse_payload);
+    const websocket_payload = try buildWebSocketRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(websocket_payload);
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"response.create\",\"model\":\"gpt-5.4\",\"input\":[]}",
-        websocket_payload,
-    );
+
+    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"type\":\"response.create\"") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"model\":\"gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"instructions\":\"Be concise.\"") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"stream\"") == null);
+    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"store\"") == null);
+    try std.testing.expect(std.mem.find(u8, sse_payload, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.find(u8, sse_payload, "\"store\":false") != null);
+}
+
+test "OpenAI Codex transport admission invokes the shared admission boundary" {
+    const Capture = struct {
+        called: bool = false,
+
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+        }
+    };
+    var capture: Capture = .{};
+    try admitCodexTransport(.{ .context = &capture, .admit_fn = Capture.admit });
+    try std.testing.expect(capture.called);
 }
 
 test "OpenAI Codex transport policy keeps auto on SSE during Phase 1" {
@@ -601,13 +665,6 @@ test "OpenAI Codex transport policy keeps auto on SSE during Phase 1" {
     if (io_mod.getenv(transport_env) == null) {
         try std.testing.expectEqual(Transport.sse, try selectedTransport());
     }
-}
-
-test "OpenAI Codex WebSocket request rejects a non-SSE payload" {
-    try std.testing.expectError(
-        error.InvalidOpenAICodexWebSocketRequest,
-        buildWebSocketRequest(std.testing.allocator, "{\"model\":\"gpt-5.4\"}"),
-    );
 }
 
 test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas" {
@@ -626,14 +683,17 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
-    const body = try buildRequest(std.testing.allocator, .{
+    const request: stream_provider.RequestData = .{
         .model = "gpt-5.4",
         .messages = &messages,
         .tools = .{ .additional_functions = &.{read_file_schema} },
         .tool_choice = .auto,
         .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .fast = true },
-    });
+    };
+    const body = try buildRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
+    const websocket_body = try buildWebSocketRequest(std.testing.allocator, request);
+    defer std.testing.allocator.free(websocket_body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.4\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Be concise.\"") != null);
@@ -643,6 +703,10 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"type\":\"response.create\"") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"encrypted_content\":\"opaque\"") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
+    try std.testing.expect(std.mem.find(u8, websocket_body, "\"reasoning\":{\"effort\":\"high\"") != null);
 }
 
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
