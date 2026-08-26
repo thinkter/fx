@@ -437,6 +437,7 @@ fn streamWebSocketPrepared(
         .account_id = prepared.account_id,
         .session_id = request.session_id,
         .payload = payload,
+        .deadline = request.deadline,
         .cancel_flag = request.cancel_flag,
     }, &bridge, WebSocketBridge.event);
     const completion = reducer.finish(alloc, request.cancel_flag, bridge.stream_limits) catch |err|

@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
+const gateway_client = @import("client.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -13,10 +14,14 @@ pub const Error = error{
     WebSocketUnexpectedBinary,
     WebSocketMessageTooLarge,
     WebSocketInvalidUtf8,
+    WebSocketPolicyClosed,
     WebSocketClosedBeforeCompletion,
 };
 
 pub const EventHandler = *const fn (context: *anyopaque, json: []const u8) anyerror!bool;
+
+const connect_timeout_ms: i64 = 30_000;
+const event_idle_timeout_ms: i64 = 30_000;
 
 pub const Request = struct {
     endpoint: []const u8,
@@ -24,7 +29,43 @@ pub const Request = struct {
     account_id: []const u8,
     session_id: ?[]const u8,
     payload: []const u8,
+    deadline: ?std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
+};
+
+const OpenedRequest = struct {
+    request: ?std.http.Client.Request,
+
+    pub fn deinit(self: *OpenedRequest, _: Allocator) void {
+        if (self.request) |*request| request.deinit();
+        self.request = null;
+    }
+
+    fn take(self: *OpenedRequest) std.http.Client.Request {
+        const request = self.request.?;
+        self.request = null;
+        return request;
+    }
+};
+
+const OpenWebSocketOperation = struct {
+    client: *std.http.Client,
+    uri: std.Uri,
+    authorization: []const u8,
+    headers: []const std.http.Header,
+
+    pub fn run(self: *@This()) !OpenedRequest {
+        return .{ .request = try self.client.request(.GET, self.uri, .{
+            .headers = .{
+                .authorization = .{ .override = self.authorization },
+                .connection = .{ .override = "Upgrade" },
+                .accept_encoding = .omit,
+            },
+            .extra_headers = self.headers,
+            .keep_alive = false,
+            .redirect_behavior = .unhandled,
+        }) };
+    }
 };
 
 /// Opens one socket, sends one request, and consumes one terminal response.
@@ -66,23 +107,60 @@ pub fn stream(
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    var http_request = try client.request(.GET, uri, .{
-        .headers = .{
-            .authorization = .{ .override = request.authorization },
-            .connection = .{ .override = "Upgrade" },
-            .accept_encoding = .omit,
-        },
-        .extra_headers = extra_headers[0..count],
-        .keep_alive = false,
-        .redirect_behavior = .unhandled,
+    var open_operation = OpenWebSocketOperation{
+        .client = &client,
+        .uri = uri,
+        .authorization = request.authorization,
+        .headers = extra_headers[0..count],
+    };
+    var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(connect_timeout_ms),
     });
+    if (request.deadline) |deadline| {
+        if (std.Io.Clock.Timestamp.compare(deadline, .lt, connect_deadline)) {
+            connect_deadline = deadline;
+        }
+    }
+    var opened = try gateway_client.runBoundedHttpOperation(
+        OpenedRequest,
+        alloc,
+        request.cancel_flag,
+        connect_deadline,
+        &open_operation,
+    );
+    var http_request = opened.take();
     defer {
         // An upgraded connection must never return to the HTTP pool.
         if (http_request.connection) |connection| connection.closing = true;
         http_request.deinit();
     }
-    try http_request.sendBodiless();
-    const response = try http_request.receiveHead(&.{});
+    var watcher_done = std.atomic.Value(bool).init(false);
+    var timeout_fired = std.atomic.Value(bool).init(false);
+    var last_progress_ms = std.atomic.Value(i64).init(io_mod.milliTimestamp());
+    const watcher = if (http_request.connection) |connection|
+        try spawnConnectionWatcher(
+            &watcher_done,
+            request.cancel_flag,
+            request.deadline,
+            &timeout_fired,
+            &last_progress_ms,
+            connection.stream_writer.stream,
+        )
+    else
+        null;
+    defer {
+        watcher_done.store(true, .seq_cst);
+        if (watcher) |thread| thread.join();
+    }
+    http_request.sendBodiless() catch |err| {
+        if (timeout_fired.load(.seq_cst)) return error.Timeout;
+        return err;
+    };
+    const response = http_request.receiveHead(&.{}) catch |err| {
+        if (timeout_fired.load(.seq_cst)) return error.Timeout;
+        return err;
+    };
     if (response.head.status != .switching_protocols) return error.WebSocketUpgradeRejected;
     if (!hasHeader(response.head, "upgrade", "websocket") or
         !hasTokenHeader(response.head, "connection", "upgrade") or
@@ -95,25 +173,47 @@ pub fn stream(
     const reader = http_request.reader.in;
     const connection = http_request.connection orelse return error.WebSocketConnectionMissing;
     const writer = connection.writer();
-    try writeFrame(writer, .text, request.payload);
-    try connection.flush();
+    defer {
+        // The watcher bounds this write and forces release if the peer does not
+        // cooperate. A fresh Phase 1 socket is never returned to the HTTP pool.
+        writeFrame(writer, .close, &.{ 0x03, 0xe8 }) catch {};
+        connection.flush() catch {};
+    }
+    writeFrame(writer, .text, request.payload) catch |err| {
+        if (timeout_fired.load(.seq_cst)) return error.Timeout;
+        return err;
+    };
+    connection.flush() catch |err| {
+        if (timeout_fired.load(.seq_cst)) return error.Timeout;
+        return err;
+    };
+    last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
 
     var message: std.ArrayList(u8) = .empty;
     defer message.deinit(alloc);
     var fragmented_opcode: ?Opcode = null;
     while (true) {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        const frame = try readFrame(alloc, reader);
+        const frame = readFrame(alloc, reader) catch |err| {
+            if (timeout_fired.load(.seq_cst)) return error.Timeout;
+            return err;
+        };
+        last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
         defer alloc.free(frame.payload);
         switch (frame.opcode) {
             .ping => {
-                try writeFrame(writer, .pong, frame.payload);
-                try connection.flush();
+                writeFrame(writer, .pong, frame.payload) catch |err| {
+                    if (timeout_fired.load(.seq_cst)) return error.Timeout;
+                    return err;
+                };
+                connection.flush() catch |err| {
+                    if (timeout_fired.load(.seq_cst)) return error.Timeout;
+                    return err;
+                };
             },
             .pong => {},
             .close => {
-                try validateClosePayload(frame.payload);
-                return error.WebSocketClosedBeforeCompletion;
+                return closeError(try validateClosePayload(frame.payload));
             },
             .binary => return error.WebSocketUnexpectedBinary,
             .continuation => {
@@ -181,14 +281,71 @@ fn dispatchTextMessage(context: *anyopaque, on_event: EventHandler, message: []c
     return on_event(context, message);
 }
 
-fn validateClosePayload(payload: []const u8) !void {
+fn closeError(code: ?u16) anyerror {
+    if (code == 1008) return error.WebSocketPolicyClosed;
+    return error.WebSocketClosedBeforeCompletion;
+}
+
+fn validateClosePayload(payload: []const u8) !?u16 {
     if (payload.len == 1) return error.WebSocketProtocolViolation;
-    if (payload.len < 2) return;
+    if (payload.len < 2) return null;
     const code = std.mem.readInt(u16, payload[0..2], .big);
     if (code < 1000 or code >= 5000 or code == 1004 or code == 1005 or code == 1006 or code == 1015) {
         return error.WebSocketProtocolViolation;
     }
     if (!std.unicode.utf8ValidateSlice(payload[2..])) return error.WebSocketInvalidUtf8;
+    return code;
+}
+
+const ConnectionWatcher = struct {
+    fn run(
+        done: *std.atomic.Value(bool),
+        cancel_flag: *std.atomic.Value(bool),
+        deadline: ?std.Io.Clock.Timestamp,
+        timeout_fired: *std.atomic.Value(bool),
+        last_progress_ms: *std.atomic.Value(i64),
+        socket: std.Io.net.Stream,
+    ) void {
+        while (!done.load(.seq_cst)) {
+            if (cancel_flag.load(.seq_cst)) {
+                socket.shutdown(io_mod.getIo(), .both) catch {};
+                return;
+            }
+            if (deadline) |limit| {
+                const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+                if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) {
+                    timeout_fired.store(true, .seq_cst);
+                    socket.shutdown(io_mod.getIo(), .both) catch {};
+                    return;
+                }
+            }
+            const elapsed_ms = io_mod.milliTimestamp() - last_progress_ms.load(.seq_cst);
+            if (elapsed_ms >= event_idle_timeout_ms) {
+                timeout_fired.store(true, .seq_cst);
+                socket.shutdown(io_mod.getIo(), .both) catch {};
+                return;
+            }
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+};
+
+fn spawnConnectionWatcher(
+    done: *std.atomic.Value(bool),
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+    timeout_fired: *std.atomic.Value(bool),
+    last_progress_ms: *std.atomic.Value(i64),
+    socket: std.Io.net.Stream,
+) !std.Thread {
+    return std.Thread.spawn(.{}, ConnectionWatcher.run, .{
+        done,
+        cancel_flag,
+        deadline,
+        timeout_fired,
+        last_progress_ms,
+        socket,
+    });
 }
 
 fn writeFrame(writer: *std.Io.Writer, opcode: Opcode, payload: []const u8) !void {
@@ -282,5 +439,7 @@ test "text messages reject malformed UTF-8 before event dispatch" {
 test "close payload rejects reserved codes and malformed UTF-8 reasons" {
     try std.testing.expectError(error.WebSocketProtocolViolation, validateClosePayload(&.{ 0x03, 0xed }));
     try std.testing.expectError(error.WebSocketInvalidUtf8, validateClosePayload(&.{ 0x03, 0xe8, 0xc3, 0x28 }));
-    try validateClosePayload(&.{ 0x03, 0xe8, 'o', 'k' });
+    try std.testing.expectEqual(@as(?u16, 1000), try validateClosePayload(&.{ 0x03, 0xe8, 'o', 'k' }));
+    try std.testing.expectEqual(error.WebSocketPolicyClosed, closeError(1008));
+    try std.testing.expectEqual(error.WebSocketClosedBeforeCompletion, closeError(1000));
 }
