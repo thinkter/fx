@@ -428,9 +428,9 @@ fn streamWebSocketPrepared(
         .stream_limits = codexStreamLimits(.{}),
     };
     // Admission is shared with SSE and happens before the upgrade can make
-    // delivery possible. Once frame writing begins, this transport never replays.
+    // delivery possible. The transport marks delivery only immediately before
+    // it begins writing the masked response.create frame.
     try admitCodexTransport(request.admission);
-    request.delivery.markPossiblySent();
     try websocket_transport.stream(alloc, .{
         .endpoint = prepared.endpoint,
         .authorization = prepared.authorization,
@@ -439,12 +439,13 @@ fn streamWebSocketPrepared(
         .payload = payload,
         .deadline = request.deadline,
         .cancel_flag = request.cancel_flag,
+        .delivery = request.delivery,
     }, &bridge, WebSocketBridge.event);
     const completion = reducer.finish(alloc, request.cancel_flag, bridge.stream_limits) catch |err|
         return mapReducerError(err);
     return .{ .completed = .{
         .completion = completion,
-        .usage = .{ .immediate = null },
+        .usage = .{ .unavailable = .possibly_billed },
         .ownership = .owned,
     } };
 }
@@ -943,6 +944,113 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
     try std.testing.expect(completion.provider_state_json != null);
     try std.testing.expect(std.mem.find(u8, completion.provider_state_json.?, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+}
+
+test "OpenAI Codex SSE and WebSocket reducers preserve callback order and completion data" {
+    const raw_events = [_][]const u8{
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}",
+        "{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"thinking\"}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}",
+        "{\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"hello\"}",
+        "{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}",
+        "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}",
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"response_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}",
+    };
+    const Capture = struct {
+        events: std.Io.Writer.Allocating = .init(std.testing.allocator),
+        failed: bool = false,
+
+        fn deinit(self: *@This()) void {
+            self.events.deinit();
+        }
+
+        fn emit(raw: *anyopaque, event: stream_provider.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const writer = &self.events.writer;
+            switch (event) {
+                .content_delta => |value| {
+                    writer.print("content:{s}|", .{value}) catch {
+                        self.failed = true;
+                    };
+                },
+                .reasoning_delta => |value| {
+                    writer.print("reasoning:{s}|", .{value}) catch {
+                        self.failed = true;
+                    };
+                },
+                .tool_started => |tool| {
+                    writer.print("tool:{s}:{s}|", .{ tool.id, tool.name }) catch {
+                        self.failed = true;
+                    };
+                },
+                .tool_input_delta => |value| {
+                    writer.print("input:{s}|", .{value}) catch {
+                        self.failed = true;
+                    };
+                },
+            }
+        }
+    };
+
+    var sse_body: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sse_body.deinit();
+    for (raw_events) |raw_event| try sse_body.writer.print("data: {s}\n\n", .{raw_event});
+    var sse_capture: Capture = .{};
+    defer sse_capture.deinit();
+    var sse_events = stream_provider.EventSink{ .context = &sse_capture, .emit_fn = Capture.emit };
+    var sse_reader: std.Io.Reader = .fixed(sse_body.written());
+    var sse_cancelled = std.atomic.Value(bool).init(false);
+    const sse_completion = try consumeSse(
+        std.testing.allocator,
+        &sse_reader,
+        &sse_events,
+        EventBridge.content,
+        EventBridge.toolStart,
+        EventBridge.reasoning,
+        EventBridge.toolInput,
+        &sse_cancelled,
+        null,
+        .{},
+    );
+    defer freeOpenAICodexTestCompletion(sse_completion);
+
+    var websocket_capture: Capture = .{};
+    defer websocket_capture.deinit();
+    const websocket_events = stream_provider.EventSink{ .context = &websocket_capture, .emit_fn = Capture.emit };
+    var websocket_cancelled = std.atomic.Value(bool).init(false);
+    var websocket_reducer = responses_protocol.Reducer.init(std.testing.allocator);
+    defer websocket_reducer.deinit(std.testing.allocator);
+    var bridge = WebSocketBridge{
+        .alloc = std.testing.allocator,
+        .reducer = &websocket_reducer,
+        .events = websocket_events,
+        .cancel_flag = &websocket_cancelled,
+        .content_capture_limit = null,
+        .stream_limits = codexStreamLimits(.{}),
+    };
+    for (raw_events) |raw_event| {
+        if (try WebSocketBridge.event(&bridge, raw_event)) break;
+    }
+    const websocket_completion = try websocket_reducer.finish(
+        std.testing.allocator,
+        &websocket_cancelled,
+        bridge.stream_limits,
+    );
+    defer freeOpenAICodexTestCompletion(websocket_completion);
+
+    try std.testing.expect(!sse_capture.failed);
+    try std.testing.expect(!websocket_capture.failed);
+    try std.testing.expectEqualStrings(sse_capture.events.written(), websocket_capture.events.written());
+    try std.testing.expectEqualStrings(sse_completion.content.?, websocket_completion.content.?);
+    try std.testing.expectEqualStrings(sse_completion.generation_id.?, websocket_completion.generation_id.?);
+    try std.testing.expectEqualStrings(sse_completion.provider_state_json.?, websocket_completion.provider_state_json.?);
+    try std.testing.expectEqual(sse_completion.usage.input_tokens, websocket_completion.usage.input_tokens);
+    try std.testing.expectEqual(sse_completion.usage.output_tokens, websocket_completion.usage.output_tokens);
+    try std.testing.expectEqual(sse_completion.finish_reason, websocket_completion.finish_reason);
+    try std.testing.expectEqual(@as(usize, 1), websocket_completion.tool_calls.len);
+    try std.testing.expectEqualStrings(sse_completion.tool_calls[0].id, websocket_completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings(sse_completion.tool_calls[0].name, websocket_completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings(sse_completion.tool_calls[0].arguments_json, websocket_completion.tool_calls[0].arguments_json);
 }
 
 fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.ModelCompletion {
