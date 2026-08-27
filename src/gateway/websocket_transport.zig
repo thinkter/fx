@@ -31,8 +31,8 @@ pub const Request = struct {
     payload: []const u8,
     deadline: ?std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
+    delivery: *gateway_client.DeliveryCertainty,
 };
-
 const OpenedRequest = struct {
     request: ?std.http.Client.Request,
 
@@ -174,17 +174,21 @@ pub fn stream(
     const connection = http_request.connection orelse return error.WebSocketConnectionMissing;
     const writer = connection.writer();
     var close_sent = false;
-    defer if (!close_sent) {
-        // The watcher bounds this write and forces release if the peer does not
-        // cooperate. A fresh Phase 1 socket is never returned to the HTTP pool.
+    defer if (!close_sent and !request.cancel_flag.load(.seq_cst)) {
+        // Cancellation force-releases the socket from the watcher. Do not race
+        // that release with a best-effort close frame from this I/O owner.
+        // A fresh Phase 1 socket is never returned to the HTTP pool.
         writeFrame(writer, .close, &.{ 0x03, 0xe8 }) catch {};
         connection.flush() catch {};
     };
+    request.delivery.markPossiblySent();
     writeFrame(writer, .text, request.payload) catch |err| {
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (timeout_fired.load(.seq_cst)) return error.Timeout;
         return err;
     };
     connection.flush() catch |err| {
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (timeout_fired.load(.seq_cst)) return error.Timeout;
         return err;
     };
@@ -467,4 +471,136 @@ test "close payload rejects reserved codes and malformed UTF-8 reasons" {
     try std.testing.expectEqual(@as(?u16, 1000), try validateClosePayload(&.{ 0x03, 0xe8, 'o', 'k' }));
     try std.testing.expectEqual(error.WebSocketPolicyClosed, closeError(1008));
     try std.testing.expectEqual(error.WebSocketClosedBeforeCompletion, closeError(1000));
+}
+
+const StalledWriteFixture = struct {
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    upgraded: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn init() !@This() {
+        var fixture: @This() = .{ .server = undefined };
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        fixture.server = try address.listen(fixture.io(), .{ .reuse_address = true });
+        return fixture;
+    }
+
+    fn io(self: *@This()) std.Io {
+        return self.io_backend.io();
+    }
+
+    fn endpoint(self: *@This(), buffer: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "http://127.0.0.1:{d}/responses", .{self.server.socket.address.getPort()});
+    }
+
+    fn start(self: *@This()) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *@This()) void {
+        self.stopping.store(true, .seq_cst);
+        if (self.thread) |thread| {
+            const listener = std.Io.net.Stream{ .socket = self.server.socket };
+            listener.shutdown(self.io(), .both) catch {};
+            thread.join();
+            self.thread = null;
+        }
+        self.server.deinit(self.io());
+    }
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            if (!self.stopping.load(.seq_cst)) self.failure = err;
+        };
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const zio = self.io();
+        var client_stream = try self.server.accept(zio);
+        defer client_stream.close(zio);
+        if (self.stopping.load(.seq_cst)) return;
+        const receive_buffer: c_int = 1024;
+        std.posix.setsockopt(client_stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&receive_buffer)) catch {};
+
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = client_stream.reader(zio, &socket_buffer);
+        var request: [16 * 1024]u8 = undefined;
+        var request_len: usize = 0;
+        while (request_len < request.len) {
+            request[request_len] = try reader.interface.takeByte();
+            request_len += 1;
+            if (std.mem.endsWith(u8, request[0..request_len], "\r\n\r\n")) break;
+        } else return error.TestRequestTooLarge;
+        const key = headerValue(request[0 .. request_len - 4], "sec-websocket-key") orelse return error.TestMissingWebSocketKey;
+        var accept_buffer: [28]u8 = undefined;
+        const accept = websocketAccept(key, &accept_buffer);
+        var write_buffer: [4096]u8 = undefined;
+        var writer = client_stream.writer(zio, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {s}\r\n\r\n",
+            .{accept},
+        );
+        try writer.interface.flush();
+        self.upgraded.store(true, .seq_cst);
+        while (!self.stopping.load(.seq_cst)) {
+            var sleep_io: std.Io.Threaded = .init_single_threaded;
+            sleep_io.io().sleep(.fromMilliseconds(1), .real) catch {};
+        }
+    }
+};
+
+fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+test "WebSocket cancellation interrupts a backpressured response.create write" {
+    var fixture = try StalledWriteFixture.init();
+    defer fixture.deinit();
+    try fixture.start();
+
+    var endpoint_buffer: [128]u8 = undefined;
+    const payload = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    const Canceller = struct {
+        fn run(server: *StalledWriteFixture, flag: *std.atomic.Value(bool)) void {
+            while (!server.upgraded.load(.seq_cst)) {
+                var sleep_io: std.Io.Threaded = .init_single_threaded;
+                sleep_io.io().sleep(.fromMilliseconds(1), .real) catch {};
+            }
+            flag.store(true, .seq_cst);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{ &fixture, &cancelled });
+    defer canceller.join();
+    const result = stream(std.testing.allocator, .{
+        .endpoint = try fixture.endpoint(&endpoint_buffer),
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = payload,
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&cancelled), struct {
+        fn ignore(_: *anyopaque, _: []const u8) !bool {
+            return false;
+        }
+    }.ignore);
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expectEqual(gateway_client.DeliveryCertainty.State.possibly_sent, delivery.load());
+    if (fixture.failure) |err| return err;
 }
