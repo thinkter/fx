@@ -840,6 +840,7 @@ function startFakeCodexToolLoop(options: {
 function startFakeCodexWebSocket(options: {
   holdOpen?: boolean;
   closeOnOpen?: number;
+  closeAfterMessage?: number;
   stallUpgrade?: boolean;
 } = {}) {
   const requests: string[] = [];
@@ -870,6 +871,10 @@ function startFakeCodexWebSocket(options: {
       message(ws, message) {
         const payload = String(message);
         requests.push(payload);
+        if (options.closeAfterMessage !== undefined) {
+          ws.close(options.closeAfterMessage, "fixture close");
+          return;
+        }
         if (options.holdOpen) return;
         ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "CODEX_WEBSOCKET_OK" }));
         ws.send(JSON.stringify({
@@ -2906,6 +2911,50 @@ test(
   },
   60_000,
 );
+
+test(
+  "Codex WebSocket close after response.create never replays the turn",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-post-send-close-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeAfterMessage: 1011 });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Do not replay this request."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-websocket-post-send-close-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_CODEX_TRANSPORT: "websocket",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code).toBe(1);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("WebSocketClosedBeforeCompletion");
+      expect(codex.requests).toHaveLength(1);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
 
 tmuxTest(
   "Codex WebSocket cancellation unblocks a stalled upgrade",
