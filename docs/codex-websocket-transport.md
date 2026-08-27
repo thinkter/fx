@@ -265,7 +265,7 @@ This review applies to the Phase 1 implementation. It is not production-ready an
 - [~] Bounded upgrade, write, and event-idle I/O with cancellation unblocking: bounded upgrade plus a socket-shutdown watcher are implemented. A tmux loopback test proves cancellation unblocks an idle frame read; connect- and write-block cancellation remain untested.
 - [~] Bounded close handshake and close-code reporting: normal completion sends and receives a close frame in the loopback smoke test; malformed close payloads are unit-tested, and an early policy close is classified without retry. Cancellation-close sequencing remains untested.
 - [~] Loopback WebSocket fixture and real-binary smoke coverage: `tests/e2e/tui-auth-source-selection.test.ts` runs `./zig-out/bin/fx` against Bun's local WebSocket server for a completion, early policy close, and idle cancellation. Full SSE/WebSocket reducer-parity and delivery-certainty matrix coverage remain.
-- [ ] Authenticated Phase 0 evidence: requires an explicit maintainer-run probe and is not satisfied by automated tests.
+- [x] Authenticated Phase 0 evidence: an explicit maintainer probe on 2026-08-27 returned `101`, completed a request, and accepted a same-socket `previous_response_id` continuation. The redacted report recorded only protocol labels, a 1,749 ms handshake, and the `x-models-etag` header name.
 
 ### Release blockers
 
@@ -328,4 +328,4 @@ This review applies to the Phase 1 implementation. It is not production-ready an
 
 ## Current status
 
-fx has robust Codex HTTPS/SSE request generation and Responses reduction. Phase 1 adds a fresh-socket WebSocket experiment behind `FX_CODEX_TRANSPORT=websocket`; SSE remains the default and `auto` maps to SSE. The experiment is intentionally blocked from broad use until the remaining coverage and authenticated Phase 0 evidence are complete.
+fx has robust Codex HTTPS/SSE request generation and Responses reduction. Phase 1 adds a fresh-socket WebSocket experiment behind `FX_CODEX_TRANSPORT=websocket`; SSE remains the default and `auto` maps to SSE. A live authenticated probe confirms the Phase 0 handshake and continuation assumptions, but the experiment remains intentionally blocked from broad use until the remaining local coverage is complete.
