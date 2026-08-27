@@ -837,9 +837,14 @@ function startFakeCodexToolLoop(options: {
   };
 }
 
-function startFakeCodexWebSocket(options: { holdOpen?: boolean; closeOnOpen?: number } = {}) {
+function startFakeCodexWebSocket(options: {
+  holdOpen?: boolean;
+  closeOnOpen?: number;
+  stallUpgrade?: boolean;
+} = {}) {
   const requests: string[] = [];
   const closeCodes: number[] = [];
+  let upgradeRequests = 0;
   const accessToken = chatgptAccessToken("acct_websocket");
   const server = Bun.serve<{ opened: boolean }>({
     hostname: "127.0.0.1",
@@ -851,7 +856,11 @@ function startFakeCodexWebSocket(options: { holdOpen?: boolean; closeOnOpen?: nu
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
         ] });
       }
-      if (path === "/responses" && server.upgrade(request, { data: { opened: true } })) return;
+      if (path === "/responses") {
+        upgradeRequests += 1;
+        if (options.stallUpgrade) return new Promise<Response>(() => {});
+        if (server.upgrade(request, { data: { opened: true } })) return;
+      }
       return new Response("not found", { status: 404 });
     },
     websocket: {
@@ -877,11 +886,13 @@ function startFakeCodexWebSocket(options: { holdOpen?: boolean; closeOnOpen?: nu
     accessToken,
     requests,
     closeCodes,
+    get upgradeRequests() { return upgradeRequests; },
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     stop() { server.stop(true); },
   };
 }
+
 
 function startFakeCodexCapacityLoop() {
   const bodies: string[] = [];
@@ -2887,6 +2898,7 @@ test(
       expect(result.code).toBe(1);
       expect(`${result.stdout}\n${result.stderr}`).toContain("WebSocketPolicyClosed");
       expect(codex.requests).toHaveLength(0);
+      expect(codex.upgradeRequests).toBe(1);
       expect(gateway.requests).toHaveLength(0);
     } finally {
       codex.stop();
@@ -2894,6 +2906,48 @@ test(
   },
   60_000,
 );
+
+tmuxTest(
+  "Codex WebSocket cancellation unblocks a stalled upgrade",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-upgrade-cancel-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ stallUpgrade: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Cancel a stalled WebSocket upgrade.");
+      const upgradeDeadline = Date.now() + TIMEOUT;
+      while (codex.upgradeRequests === 0) {
+        if (Date.now() >= upgradeDeadline) throw new Error("Codex WebSocket upgrade did not arrive");
+        await Bun.sleep(25);
+      }
+      await session.sendKeys("C-c");
+      await session.waitForComposer(TIMEOUT);
+      expect(session.isAlive()).toBe(true);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
 
 tmuxTest(
   "Codex WebSocket cancellation unblocks an idle response",
@@ -2927,6 +2981,7 @@ tmuxTest(
       await session.waitForComposer(TIMEOUT);
       expect(session.isAlive()).toBe(true);
       expect(codex.requests).toHaveLength(1);
+      expect(codex.upgradeRequests).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       codex.stop();
