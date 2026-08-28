@@ -154,10 +154,12 @@ pub fn stream(
         if (watcher) |thread| thread.join();
     }
     http_request.sendBodiless() catch |err| {
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (timeout_fired.load(.seq_cst)) return error.Timeout;
         return err;
     };
     const response = http_request.receiveHead(&.{}) catch |err| {
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (timeout_fired.load(.seq_cst)) return error.Timeout;
         return err;
     };
@@ -200,6 +202,7 @@ pub fn stream(
     while (true) {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         const frame = readFrame(alloc, reader) catch |err| {
+            if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
             if (timeout_fired.load(.seq_cst)) return error.Timeout;
             return err;
         };
@@ -208,10 +211,12 @@ pub fn stream(
         switch (frame.opcode) {
             .ping => {
                 writeFrame(writer, .pong, frame.payload) catch |err| {
+                    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
                     if (timeout_fired.load(.seq_cst)) return error.Timeout;
                     return err;
                 };
                 connection.flush() catch |err| {
+                    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
                     if (timeout_fired.load(.seq_cst)) return error.Timeout;
                     return err;
                 };
@@ -229,7 +234,10 @@ pub fn stream(
                 fragmented_opcode = null;
                 if (opcode != .text) return error.WebSocketUnexpectedBinary;
                 if (try dispatchTextMessage(context, on_event, message.items)) {
-                    try closeAfterCompletion(alloc, reader, writer, connection);
+                    closeAfterCompletion(alloc, reader, writer, connection, request.cancel_flag, &timeout_fired) catch |err| {
+                        if (err == error.Cancelled or err == error.Timeout) close_sent = true;
+                        return err;
+                    };
                     close_sent = true;
                     return;
                 }
@@ -243,7 +251,10 @@ pub fn stream(
                     continue;
                 }
                 if (try dispatchTextMessage(context, on_event, message.items)) {
-                    try closeAfterCompletion(alloc, reader, writer, connection);
+                    closeAfterCompletion(alloc, reader, writer, connection, request.cancel_flag, &timeout_fired) catch |err| {
+                        if (err == error.Cancelled or err == error.Timeout) close_sent = true;
+                        return err;
+                    };
                     close_sent = true;
                     return;
                 }
@@ -299,10 +310,16 @@ fn closeAfterCompletion(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     connection: anytype,
+    cancel_flag: *std.atomic.Value(bool),
+    timeout_fired: *std.atomic.Value(bool),
 ) !void {
     try writeFrame(writer, .close, &.{ 0x03, 0xe8 });
     try connection.flush();
-    const frame = try readFrame(alloc, reader);
+    const frame = readFrame(alloc, reader) catch |err| {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (timeout_fired.load(.seq_cst)) return error.Timeout;
+        return err;
+    };
     defer alloc.free(frame.payload);
     switch (frame.opcode) {
         .close => _ = try validateClosePayload(frame.payload),
@@ -551,6 +568,167 @@ const StalledWriteFixture = struct {
         }
     }
 };
+const LoopbackMode = enum {
+    never_accept,
+    hang_after_upgrade,
+    reset_after_upgrade,
+    complete_then_hang_close,
+    binary_then_close,
+    ping_then_complete,
+    oversized_frame,
+};
+
+const LoopbackWebSocketFixture = struct {
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server,
+    mode: LoopbackMode,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    upgraded: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn init(mode: LoopbackMode) !@This() {
+        var fixture: @This() = .{ .server = undefined, .mode = mode };
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        fixture.server = try address.listen(fixture.io(), .{ .reuse_address = true });
+        return fixture;
+    }
+
+    fn io(self: *@This()) std.Io {
+        return self.io_backend.io();
+    }
+
+    fn endpoint(self: *@This(), buffer: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "http://127.0.0.1:{d}/responses", .{self.server.socket.address.getPort()});
+    }
+
+    fn start(self: *@This()) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *@This()) void {
+        self.stopping.store(true, .seq_cst);
+        if (self.thread) |thread| {
+            const listener = std.Io.net.Stream{ .socket = self.server.socket };
+            listener.shutdown(self.io(), .both) catch {};
+            thread.join();
+            self.thread = null;
+        }
+        self.server.deinit(self.io());
+    }
+
+    fn hold(self: *@This()) void {
+        while (!self.stopping.load(.seq_cst)) {
+            self.io().sleep(.fromMilliseconds(1), .real) catch {};
+        }
+    }
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            if (!self.stopping.load(.seq_cst)) self.failure = err;
+        };
+    }
+
+    fn runFallible(self: *@This()) !void {
+        if (self.mode == .never_accept) return self.hold();
+        const zio = self.io();
+        var client_stream = try self.server.accept(zio);
+        defer client_stream.close(zio);
+        if (self.stopping.load(.seq_cst)) return;
+
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = client_stream.reader(zio, &socket_buffer);
+        var request: [16 * 1024]u8 = undefined;
+        var request_len: usize = 0;
+        while (request_len < request.len) {
+            request[request_len] = try reader.interface.takeByte();
+            request_len += 1;
+            if (std.mem.endsWith(u8, request[0..request_len], "\r\n\r\n")) break;
+        } else return error.TestRequestTooLarge;
+        const key = headerValue(request[0 .. request_len - 4], "sec-websocket-key") orelse return error.TestMissingWebSocketKey;
+        var accept_buffer: [28]u8 = undefined;
+        const accept = websocketAccept(key, &accept_buffer);
+        var write_buffer: [4096]u8 = undefined;
+        var writer = client_stream.writer(zio, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {s}\r\n\r\n",
+            .{accept},
+        );
+        try writer.interface.flush();
+        self.upgraded.store(true, .seq_cst);
+
+        if (self.mode == .reset_after_upgrade) {
+            const reset_on_close: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+            try std.posix.setsockopt(
+                client_stream.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.LINGER,
+                std.mem.asBytes(&reset_on_close),
+            );
+            return;
+        }
+        if (self.mode == .hang_after_upgrade) return self.hold();
+
+        try discardClientFrame(&reader.interface);
+        switch (self.mode) {
+            .complete_then_hang_close => {
+                try writeServerFrame(&writer.interface, .text, "{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}");
+                try writeServerFrame(&writer.interface, .text, "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}");
+                try writer.interface.flush();
+                self.hold();
+            },
+            .binary_then_close => {
+                try writeServerFrame(&writer.interface, .binary, &.{0});
+                try writer.interface.flush();
+            },
+            .ping_then_complete => {
+                try writeServerFrame(&writer.interface, .ping, "hi");
+                try writeServerFrame(&writer.interface, .text, "{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}");
+                try writeServerFrame(&writer.interface, .text, "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}");
+                try writeServerFrame(&writer.interface, .close, &.{ 0x03, 0xe8 });
+                try writer.interface.flush();
+                try discardClientFrame(&reader.interface);
+            },
+            .oversized_frame => {
+                try writer.interface.writeAll(&.{ 0x81, 127 });
+                try writer.interface.writeInt(u64, max_frame_bytes + 1, .big);
+                try writer.interface.flush();
+            },
+            else => unreachable,
+        }
+    }
+};
+
+fn writeServerFrame(writer: *std.Io.Writer, opcode: Opcode, payload: []const u8) !void {
+    try writer.writeByte(0x80 | @as(u8, @intFromEnum(opcode)));
+    if (payload.len < 126) {
+        try writer.writeByte(@intCast(payload.len));
+    } else if (payload.len <= std.math.maxInt(u16)) {
+        try writer.writeByte(126);
+        try writer.writeInt(u16, @intCast(payload.len), .big);
+    } else {
+        try writer.writeByte(127);
+        try writer.writeInt(u64, @intCast(payload.len), .big);
+    }
+    try writer.writeAll(payload);
+}
+
+fn discardClientFrame(reader: *std.Io.Reader) !void {
+    _ = try reader.takeByte();
+    const second = try reader.takeByte();
+    if (second & 0x80 == 0) return error.WebSocketProtocolViolation;
+    var length: u64 = second & 0x7f;
+    if (length == 126) length = try reader.takeInt(u16, .big) else if (length == 127) length = try reader.takeInt(u64, .big);
+    var mask: [4]u8 = undefined;
+    try reader.readSliceAll(&mask);
+    var discarded: [4096]u8 = undefined;
+    var remaining = length;
+    while (remaining > 0) {
+        const chunk_len: usize = @intCast(@min(remaining, discarded.len));
+        try reader.readSliceAll(discarded[0..chunk_len]);
+        remaining -= chunk_len;
+    }
+}
 
 fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
@@ -603,4 +781,235 @@ test "WebSocket cancellation interrupts a backpressured response.create write" {
     try std.testing.expectError(error.Cancelled, result);
     try std.testing.expectEqual(gateway_client.DeliveryCertainty.State.possibly_sent, delivery.load());
     if (fixture.failure) |err| return err;
+}
+
+test "WebSocket cancellation interrupts a stalled connect" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    const Canceller = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{&cancelled});
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = stream(std.testing.allocator, .{
+        .endpoint = "http://192.0.2.1:9/responses",
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = "{}",
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&cancelled), struct {
+        fn ignore(_: *anyopaque, _: []const u8) !bool {
+            return false;
+        }
+    }.ignore);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    canceller.join();
+    if (result) |_| {
+        return error.TestExpectedError;
+    } else |err| {
+        if (err == error.Cancelled) {
+            try std.testing.expect(elapsed_ms < 2_000);
+            try std.testing.expectEqual(gateway_client.DeliveryCertainty.State.definitely_unsent, delivery.load());
+            return;
+        }
+        if (elapsed_ms >= 5) return err;
+    }
+
+    var fixture = try LoopbackWebSocketFixture.init(.never_accept);
+    defer fixture.deinit();
+    try fixture.start();
+    var endpoint_buffer: [128]u8 = undefined;
+    cancelled.store(false, .seq_cst);
+    delivery = gateway_client.DeliveryCertainty.init();
+    const fallback_canceller = try std.Thread.spawn(.{}, Canceller.run, .{&cancelled});
+    const fallback_started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const fallback_result = stream(std.testing.allocator, .{
+        .endpoint = try fixture.endpoint(&endpoint_buffer),
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = "{}",
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&cancelled), struct {
+        fn ignore(_: *anyopaque, _: []const u8) !bool {
+            return false;
+        }
+    }.ignore);
+    const fallback_elapsed_ms = fallback_started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    fallback_canceller.join();
+    try std.testing.expectError(error.Cancelled, fallback_result);
+    try std.testing.expect(fallback_elapsed_ms < 2_000);
+    try std.testing.expectEqual(gateway_client.DeliveryCertainty.State.definitely_unsent, delivery.load());
+    if (fixture.failure) |err| return err;
+}
+
+test "WebSocket cancellation interrupts a hung close handshake" {
+    var fixture = try LoopbackWebSocketFixture.init(.complete_then_hang_close);
+    defer fixture.deinit();
+    try fixture.start();
+    var endpoint_buffer: [128]u8 = undefined;
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    const Canceller = struct {
+        fn run(server: *LoopbackWebSocketFixture, flag: *std.atomic.Value(bool)) void {
+            while (!server.upgraded.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+            io_mod.sleep(50 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{ &fixture, &cancelled });
+    defer canceller.join();
+    const result = stream(std.testing.allocator, .{
+        .endpoint = try fixture.endpoint(&endpoint_buffer),
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = "{}",
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&cancelled), struct {
+        fn completed(_: *anyopaque, json: []const u8) !bool {
+            return std.mem.find(u8, json, "\"response.completed\"") != null;
+        }
+    }.completed);
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expectEqual(gateway_client.DeliveryCertainty.State.possibly_sent, delivery.load());
+    if (fixture.failure) |err| return err;
+}
+
+test "WebSocket peer reset after upgrade leaves delivery possibly sent" {
+    var fixture = try LoopbackWebSocketFixture.init(.reset_after_upgrade);
+    defer fixture.deinit();
+    try fixture.start();
+    var endpoint_buffer: [128]u8 = undefined;
+    const payload = try std.testing.allocator.alloc(u8, 4 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    const result = stream(std.testing.allocator, .{
+        .endpoint = try fixture.endpoint(&endpoint_buffer),
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = payload,
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&cancelled), struct {
+        fn ignore(_: *anyopaque, _: []const u8) !bool {
+            return false;
+        }
+    }.ignore);
+    if (result) |_| return error.TestExpectedError else |err| try std.testing.expect(err != error.Cancelled);
+    try std.testing.expectEqual(gateway_client.DeliveryCertainty.State.possibly_sent, delivery.load());
+    if (fixture.failure) |err| return err;
+}
+
+test "WebSocket rejects unexpected binary frames" {
+    var fixture = try LoopbackWebSocketFixture.init(.binary_then_close);
+    defer fixture.deinit();
+    try fixture.start();
+    var endpoint_buffer: [128]u8 = undefined;
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    const result = stream(std.testing.allocator, .{
+        .endpoint = try fixture.endpoint(&endpoint_buffer),
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = "{}",
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&cancelled), struct {
+        fn ignore(_: *anyopaque, _: []const u8) !bool {
+            return false;
+        }
+    }.ignore);
+    try std.testing.expectError(error.WebSocketUnexpectedBinary, result);
+    try std.testing.expectEqual(gateway_client.DeliveryCertainty.State.possibly_sent, delivery.load());
+    if (fixture.failure) |err| return err;
+}
+
+test "WebSocket answers ping then completes" {
+    var fixture = try LoopbackWebSocketFixture.init(.ping_then_complete);
+    defer fixture.deinit();
+    try fixture.start();
+    var endpoint_buffer: [128]u8 = undefined;
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    var completed = false;
+    try stream(std.testing.allocator, .{
+        .endpoint = try fixture.endpoint(&endpoint_buffer),
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = "{}",
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&completed), struct {
+        fn handle(context: *anyopaque, json: []const u8) !bool {
+            const done: *bool = @ptrCast(@alignCast(context));
+            if (std.mem.find(u8, json, "\"response.completed\"") != null) {
+                done.* = true;
+                return true;
+            }
+            return false;
+        }
+    }.handle);
+    try std.testing.expect(completed);
+    if (fixture.failure) |err| return err;
+}
+
+test "WebSocket rejects inbound frames over max_frame_bytes" {
+    var fixture = try LoopbackWebSocketFixture.init(.oversized_frame);
+    defer fixture.deinit();
+    try fixture.start();
+    var endpoint_buffer: [128]u8 = undefined;
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    const result = stream(std.testing.allocator, .{
+        .endpoint = try fixture.endpoint(&endpoint_buffer),
+        .authorization = "Bearer test",
+        .account_id = "test",
+        .session_id = null,
+        .payload = "{}",
+        .deadline = null,
+        .cancel_flag = &cancelled,
+        .delivery = &delivery,
+    }, @ptrCast(&cancelled), struct {
+        fn ignore(_: *anyopaque, _: []const u8) !bool {
+            return false;
+        }
+    }.ignore);
+    try std.testing.expectError(error.WebSocketMessageTooLarge, result);
+    if (fixture.failure) |err| return err;
+}
+
+test "appendMessage rejects a 64 MiB overflow" {
+    var message: std.ArrayList(u8) = .empty;
+    defer message.deinit(std.testing.allocator);
+    const payload = try std.testing.allocator.alloc(u8, max_message_bytes);
+    defer std.testing.allocator.free(payload);
+    try appendMessage(&message, std.testing.allocator, payload);
+    try std.testing.expectError(error.WebSocketMessageTooLarge, appendMessage(&message, std.testing.allocator, "x"));
+}
+
+test "writeFrame rejects payloads over max_message_bytes" {
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    const payload = try std.testing.allocator.alloc(u8, max_message_bytes + 1);
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectError(error.WebSocketMessageTooLarge, writeFrame(&encoded.writer, .text, payload));
 }
