@@ -9,8 +9,10 @@ const pool_alloc = std.heap.c_allocator;
 pub const health_budget: u8 = 3;
 pub const default_max_connection_age_ms: i64 = 55 * 60 * 1000;
 const default_max_lanes: usize = 4;
+const default_max_slots: usize = 32;
 const max_connection_age_env = "FX_CODEX_WEBSOCKET_MAX_CONNECTION_AGE_MS";
 const max_lanes_env = "FX_CODEX_WEBSOCKET_MAX_LANES";
+const max_slots_env = "FX_CODEX_WEBSOCKET_MAX_SLOTS";
 
 const Slot = struct {
     session_id: []u8,
@@ -22,6 +24,7 @@ const Slot = struct {
     busy: bool,
     health_failures: u8,
     opened_at_ms: i64,
+    last_used_at_ms: i64,
     continuation_response_id: ?[]u8,
     continuation_baseline: ?[]u8,
     continuation_durable_baseline: ?[]u8,
@@ -66,9 +69,10 @@ pub const AcquireArgs = struct {
 };
 
 pub const Checkout = struct {
-    slot: usize,
+    slot: ?usize,
     connection: *websocket_transport.Connection,
     reused: bool,
+    retained: bool,
     handshake_ms: i64,
     health_failures: u8,
 };
@@ -121,16 +125,14 @@ fn maxLanes() !usize {
     return parsed;
 }
 
-fn incompatibleIdentity(slot: *const Slot, args: AcquireArgs) bool {
-    const fingerprint = authorizationFingerprint(args.authorization);
-    return std.mem.eql(u8, slot.session_id, sessionKey(args.session_id)) and
-        (!std.mem.eql(u8, slot.account_id, args.account_id) or
-            !std.mem.eql(u8, slot.model, args.model) or
-            !std.mem.eql(u8, slot.endpoint, args.endpoint) or
-            !std.mem.eql(u8, &slot.authorization_fingerprint, &fingerprint));
+fn maxSlots() !usize {
+    const value = io_mod.getenv(max_slots_env) orelse return default_max_slots;
+    const parsed = std.fmt.parseInt(usize, value, 10) catch return error.InvalidOpenAICodexTransport;
+    if (parsed == 0) return error.InvalidOpenAICodexTransport;
+    return parsed;
 }
 
-fn appendSlot(args: AcquireArgs) !usize {
+fn initSlot(args: AcquireArgs, busy: bool) !Slot {
     const session_id = try pool_alloc.dupe(u8, sessionKey(args.session_id));
     errdefer pool_alloc.free(session_id);
     const account_id = try pool_alloc.dupe(u8, args.account_id);
@@ -139,22 +141,27 @@ fn appendSlot(args: AcquireArgs) !usize {
     errdefer pool_alloc.free(model);
     const endpoint = try pool_alloc.dupe(u8, args.endpoint);
     errdefer pool_alloc.free(endpoint);
-    try slots.append(pool_alloc, .{
+    return .{
         .session_id = session_id,
         .account_id = account_id,
         .model = model,
         .endpoint = endpoint,
         .authorization_fingerprint = authorizationFingerprint(args.authorization),
         .connection = null,
-        .busy = false,
+        .busy = busy,
         .health_failures = 0,
         .opened_at_ms = 0,
+        .last_used_at_ms = io_mod.milliTimestamp(),
         .continuation_response_id = null,
         .continuation_baseline = null,
         .continuation_durable_baseline = null,
         .continuation_shape = undefined,
         .continuation_valid = false,
-    });
+    };
+}
+
+fn appendSlot(args: AcquireArgs, busy: bool) !usize {
+    try slots.append(pool_alloc, try initSlot(args, busy));
     return slots.items.len - 1;
 }
 
@@ -198,120 +205,189 @@ fn selectIdleLane(slot_items: []Slot, args: AcquireArgs) LaneSelection {
 const LaneChoice = union(enum) {
     existing: usize,
     append,
-    wait,
+    temporary,
 };
 
 fn chooseLane(slot_items: []Slot, args: AcquireArgs, lane_limit: usize) LaneChoice {
     const selection = selectIdleLane(slot_items, args);
     if (selection.index) |index| return .{ .existing = index };
     if (selection.matching_count < lane_limit) return .append;
-    return .wait;
+    return .temporary;
 }
 
 fn incrementFailure(slot: *Slot) void {
     slot.health_failures = std.math.add(u8, slot.health_failures, 1) catch std.math.maxInt(u8);
 }
 
-pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
-    while (true) {
-        if (args.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (args.deadline) |deadline| {
-            const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-            if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) return error.Timeout;
+fn leastRecentlyUsedIdle(slot_items: []Slot) ?usize {
+    var selected: ?usize = null;
+    for (slot_items, 0..) |*slot, index| {
+        if (slot.busy) continue;
+        if (selected == null or slot.last_used_at_ms < slot_items[selected.?].last_used_at_ms) {
+            selected = index;
         }
-        pool_mutex.lockUncancelable(io_mod.getIo());
-        var locked = true;
-        errdefer if (locked) pool_mutex.unlock(io_mod.getIo());
-        for (slots.items) |*existing| {
-            if (!incompatibleIdentity(existing, args) or existing.busy) continue;
-            if (existing.connection) |connection| websocket_transport.close(connection, pool_alloc);
-            existing.connection = null;
-            existing.clearContinuation();
-        }
-        // Responses on one WebSocket are exclusive and ordered. Preserve a
-        // compatible continuation lane when it is idle; otherwise another
-        // retained socket provides bounded parallelism without multiplexing
-        // unrelated response events on the same wire.
-        const index = switch (chooseLane(slots.items, args, try maxLanes())) {
-            .existing => |existing| existing,
-            .append => try appendSlot(args),
-            .wait => {
-                pool_mutex.unlock(io_mod.getIo());
-                locked = false;
-                io_mod.sleep(10 * std.time.ns_per_ms);
-                continue;
-            },
-        };
-        const slot = &slots.items[index];
+    }
+    return selected;
+}
 
-        const age_limit = try maxConnectionAgeMs();
-        if (slot.connection != null and slot.health_failures >= health_budget) {
-            websocket_transport.close(slot.connection.?, pool_alloc);
-            slot.connection = null;
-            slot.clearContinuation();
-        }
-        if (slot.connection != null and age_limit != 0 and io_mod.milliTimestamp() - slot.opened_at_ms > age_limit) {
-            websocket_transport.close(slot.connection.?, pool_alloc);
-            slot.connection = null;
-            slot.clearContinuation();
-        }
-        if (slot.connection) |connection| {
-            const ping_result = websocket_transport.ping(connection, args.cancel_flag, args.deadline, args.delivery);
-            if (ping_result) |_| {
-                slot.busy = true;
-                const checkout = Checkout{
-                    .slot = index,
-                    .connection = connection,
-                    .reused = true,
-                    .handshake_ms = 0,
-                    .health_failures = slot.health_failures,
-                };
-                pool_mutex.unlock(io_mod.getIo());
-                return checkout;
-            } else |err| {
-                websocket_transport.close(connection, pool_alloc);
+fn incompatibleIdle(slot_items: []Slot, args: AcquireArgs) ?usize {
+    for (slot_items, 0..) |*slot, index| {
+        if (slot.busy or matches(slot, args)) continue;
+        if (std.mem.eql(u8, slot.session_id, sessionKey(args.session_id))) return index;
+    }
+    return null;
+}
+
+fn replaceSlot(index: usize, args: AcquireArgs) !?*websocket_transport.Connection {
+    const replacement = try initSlot(args, true);
+    const displaced = slots.items[index].connection;
+    slots.items[index].connection = null;
+    slots.items[index].deinit();
+    slots.items[index] = replacement;
+    return displaced;
+}
+
+pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
+    if (args.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (args.deadline) |deadline| {
+        const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) return error.Timeout;
+    }
+
+    const lane_limit = try maxLanes();
+    const slot_limit = try maxSlots();
+    const age_limit = try maxConnectionAgeMs();
+    var index: ?usize = null;
+    var retained = true;
+    var reusable: ?*websocket_transport.Connection = null;
+    var displaced: ?*websocket_transport.Connection = null;
+    var prior_health: u8 = 0;
+
+    pool_mutex.lockUncancelable(io_mod.getIo());
+    switch (chooseLane(slots.items, args, lane_limit)) {
+        .existing => |existing| {
+            index = existing;
+            const slot = &slots.items[existing];
+            slot.busy = true;
+            prior_health = slot.health_failures;
+            const expired = age_limit != 0 and
+                io_mod.milliTimestamp() - slot.opened_at_ms > age_limit;
+            if (slot.connection != null and slot.health_failures < health_budget and !expired) {
+                reusable = slot.connection;
+            } else {
+                displaced = slot.connection;
                 slot.connection = null;
                 slot.clearContinuation();
-                incrementFailure(slot);
-                if (err == error.Cancelled) return err;
             }
-        }
+        },
+        .append => {
+            if (incompatibleIdle(slots.items, args)) |victim| {
+                index = victim;
+                displaced = replaceSlot(victim, args) catch |err| {
+                    pool_mutex.unlock(io_mod.getIo());
+                    return err;
+                };
+            } else if (slots.items.len < slot_limit) {
+                index = appendSlot(args, true) catch |err| {
+                    pool_mutex.unlock(io_mod.getIo());
+                    return err;
+                };
+            } else if (leastRecentlyUsedIdle(slots.items)) |victim| {
+                index = victim;
+                displaced = replaceSlot(victim, args) catch |err| {
+                    pool_mutex.unlock(io_mod.getIo());
+                    return err;
+                };
+            } else {
+                retained = false;
+            }
+        },
+        .temporary => retained = false,
+    }
+    pool_mutex.unlock(io_mod.getIo());
 
-        const started_at_ms = io_mod.milliTimestamp();
-        const connection = websocket_transport.connect(pool_alloc, .{
-            .endpoint = args.endpoint,
-            .authorization = args.authorization,
-            .account_id = args.account_id,
-            .session_id = args.session_id,
-            .deadline = args.deadline,
-            .cancel_flag = args.cancel_flag,
-            .delivery = args.delivery,
-        }) catch |err| return err;
+    // Socket close, health checks, and connection establishment are all
+    // deliberately outside the global pool mutex.
+    if (displaced) |connection| websocket_transport.close(connection, pool_alloc);
+    if (reusable) |connection| {
+        websocket_transport.ping(connection, args.cancel_flag, args.deadline, args.delivery) catch |err| {
+            websocket_transport.close(connection, pool_alloc);
+            pool_mutex.lockUncancelable(io_mod.getIo());
+            if (index) |slot_index| {
+                const slot = &slots.items[slot_index];
+                if (slot.connection == connection) slot.connection = null;
+                slot.clearContinuation();
+                incrementFailure(slot);
+                prior_health = slot.health_failures;
+            }
+            pool_mutex.unlock(io_mod.getIo());
+            if (err == error.Cancelled) {
+                rollbackReservation(index);
+                return err;
+            }
+            reusable = null;
+        };
+        if (reusable != null) {
+            return .{
+                .slot = index,
+                .connection = connection,
+                .reused = true,
+                .retained = retained,
+                .handshake_ms = 0,
+                .health_failures = prior_health,
+            };
+        }
+    }
+
+    const started_at_ms = io_mod.milliTimestamp();
+    const connection = websocket_transport.connect(pool_alloc, .{
+        .endpoint = args.endpoint,
+        .authorization = args.authorization,
+        .account_id = args.account_id,
+        .session_id = args.session_id,
+        .deadline = args.deadline,
+        .cancel_flag = args.cancel_flag,
+        .delivery = args.delivery,
+    }) catch |err| {
+        rollbackReservation(index);
+        return err;
+    };
+    if (index) |slot_index| {
+        pool_mutex.lockUncancelable(io_mod.getIo());
+        const slot = &slots.items[slot_index];
         slot.connection = connection;
         slot.clearContinuation();
         slot.opened_at_ms = connection.opened_at_ms;
-        slot.busy = true;
-        const checkout = Checkout{
-            .slot = index,
-            .connection = connection,
-            .reused = false,
-            .handshake_ms = @max(io_mod.milliTimestamp() - started_at_ms, 0),
-            .health_failures = slot.health_failures,
-        };
+        slot.last_used_at_ms = io_mod.milliTimestamp();
         pool_mutex.unlock(io_mod.getIo());
-        return checkout;
     }
+    return .{
+        .slot = index,
+        .connection = connection,
+        .reused = false,
+        .retained = retained,
+        .handshake_ms = @max(io_mod.milliTimestamp() - started_at_ms, 0),
+        .health_failures = prior_health,
+    };
+}
+
+fn rollbackReservation(index: ?usize) void {
+    const slot_index = index orelse return;
+    pool_mutex.lockUncancelable(io_mod.getIo());
+    if (slot_index < slots.items.len) slots.items[slot_index].busy = false;
+    pool_mutex.unlock(io_mod.getIo());
 }
 
 pub fn continuation(
-    index: usize,
+    index: ?usize,
     full_input: []const u8,
     shape: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) ?Continuation {
+    const slot_index = index orelse return null;
     pool_mutex.lockUncancelable(io_mod.getIo());
     defer pool_mutex.unlock(io_mod.getIo());
-    if (index >= slots.items.len) return null;
-    const slot = &slots.items[index];
+    if (slot_index >= slots.items.len) return null;
+    const slot = &slots.items[slot_index];
     if (!slot.busy or !slot.continuation_valid) return null;
     if (!std.mem.eql(u8, &slot.continuation_shape, &shape)) {
         slot.clearContinuation();
@@ -336,16 +412,17 @@ pub fn continuation(
 }
 
 pub fn recordCompletion(
-    index: usize,
+    index: ?usize,
     response_id: []const u8,
     baseline: []const u8,
     durable_baseline: []const u8,
     shape: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) void {
+    const slot_index = index orelse return;
     pool_mutex.lockUncancelable(io_mod.getIo());
     defer pool_mutex.unlock(io_mod.getIo());
-    if (index >= slots.items.len) return;
-    const slot = &slots.items[index];
+    if (slot_index >= slots.items.len) return;
+    const slot = &slots.items[slot_index];
     slot.clearContinuation();
     const owned_id = pool_alloc.dupe(u8, response_id) catch return;
     const owned_baseline = pool_alloc.dupe(u8, baseline) catch {
@@ -364,29 +441,42 @@ pub fn recordCompletion(
     slot.continuation_valid = true;
 }
 
-pub fn release(index: usize, outcome: Outcome) void {
+pub fn release(checkout: Checkout, outcome: Outcome) void {
+    const index = checkout.slot orelse {
+        websocket_transport.close(checkout.connection, pool_alloc);
+        return;
+    };
+    var discarded: ?*websocket_transport.Connection = null;
     pool_mutex.lockUncancelable(io_mod.getIo());
-    defer pool_mutex.unlock(io_mod.getIo());
-    if (index >= slots.items.len) return;
+    if (index >= slots.items.len) {
+        pool_mutex.unlock(io_mod.getIo());
+        websocket_transport.close(checkout.connection, pool_alloc);
+        return;
+    }
     const slot = &slots.items[index];
     slot.busy = false;
+    slot.last_used_at_ms = io_mod.milliTimestamp();
     switch (outcome) {
         .completed => slot.health_failures = 0,
         .failed => {
             incrementFailure(slot);
-            if (slot.connection) |connection| websocket_transport.close(connection, pool_alloc);
+            discarded = slot.connection;
             slot.connection = null;
             slot.clearContinuation();
         },
     }
+    pool_mutex.unlock(io_mod.getIo());
+    if (discarded) |connection| websocket_transport.close(connection, pool_alloc);
 }
 
 pub fn shutdown() void {
     pool_mutex.lockUncancelable(io_mod.getIo());
-    defer pool_mutex.unlock(io_mod.getIo());
-    for (slots.items) |*slot| slot.deinit();
-    slots.deinit(pool_alloc);
+    const retired = slots;
     slots = .empty;
+    pool_mutex.unlock(io_mod.getIo());
+    var owned = retired;
+    for (owned.items) |*slot| slot.deinit();
+    owned.deinit(pool_alloc);
 }
 
 test "retained Codex WebSocket identity includes authorization without storing it" {
@@ -400,6 +490,7 @@ test "retained Codex WebSocket identity includes authorization without storing i
         .busy = false,
         .health_failures = 0,
         .opened_at_ms = 0,
+        .last_used_at_ms = 0,
         .continuation_response_id = null,
         .continuation_baseline = null,
         .continuation_durable_baseline = null,
@@ -418,17 +509,14 @@ test "retained Codex WebSocket identity includes authorization without storing i
     };
 
     try std.testing.expect(matches(&slot, base));
-    try std.testing.expect(!incompatibleIdentity(&slot, base));
 
     var rotated = base;
     rotated.authorization = "Bearer token-b";
     try std.testing.expect(!matches(&slot, rotated));
-    try std.testing.expect(incompatibleIdentity(&slot, rotated));
 
     var changed_model = base;
     changed_model.model = "gpt-5.4";
     try std.testing.expect(!matches(&slot, changed_model));
-    try std.testing.expect(incompatibleIdentity(&slot, changed_model));
 }
 
 test "Codex WebSocket continuation requires an exact item boundary prefix" {
@@ -468,9 +556,9 @@ test "Codex WebSocket lane selection preserves continuation affinity" {
         .continuation_shape = shape,
     };
 
-    const first = try appendSlot(args);
+    const first = try appendSlot(args, false);
     slots.items[first].busy = true;
-    const second = try appendSlot(args);
+    const second = try appendSlot(args, false);
     slots.items[second].busy = true;
     recordCompletion(second, "response-2", "{\"type\":\"message\"}", "{\"type\":\"message\"}", shape);
     slots.items[second].busy = false;
@@ -479,6 +567,67 @@ test "Codex WebSocket lane selection preserves continuation affinity" {
     try std.testing.expectEqual(second, selection.existing);
 
     slots.items[second].busy = true;
-    try std.testing.expect(chooseLane(slots.items, args, 2) == .wait);
+    try std.testing.expect(chooseLane(slots.items, args, 2) == .temporary);
     try std.testing.expect(chooseLane(slots.items, args, 3) == .append);
+}
+
+test "Codex WebSocket global slot eviction selects the least recently used idle lane" {
+    shutdown();
+    defer shutdown();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    const args = AcquireArgs{
+        .session_id = "session-a",
+        .account_id = "account-a",
+        .model = "gpt-5.6-sol",
+        .endpoint = "http://127.0.0.1/responses",
+        .authorization = "Bearer token-a",
+        .deadline = null,
+        .cancel_flag = &cancel_flag,
+        .delivery = &delivery,
+    };
+    _ = try appendSlot(args, false);
+    _ = try appendSlot(args, false);
+    _ = try appendSlot(args, false);
+    slots.items[0].last_used_at_ms = 30;
+    slots.items[1].last_used_at_ms = 10;
+    slots.items[2].last_used_at_ms = 20;
+    slots.items[1].busy = true;
+
+    try std.testing.expectEqual(@as(?usize, 2), leastRecentlyUsedIdle(slots.items));
+    try std.testing.expectEqual(@as(usize, 3), slots.items.len);
+}
+
+test "Codex WebSocket slot storage remains bounded under identity churn" {
+    shutdown();
+    defer shutdown();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    var session_buffer: [32]u8 = undefined;
+    var args = AcquireArgs{
+        .session_id = "",
+        .account_id = "account-a",
+        .model = "gpt-5.6-sol",
+        .endpoint = "http://127.0.0.1/responses",
+        .authorization = "Bearer token-a",
+        .deadline = null,
+        .cancel_flag = &cancel_flag,
+        .delivery = &delivery,
+    };
+    const limit: usize = 3;
+    for (0..64) |identity| {
+        args.session_id = try std.fmt.bufPrint(&session_buffer, "session-{d}", .{identity});
+        if (slots.items.len < limit) {
+            _ = try appendSlot(args, false);
+        } else {
+            const victim = leastRecentlyUsedIdle(slots.items).?;
+            _ = try replaceSlot(victim, args);
+            slots.items[victim].busy = false;
+            slots.items[victim].last_used_at_ms = @intCast(identity);
+        }
+        try std.testing.expect(slots.items.len <= limit);
+    }
+    try std.testing.expectEqual(limit, slots.items.len);
 }

@@ -848,16 +848,19 @@ function startFakeCodexWebSocket(options: {
   rejectPreviousOnce?: boolean;
   toolRoundTrip?: boolean;
   reasoningState?: boolean;
+  rejectUpgradeWithSse?: boolean;
 } = {}) {
   const requests: string[] = [];
   const closeCodes: number[] = [];
   let upgradeRequests = 0;
+  let sseRequests = 0;
+  let httpResponseRequests = 0;
   let rejectedPrevious = false;
   const accessToken = chatgptAccessToken("acct_websocket");
   const server = Bun.serve<{ opened: boolean }>({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(request, server) {
+    async fetch(request, server) {
       const path = new URL(request.url).pathname;
       if (path === "/models") {
         return Response.json({ models: [
@@ -865,9 +868,31 @@ function startFakeCodexWebSocket(options: {
         ] });
       }
       if (path === "/responses") {
-        upgradeRequests += 1;
-        if (options.stallUpgrade) return new Promise<Response>(() => {});
-        if (server.upgrade(request, { data: { opened: true } })) return;
+        if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+          upgradeRequests += 1;
+          if (options.rejectUpgradeWithSse) return new Response("upgrade unavailable", { status: 426 });
+          if (options.stallUpgrade) return new Promise<Response>(() => {});
+          if (server.upgrade(request, { data: { opened: true } })) return;
+        } else {
+          httpResponseRequests += 1;
+          if (options.rejectUpgradeWithSse) {
+            requests.push(await request.text());
+            sseRequests += 1;
+            const completed = {
+              type: "response.completed",
+              response: {
+                id: `resp_sse_${sseRequests}`,
+                status: "completed",
+                usage: { input_tokens: 5, output_tokens: 2 },
+              },
+            };
+            return new Response(
+              `data: ${JSON.stringify({ type: "response.output_text.delta", delta: `CODEX_SSE_FALLBACK_${sseRequests}` })}\n\n` +
+                `data: ${JSON.stringify(completed)}\n\n`,
+              { headers: { "content-type": "text/event-stream" } },
+            );
+          }
+        }
       }
       return new Response("not found", { status: 404 });
     },
@@ -951,6 +976,8 @@ function startFakeCodexWebSocket(options: {
     requests,
     closeCodes,
     get upgradeRequests() { return upgradeRequests; },
+    get sseRequests() { return sseRequests; },
+    get httpResponseRequests() { return httpResponseRequests; },
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     stop() { server.stop(true); },
@@ -3050,6 +3077,7 @@ test(
       expect(`${result.stdout}\n${result.stderr}`).toContain("WebSocketClosedBeforeCompletion");
       expect(codex.requests).toHaveLength(1);
       expect(codex.upgradeRequests).toBe(1);
+      expect(codex.httpResponseRequests).toBe(0);
       expect(gateway.requests).toHaveLength(0);
     } finally {
       codex.stop();
@@ -3183,6 +3211,43 @@ tmuxTest(
       expect(codex.requests[1]).not.toContain("Complete the first retained-socket turn.");
       expect(codex.requests[1]).not.toContain("CODEX_WEBSOCKET_OK_1");
       expect(codex.requests[1]).toContain('"previous_response_id":"resp_websocket_1"');
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket handshake failure falls back once and latches SSE",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-fallback-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ rejectUpgradeWithSse: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Fall back after the rejected WebSocket upgrade.");
+      await session.waitForText("CODEX_SSE_FALLBACK_1", TIMEOUT);
+      await session.sendText("Keep using SSE after the fallback latch is armed.");
+      await session.waitForText("CODEX_SSE_FALLBACK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.sseRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       codex.stop();
