@@ -137,18 +137,16 @@ Implement a fresh socket per model request, with no retained connection or cache
 
 ### Phase 2: retained socket, full context per turn
 
-After Phase 1 has stable production evidence:
+- [x] Retain one idle native WebSocket per session ID, account, model, and endpoint. A slot serializes one stream at a time and pings before reuse.
+- [x] Send a complete `response.create` body for every turn. Phase 2 does not send `previous_response_id` or retain continuation state.
+- [x] Keep `FX_CODEX_TRANSPORT=websocket` opt-in only. SSE remains the default, `auto` remains SSE, and no SSE fallback occurs from the required WebSocket path.
+- [x] Poison and close sockets after cancellation, timeout, protocol or binary-frame failures, writes, policy close, unhealthy ping, identity changes, and age eviction.
+- [x] Evict idle connections at 55 minutes by default, with `FX_CODEX_WEBSOCKET_MAX_CONNECTION_AGE_MS=0` disabling age eviction.
+- [x] Reset the health budget only after a completed response, never after an upgrade alone.
 
-- Retain at most one idle connection per active fx session, provider, account identity, and compatible model.
-- Serialize one full request at a time over it.
-- Preconnect only as an optimization. Never send prompt data during preconnect.
-- Discard and recreate the connection after a close, protocol error, cancellation during a stream, timeout, failed write, authentication transition, or model incompatibility.
-- Continue sending full context after reconnect.
-- Proactively reconnect before a confirmed connection-age limit, with enough margin that the limit cannot interrupt an in-flight turn.
-- Reset a connection-health or fallback budget only after confirmed `response.completed`, not merely after a successful handshake.
-- Segment telemetry by authentication mode from the start.
+Connect and event-idle timeouts default to 30 seconds and may be overridden with `FX_CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS` and `FX_CODEX_WEBSOCKET_EVENT_IDLE_TIMEOUT_MS`. Values must be positive integer milliseconds.
 
-Connect and event-idle timeouts must be configurable and measured per platform. Do not assume Linux and macOS behavior predicts Windows behavior.
+Local Phase 2 verification exercises the freshly built binary against a loopback WebSocket service. It covers two full-context turns on one socket, absence of `previous_response_id`, pre-delivery reconnect after a peer close, poisoning and recovery after an in-flight failure, maximum-age eviction, policy and post-delivery close handling, and cancellation during upgrade and idle reads. The retained identity includes a SHA-256 fingerprint of the authorization value so credential rotation invalidates a socket without retaining the credential itself.
 
 ### Phase 3: incremental continuation
 
@@ -262,9 +260,9 @@ This review applies to the Phase 1 implementation. It is not production-ready an
 
 - [x] Frame parsing and UTF-8 validation: regression tests pass in the repository test target, including a 127-byte extended frame followed by another frame. Close payloads and malformed text are also validated at the frame boundary.
 - [x] Provider admission, transport-neutral request construction, shared Codex preparation, and shared stream limits: covered by unit assertions in the repository test target.
-- [~] Bounded upgrade, write, and event-idle I/O with cancellation unblocking: bounded upgrade plus a socket-shutdown watcher are implemented. Tmux loopback tests prove cancellation unblocks both a stalled upgrade and an idle frame read; connect- and write-block cancellation remain untested.
-- [~] Bounded close handshake and close-code reporting: normal completion sends and receives a close frame in the loopback smoke test; malformed close payloads are unit-tested, and an early policy close is classified without retry. Cancellation-close sequencing remains untested.
-- [~] Loopback WebSocket fixture and real-binary smoke coverage: `tests/e2e/tui-auth-source-selection.test.ts` runs `./zig-out/bin/fx` against Bun's local WebSocket server for a completion, early policy close, stalled-upgrade cancellation, and idle cancellation. It proves policy-close and post-send cancellation each create exactly one connection, so they cannot silently replay a turn. Delivery certainty remains definitely unsent until immediately before the masked `response.create` frame write. A unit test proves the SSE and WebSocket reducers preserve callback order and completion data for the same Responses event sequence. Full delivery-certainty matrix coverage remains.
+- [x] Bounded upgrade, write, and event-idle I/O with cancellation unblocking: unit and tmux loopback tests cover stalled connect, backpressured write, stalled upgrade, idle frame read, and a hung close handshake.
+- [x] Bounded close handshake and close-code reporting: malformed close payloads are unit-tested, an early policy close is classified without retry, and shutdown uses independent bounded teardown state rather than retaining pointers into a completed turn.
+- [x] Loopback WebSocket fixture and real-binary smoke coverage: `tests/e2e/tui-auth-source-selection.test.ts` runs `./zig-out/bin/fx` against Bun's local WebSocket server for completion, close failures, retained reuse, reconnect, poisoning recovery, age eviction, and cancellation. Delivery certainty remains definitely unsent until immediately before the masked `response.create` frame write. A unit test proves the SSE and WebSocket reducers preserve callback order and completion data for the same Responses event sequence.
 - [x] Authenticated Phase 0 evidence: an explicit maintainer probe on 2026-08-27 returned `101`, completed a request, and accepted a same-socket `previous_response_id` continuation. The redacted report recorded only protocol labels, a 1,749 ms handshake, and the `x-models-etag` header name.
 
 ### Release blockers
@@ -328,4 +326,4 @@ This review applies to the Phase 1 implementation. It is not production-ready an
 
 ## Current status
 
-fx has robust Codex HTTPS/SSE request generation and Responses reduction. Phase 1 adds a fresh-socket WebSocket experiment behind `FX_CODEX_TRANSPORT=websocket`; SSE remains the default and `auto` maps to SSE. A live authenticated probe confirms the Phase 0 handshake and continuation assumptions, but the experiment remains intentionally blocked from broad use until the remaining local coverage is complete.
+fx has robust Codex HTTPS/SSE request generation and Responses reduction. Phase 1 adds a fresh-socket WebSocket experiment behind `FX_CODEX_TRANSPORT=websocket`; SSE remains the default and `auto` maps to SSE. Phase 2 retains a healthy socket for later turns in the same process while continuing to send full request context. It has no continuation protocol, no `previous_response_id`, and no WebSocket-to-SSE fallback. Local Phase 2 verification is green; exact-commit Full CI remains the release-readiness authority.

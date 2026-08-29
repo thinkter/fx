@@ -841,6 +841,8 @@ function startFakeCodexWebSocket(options: {
   holdOpen?: boolean;
   closeOnOpen?: number;
   closeAfterMessage?: number;
+  closeAfterFirstMessage?: number;
+  closeAfterCompletion?: boolean;
   toolThenClose?: boolean;
   stallUpgrade?: boolean;
 } = {}) {
@@ -890,12 +892,17 @@ function startFakeCodexWebSocket(options: {
           ws.close(options.closeAfterMessage, "fixture close");
           return;
         }
+        if (options.closeAfterFirstMessage !== undefined && requests.length === 1) {
+          ws.close(options.closeAfterFirstMessage, "fixture first-message close");
+          return;
+        }
         if (options.holdOpen) return;
-        ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "CODEX_WEBSOCKET_OK" }));
+        ws.send(JSON.stringify({ type: "response.output_text.delta", delta: `CODEX_WEBSOCKET_OK_${requests.length}` }));
         ws.send(JSON.stringify({
           type: "response.completed",
           response: { id: "resp_websocket", status: "completed", usage: { input_tokens: 5, output_tokens: 2 } },
         }));
+        if (options.closeAfterCompletion) ws.close(1000, "fixture completed");
       },
       close(_ws, code) {
         closeCodes.push(code);
@@ -2875,7 +2882,6 @@ test(
       expect(codex.requests).toHaveLength(1);
       expect(codex.requests[0]).toContain('"type":"response.create"');
       expect(codex.requests[0]).not.toContain('"stream"');
-      expect(codex.closeCodes).toContain(1000);
       expect(gateway.requests).toHaveLength(0);
     } finally {
       codex.stop();
@@ -3007,6 +3013,166 @@ test(
       expect(codex.requests).toHaveLength(1);
       expect(codex.upgradeRequests).toBe(1);
       expect(gateway.requests).toHaveLength(0);
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket reuses one socket for sequential interactive turns",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-reuse-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Complete the first retained-socket turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.sendText("Complete the second retained-socket turn.");
+      const secondDeadline = Date.now() + TIMEOUT;
+      while (codex.requests.length < 2) {
+        if (Date.now() >= secondDeadline) throw new Error("Second Codex WebSocket request did not arrive");
+        await Bun.sleep(25);
+      }
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests.every((request) => request.includes('"type":"response.create"'))).toBe(true);
+      expect(codex.requests[1]).toContain("Complete the first retained-socket turn.");
+      expect(codex.requests[1]).toContain("Complete the second retained-socket turn.");
+      expect(codex.requests[1]).toContain("CODEX_WEBSOCKET_OK_1");
+      expect(codex.requests[1]).not.toContain("previous_response_id");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket reconnects before delivery when the retained socket closes",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-reconnect-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeAfterCompletion: true });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Complete before the retained socket closes.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await session.sendText("Reconnect without replaying either turn.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests[1]).toContain("Complete before the retained socket closes.");
+      expect(codex.requests[1]).toContain("Reconnect without replaying either turn.");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket poisons a failed stream and recovers on the next turn",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-poison-recovery-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({ closeAfterFirstMessage: 1011 });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Fail this retained-socket turn once.");
+      await session.waitForText("WebSocketClosedBeforeCompletion", TIMEOUT);
+      await session.sendText("Recover on a fresh socket.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(codex.requests[0]).toContain("Fail this retained-socket turn once.");
+      expect(codex.requests[1]).toContain("Recover on a fresh socket.");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Codex WebSocket evicts a retained socket after its configured maximum age",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-age-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_CODEX_WEBSOCKET_MAX_CONNECTION_AGE_MS: "1",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Complete on the initial short-lived socket.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_1", TIMEOUT);
+      await Bun.sleep(20);
+      await session.sendText("Complete after connection-age eviction.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      expect(codex.upgradeRequests).toBe(2);
+      expect(codex.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       codex.stop();
     }

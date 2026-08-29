@@ -8,6 +8,8 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const websocket_transport = @import("websocket_transport.zig");
+const codex_websocket_session = @import("codex_websocket_session.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
@@ -57,6 +59,10 @@ fn codexStreamLimits(limits: CodexLimits) responses_protocol.StreamLimits {
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
 };
+
+pub fn shutdownWebSockets() void {
+    codex_websocket_session.shutdown();
+}
 
 fn validateModel(model: []const u8) !void {
     if (model.len == 0 or model.len > 1024) return error.InvalidOpenAICodexModel;
@@ -427,27 +433,69 @@ fn streamWebSocketPrepared(
         .content_capture_limit = request.content_capture_limit,
         .stream_limits = codexStreamLimits(.{}),
     };
-    // Admission is shared with SSE and happens before the upgrade can make
-    // delivery possible. The transport marks delivery only immediately before
-    // it begins writing the masked response.create frame.
     try admitCodexTransport(request.admission);
-    try websocket_transport.stream(alloc, .{
-        .endpoint = prepared.endpoint,
-        .authorization = prepared.authorization,
-        .account_id = prepared.account_id,
-        .session_id = request.session_id,
-        .payload = payload,
-        .deadline = request.deadline,
-        .cancel_flag = request.cancel_flag,
-        .delivery = request.delivery,
-    }, &bridge, WebSocketBridge.event);
-    const completion = reducer.finish(alloc, request.cancel_flag, bridge.stream_limits) catch |err|
-        return mapReducerError(err);
-    return .{ .completed = .{
-        .completion = completion,
-        .usage = .{ .unavailable = .possibly_billed },
-        .ownership = .owned,
-    } };
+
+    var acquisition_attempt: u8 = 0;
+    while (true) {
+        const checkout = codex_websocket_session.acquire(alloc, .{
+            .session_id = request.session_id,
+            .account_id = prepared.account_id,
+            .model = request.model,
+            .endpoint = prepared.endpoint,
+            .authorization = prepared.authorization,
+            .deadline = request.deadline,
+            .cancel_flag = request.cancel_flag,
+            .delivery = request.delivery,
+        }) catch |err| {
+            if (acquisition_attempt == 0 and request.delivery.load() == .definitely_unsent) {
+                acquisition_attempt += 1;
+                continue;
+            }
+            return err;
+        };
+        debug_trace.eventf("codex.ws", "turn", request.trace_ctx, "reused={d} handshake_ms={d} health={d} auth=chatgpt_subscription", .{
+            @as(u8, @intFromBool(checkout.reused)),
+            checkout.handshake_ms,
+            checkout.health_failures,
+        });
+        websocket_transport.streamOn(checkout.connection, alloc, .{
+            .endpoint = prepared.endpoint,
+            .authorization = prepared.authorization,
+            .account_id = prepared.account_id,
+            .session_id = request.session_id,
+            .payload = payload,
+            .deadline = request.deadline,
+            .cancel_flag = request.cancel_flag,
+            .delivery = request.delivery,
+        }, &bridge, WebSocketBridge.event) catch |err| {
+            codex_websocket_session.release(checkout.slot, .failed);
+            debug_trace.eventf("codex.ws", "poison", request.trace_ctx, "reason={s} close={d}", .{ websocketFailureReason(err), @as(u16, 0) });
+            return err;
+        };
+        const completion = reducer.finish(alloc, request.cancel_flag, bridge.stream_limits) catch |err| {
+            codex_websocket_session.release(checkout.slot, .failed);
+            debug_trace.eventf("codex.ws", "poison", request.trace_ctx, "reason={s} close={d}", .{ "protocol", @as(u16, 0) });
+            return mapReducerError(err);
+        };
+        codex_websocket_session.release(checkout.slot, .completed);
+        return .{ .completed = .{
+            .completion = completion,
+            .usage = .{ .unavailable = .possibly_billed },
+            .ownership = .owned,
+        } };
+    }
+}
+
+fn websocketFailureReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Cancelled => "cancel",
+        error.Timeout => "timeout",
+        error.WebSocketPolicyClosed => "policy",
+        error.WebSocketUnexpectedBinary => "binary",
+        error.WebSocketProtocolViolation, error.WebSocketInvalidUtf8 => "protocol",
+        error.WebSocketUpgradeRejected, error.WebSocketAcceptInvalid => "auth",
+        else => "close",
+    };
 }
 
 const WebSocketBridge = struct {
