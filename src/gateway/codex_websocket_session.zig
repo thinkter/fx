@@ -20,9 +20,25 @@ const Slot = struct {
     busy: bool,
     health_failures: u8,
     opened_at_ms: i64,
+    continuation_response_id: ?[]u8,
+    continuation_baseline: ?[]u8,
+    continuation_durable_baseline: ?[]u8,
+    continuation_shape: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    continuation_valid: bool,
+
+    fn clearContinuation(self: *Slot) void {
+        if (self.continuation_response_id) |value| pool_alloc.free(value);
+        if (self.continuation_baseline) |value| pool_alloc.free(value);
+        if (self.continuation_durable_baseline) |value| pool_alloc.free(value);
+        self.continuation_response_id = null;
+        self.continuation_baseline = null;
+        self.continuation_durable_baseline = null;
+        self.continuation_valid = false;
+    }
 
     fn deinit(self: *Slot) void {
         if (self.connection) |connection| websocket_transport.close(connection, pool_alloc);
+        self.clearContinuation();
         pool_alloc.free(self.session_id);
         pool_alloc.free(self.account_id);
         pool_alloc.free(self.model);
@@ -52,6 +68,18 @@ pub const Checkout = struct {
     handshake_ms: i64,
     health_failures: u8,
 };
+
+pub const Continuation = struct {
+    previous_response_id: []const u8,
+    delta_input: []const u8,
+};
+
+fn continuationDelta(full_input: []const u8, baseline: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, full_input, baseline)) return null;
+    if (full_input.len == baseline.len) return "";
+    if (full_input[baseline.len] != ',') return null;
+    return full_input[baseline.len + 1 ..];
+}
 
 pub const Outcome = enum { completed, failed };
 
@@ -110,6 +138,11 @@ fn appendSlot(args: AcquireArgs) !usize {
         .busy = false,
         .health_failures = 0,
         .opened_at_ms = 0,
+        .continuation_response_id = null,
+        .continuation_baseline = null,
+        .continuation_durable_baseline = null,
+        .continuation_shape = undefined,
+        .continuation_valid = false,
     });
     return slots.items.len - 1;
 }
@@ -133,6 +166,7 @@ pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
             if (!incompatibleIdentity(existing, args) or existing.busy) continue;
             if (existing.connection) |connection| websocket_transport.close(connection, pool_alloc);
             existing.connection = null;
+            existing.clearContinuation();
         }
         const index = findSlot(args) orelse try appendSlot(args);
         const slot = &slots.items[index];
@@ -147,10 +181,12 @@ pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
         if (slot.connection != null and slot.health_failures >= health_budget) {
             websocket_transport.close(slot.connection.?, pool_alloc);
             slot.connection = null;
+            slot.clearContinuation();
         }
         if (slot.connection != null and age_limit != 0 and io_mod.milliTimestamp() - slot.opened_at_ms > age_limit) {
             websocket_transport.close(slot.connection.?, pool_alloc);
             slot.connection = null;
+            slot.clearContinuation();
         }
         if (slot.connection) |connection| {
             const ping_result = websocket_transport.ping(connection, args.cancel_flag, args.deadline, args.delivery);
@@ -168,6 +204,7 @@ pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
             } else |err| {
                 websocket_transport.close(connection, pool_alloc);
                 slot.connection = null;
+                slot.clearContinuation();
                 incrementFailure(slot);
                 if (err == error.Cancelled) return err;
             }
@@ -184,6 +221,7 @@ pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
             .delivery = args.delivery,
         }) catch |err| return err;
         slot.connection = connection;
+        slot.clearContinuation();
         slot.opened_at_ms = connection.opened_at_ms;
         slot.busy = true;
         const checkout = Checkout{
@@ -198,6 +236,67 @@ pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
     }
 }
 
+pub fn continuation(
+    index: usize,
+    full_input: []const u8,
+    shape: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) ?Continuation {
+    pool_mutex.lockUncancelable(io_mod.getIo());
+    defer pool_mutex.unlock(io_mod.getIo());
+    if (index >= slots.items.len) return null;
+    const slot = &slots.items[index];
+    if (!slot.busy or !slot.continuation_valid) return null;
+    if (!std.mem.eql(u8, &slot.continuation_shape, &shape)) {
+        slot.clearContinuation();
+        return null;
+    }
+    const response_id = slot.continuation_response_id orelse return null;
+    const baseline = slot.continuation_baseline orelse return null;
+    const delta = continuationDelta(full_input, baseline) orelse durable: {
+        const durable_baseline = slot.continuation_durable_baseline orelse {
+            slot.clearContinuation();
+            return null;
+        };
+        break :durable continuationDelta(full_input, durable_baseline) orelse {
+            slot.clearContinuation();
+            return null;
+        };
+    };
+    return .{
+        .previous_response_id = response_id,
+        .delta_input = delta,
+    };
+}
+
+pub fn recordCompletion(
+    index: usize,
+    response_id: []const u8,
+    baseline: []const u8,
+    durable_baseline: []const u8,
+    shape: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) void {
+    pool_mutex.lockUncancelable(io_mod.getIo());
+    defer pool_mutex.unlock(io_mod.getIo());
+    if (index >= slots.items.len) return;
+    const slot = &slots.items[index];
+    slot.clearContinuation();
+    const owned_id = pool_alloc.dupe(u8, response_id) catch return;
+    const owned_baseline = pool_alloc.dupe(u8, baseline) catch {
+        pool_alloc.free(owned_id);
+        return;
+    };
+    const owned_durable_baseline = pool_alloc.dupe(u8, durable_baseline) catch {
+        pool_alloc.free(owned_id);
+        pool_alloc.free(owned_baseline);
+        return;
+    };
+    slot.continuation_response_id = owned_id;
+    slot.continuation_baseline = owned_baseline;
+    slot.continuation_durable_baseline = owned_durable_baseline;
+    slot.continuation_shape = shape;
+    slot.continuation_valid = true;
+}
+
 pub fn release(index: usize, outcome: Outcome) void {
     pool_mutex.lockUncancelable(io_mod.getIo());
     defer pool_mutex.unlock(io_mod.getIo());
@@ -210,6 +309,7 @@ pub fn release(index: usize, outcome: Outcome) void {
             incrementFailure(slot);
             if (slot.connection) |connection| websocket_transport.close(connection, pool_alloc);
             slot.connection = null;
+            slot.clearContinuation();
         },
     }
 }
@@ -233,6 +333,11 @@ test "retained Codex WebSocket identity includes authorization without storing i
         .busy = false,
         .health_failures = 0,
         .opened_at_ms = 0,
+        .continuation_response_id = null,
+        .continuation_baseline = null,
+        .continuation_durable_baseline = null,
+        .continuation_shape = undefined,
+        .continuation_valid = false,
     };
     const base = AcquireArgs{
         .session_id = "session-a",
@@ -257,4 +362,20 @@ test "retained Codex WebSocket identity includes authorization without storing i
     changed_model.model = "gpt-5.4";
     try std.testing.expect(!matches(&slot, changed_model));
     try std.testing.expect(incompatibleIdentity(&slot, changed_model));
+}
+
+test "Codex WebSocket continuation requires an exact item boundary prefix" {
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"user\",\"content\":[]}",
+        continuationDelta(
+            "{\"type\":\"message\"},{\"role\":\"user\",\"content\":[]}",
+            "{\"type\":\"message\"}",
+        ).?,
+    );
+    try std.testing.expectEqualStrings(
+        "",
+        continuationDelta("{\"type\":\"message\"}", "{\"type\":\"message\"}").?,
+    );
+    try std.testing.expect(continuationDelta("{\"type\":\"message\"}suffix", "{\"type\":\"message\"}") == null);
+    try std.testing.expect(continuationDelta("{\"type\":\"other\"}", "{\"type\":\"message\"}") == null);
 }
