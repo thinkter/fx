@@ -514,6 +514,8 @@ fn streamWebSocketPrepared(
             .deadline = request.deadline,
             .cancel_flag = request.cancel_flag,
             .delivery = request.delivery,
+            .continuation_input = if (continuation_recovery_attempted) null else full_input,
+            .continuation_shape = if (continuation_recovery_attempted) null else shape,
         }) catch |err| {
             if (acquisition_attempt == 0 and request.delivery.load() == .definitely_unsent) {
                 acquisition_attempt += 1;
@@ -521,7 +523,8 @@ fn streamWebSocketPrepared(
             }
             return err;
         };
-        debug_trace.eventf("codex.ws", "turn", request.trace_ctx, "reused={d} handshake_ms={d} health={d} auth=chatgpt_subscription", .{
+        debug_trace.eventf("codex.ws", "turn", request.trace_ctx, "lane={d} reused={d} handshake_ms={d} health={d} auth=chatgpt_subscription", .{
+            checkout.slot,
             @as(u8, @intFromBool(checkout.reused)),
             checkout.handshake_ms,
             checkout.health_failures,
