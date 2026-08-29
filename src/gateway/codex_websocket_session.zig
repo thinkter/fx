@@ -8,7 +8,9 @@ const pool_alloc = std.heap.c_allocator;
 
 pub const health_budget: u8 = 3;
 pub const default_max_connection_age_ms: i64 = 55 * 60 * 1000;
+const default_max_lanes: usize = 4;
 const max_connection_age_env = "FX_CODEX_WEBSOCKET_MAX_CONNECTION_AGE_MS";
+const max_lanes_env = "FX_CODEX_WEBSOCKET_MAX_LANES";
 
 const Slot = struct {
     session_id: []u8,
@@ -59,6 +61,8 @@ pub const AcquireArgs = struct {
     deadline: ?std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
     delivery: *gateway_client.DeliveryCertainty,
+    continuation_input: ?[]const u8 = null,
+    continuation_shape: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
 };
 
 pub const Checkout = struct {
@@ -110,6 +114,13 @@ fn maxConnectionAgeMs() !i64 {
     return parsed;
 }
 
+fn maxLanes() !usize {
+    const value = io_mod.getenv(max_lanes_env) orelse return default_max_lanes;
+    const parsed = std.fmt.parseInt(usize, value, 10) catch return error.InvalidOpenAICodexTransport;
+    if (parsed == 0) return error.InvalidOpenAICodexTransport;
+    return parsed;
+}
+
 fn incompatibleIdentity(slot: *const Slot, args: AcquireArgs) bool {
     const fingerprint = authorizationFingerprint(args.authorization);
     return std.mem.eql(u8, slot.session_id, sessionKey(args.session_id)) and
@@ -147,9 +158,41 @@ fn appendSlot(args: AcquireArgs) !usize {
     return slots.items.len - 1;
 }
 
-fn findSlot(args: AcquireArgs) ?usize {
-    for (slots.items, 0..) |*slot, index| if (matches(slot, args)) return index;
-    return null;
+fn continuationMatches(slot: *const Slot, full_input: []const u8, shape: [std.crypto.hash.sha2.Sha256.digest_length]u8) bool {
+    if (!slot.continuation_valid or !std.mem.eql(u8, &slot.continuation_shape, &shape)) return false;
+    if (slot.continuation_baseline) |baseline| {
+        if (continuationDelta(full_input, baseline) != null) return true;
+    }
+    if (slot.continuation_durable_baseline) |baseline| {
+        if (continuationDelta(full_input, baseline) != null) return true;
+    }
+    return false;
+}
+
+const LaneSelection = struct {
+    index: ?usize,
+    matching_count: usize,
+};
+
+fn selectIdleLane(args: AcquireArgs) LaneSelection {
+    var first_idle: ?usize = null;
+    var continuation_idle: ?usize = null;
+    var matching_count: usize = 0;
+    for (slots.items, 0..) |*slot, index| {
+        if (!matches(slot, args)) continue;
+        matching_count += 1;
+        if (slot.busy) continue;
+        if (first_idle == null) first_idle = index;
+        if (args.continuation_input) |full_input| {
+            if (args.continuation_shape) |shape| {
+                if (continuationMatches(slot, full_input, shape)) {
+                    continuation_idle = index;
+                    break;
+                }
+            }
+        }
+    }
+    return .{ .index = continuation_idle orelse first_idle, .matching_count = matching_count };
 }
 
 fn incrementFailure(slot: *Slot) void {
@@ -168,14 +211,20 @@ pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
             existing.connection = null;
             existing.clearContinuation();
         }
-        const index = findSlot(args) orelse try appendSlot(args);
-        const slot = &slots.items[index];
-        if (slot.busy) {
+        // Responses on one WebSocket are exclusive and ordered. Preserve a
+        // compatible continuation lane when it is idle; otherwise another
+        // retained socket provides bounded parallelism without multiplexing
+        // unrelated response events on the same wire.
+        const selection = selectIdleLane(args);
+        const index = selection.index orelse if (selection.matching_count < try maxLanes())
+            try appendSlot(args)
+        else {
             pool_mutex.unlock(io_mod.getIo());
             locked = false;
             io_mod.sleep(10 * std.time.ns_per_ms);
             continue;
-        }
+        };
+        const slot = &slots.items[index];
 
         const age_limit = try maxConnectionAgeMs();
         if (slot.connection != null and slot.health_failures >= health_budget) {
@@ -378,4 +427,42 @@ test "Codex WebSocket continuation requires an exact item boundary prefix" {
     );
     try std.testing.expect(continuationDelta("{\"type\":\"message\"}suffix", "{\"type\":\"message\"}") == null);
     try std.testing.expect(continuationDelta("{\"type\":\"other\"}", "{\"type\":\"message\"}") == null);
+}
+
+test "Codex WebSocket lane selection preserves continuation affinity" {
+    shutdown();
+    defer shutdown();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = gateway_client.DeliveryCertainty.init();
+    var shape: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("shape", &shape, .{});
+    const args = AcquireArgs{
+        .session_id = "session-a",
+        .account_id = "account-a",
+        .model = "gpt-5.6-sol",
+        .endpoint = "http://127.0.0.1/responses",
+        .authorization = "Bearer token-a",
+        .deadline = null,
+        .cancel_flag = &cancel_flag,
+        .delivery = &delivery,
+        .continuation_input = "{\"type\":\"message\"},{\"role\":\"user\"}",
+        .continuation_shape = shape,
+    };
+
+    const first = try appendSlot(args);
+    slots.items[first].busy = true;
+    const second = try appendSlot(args);
+    slots.items[second].busy = true;
+    recordCompletion(second, "response-2", "{\"type\":\"message\"}", "{\"type\":\"message\"}", shape);
+    slots.items[second].busy = false;
+
+    const selection = selectIdleLane(args);
+    try std.testing.expectEqual(@as(?usize, second), selection.index);
+    try std.testing.expectEqual(@as(usize, 2), selection.matching_count);
+
+    slots.items[second].busy = true;
+    const saturated = selectIdleLane(args);
+    try std.testing.expectEqual(@as(?usize, null), saturated.index);
+    try std.testing.expectEqual(@as(usize, 2), saturated.matching_count);
 }
