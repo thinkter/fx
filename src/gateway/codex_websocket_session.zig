@@ -174,11 +174,11 @@ const LaneSelection = struct {
     matching_count: usize,
 };
 
-fn selectIdleLane(args: AcquireArgs) LaneSelection {
+fn selectIdleLane(slot_items: []Slot, args: AcquireArgs) LaneSelection {
     var first_idle: ?usize = null;
     var continuation_idle: ?usize = null;
     var matching_count: usize = 0;
-    for (slots.items, 0..) |*slot, index| {
+    for (slot_items, 0..) |*slot, index| {
         if (!matches(slot, args)) continue;
         matching_count += 1;
         if (slot.busy) continue;
@@ -195,6 +195,19 @@ fn selectIdleLane(args: AcquireArgs) LaneSelection {
     return .{ .index = continuation_idle orelse first_idle, .matching_count = matching_count };
 }
 
+const LaneChoice = union(enum) {
+    existing: usize,
+    append,
+    wait,
+};
+
+fn chooseLane(slot_items: []Slot, args: AcquireArgs, lane_limit: usize) LaneChoice {
+    const selection = selectIdleLane(slot_items, args);
+    if (selection.index) |index| return .{ .existing = index };
+    if (selection.matching_count < lane_limit) return .append;
+    return .wait;
+}
+
 fn incrementFailure(slot: *Slot) void {
     slot.health_failures = std.math.add(u8, slot.health_failures, 1) catch std.math.maxInt(u8);
 }
@@ -202,6 +215,10 @@ fn incrementFailure(slot: *Slot) void {
 pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
     while (true) {
         if (args.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (args.deadline) |deadline| {
+            const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+            if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) return error.Timeout;
+        }
         pool_mutex.lockUncancelable(io_mod.getIo());
         var locked = true;
         errdefer if (locked) pool_mutex.unlock(io_mod.getIo());
@@ -215,14 +232,15 @@ pub fn acquire(_: Allocator, args: AcquireArgs) !Checkout {
         // compatible continuation lane when it is idle; otherwise another
         // retained socket provides bounded parallelism without multiplexing
         // unrelated response events on the same wire.
-        const selection = selectIdleLane(args);
-        const index = selection.index orelse if (selection.matching_count < try maxLanes())
-            try appendSlot(args)
-        else {
-            pool_mutex.unlock(io_mod.getIo());
-            locked = false;
-            io_mod.sleep(10 * std.time.ns_per_ms);
-            continue;
+        const index = switch (chooseLane(slots.items, args, try maxLanes())) {
+            .existing => |existing| existing,
+            .append => try appendSlot(args),
+            .wait => {
+                pool_mutex.unlock(io_mod.getIo());
+                locked = false;
+                io_mod.sleep(10 * std.time.ns_per_ms);
+                continue;
+            },
         };
         const slot = &slots.items[index];
 
@@ -457,12 +475,10 @@ test "Codex WebSocket lane selection preserves continuation affinity" {
     recordCompletion(second, "response-2", "{\"type\":\"message\"}", "{\"type\":\"message\"}", shape);
     slots.items[second].busy = false;
 
-    const selection = selectIdleLane(args);
-    try std.testing.expectEqual(@as(?usize, second), selection.index);
-    try std.testing.expectEqual(@as(usize, 2), selection.matching_count);
+    const selection = chooseLane(slots.items, args, 2);
+    try std.testing.expectEqual(second, selection.existing);
 
     slots.items[second].busy = true;
-    const saturated = selectIdleLane(args);
-    try std.testing.expectEqual(@as(?usize, null), saturated.index);
-    try std.testing.expectEqual(@as(usize, 2), saturated.matching_count);
+    try std.testing.expect(chooseLane(slots.items, args, 2) == .wait);
+    try std.testing.expect(chooseLane(slots.items, args, 3) == .append);
 }
