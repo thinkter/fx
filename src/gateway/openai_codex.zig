@@ -87,9 +87,24 @@ fn buildWebSocketRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
 ) ![]u8 {
+    const input = try buildResponseInput(alloc, request.messages, request.verified_images);
+    defer alloc.free(input);
+    return buildWebSocketRequestWithInput(alloc, request, input, null);
+}
+
+fn buildWebSocketRequestWithInput(
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    input: []const u8,
+    previous_response_id: ?[]const u8,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try writeResponseRequestStart(&out.writer, alloc, request, "response.create");
+    try writeResponseRequestStartWithInput(&out.writer, alloc, request, "response.create", input);
+    if (previous_response_id) |response_id| {
+        try out.writer.writeAll(",\"previous_response_id\":");
+        try std.json.Stringify.value(response_id, .{}, &out.writer);
+    }
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -101,6 +116,18 @@ fn writeResponseRequestStart(
     alloc: Allocator,
     request: stream_provider.RequestData,
     websocket_type: ?[]const u8,
+) !void {
+    const input = try buildResponseInput(alloc, request.messages, request.verified_images);
+    defer alloc.free(input);
+    return writeResponseRequestStartWithInput(writer, alloc, request, websocket_type, input);
+}
+
+fn writeResponseRequestStartWithInput(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    websocket_type: ?[]const u8,
+    input: []const u8,
 ) !void {
     try validateModel(request.model);
     if (request.budget) |budget| {
@@ -131,7 +158,7 @@ fn writeResponseRequestStart(
     try writer.writeAll(",\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
+    try writer.writeAll(input);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -163,6 +190,42 @@ fn writeResponseRequestStart(
     }
     // The ChatGPT Codex endpoint chooses the model's output limit and rejects
     // the public Responses API max_output_tokens parameter.
+}
+
+fn buildResponseInput(
+    alloc: Allocator,
+    messages: []const types.ChatMessage,
+    images: ?[]const image_attachments.VerifiedSnapshot,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeResponsesInput(&out.writer, alloc, messages, images);
+    return out.toOwnedSlice();
+}
+
+fn buildContinuationBaseline(
+    alloc: Allocator,
+    full_input: []const u8,
+    response_input: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(full_input);
+    if (response_input.len > 0) {
+        if (out.written().len > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll(response_input);
+    }
+    return out.toOwnedSlice();
+}
+
+fn buildDurableResponseInput(
+    alloc: Allocator,
+    messages: []const types.ChatMessage,
+) ![]u8 {
+    const projected = try alloc.dupe(types.ChatMessage, messages);
+    defer alloc.free(projected);
+    for (projected) |*message| message.provider_state_json = null;
+    return buildResponseInput(alloc, projected, null);
 }
 
 fn writeResponsesInput(
@@ -202,9 +265,7 @@ fn streamCompletion(
             break :blk streamPrepared(alloc, request, payload);
         },
         .websocket => blk: {
-            const payload = try buildWebSocketRequest(alloc, request.data());
-            defer alloc.free(payload);
-            break :blk streamWebSocketPrepared(alloc, request, payload);
+            break :blk streamWebSocketPrepared(alloc, request);
         },
     } catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
@@ -417,11 +478,17 @@ fn prepareCodexTransport(
 fn streamWebSocketPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
-    payload: []const u8,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     var prepared = try prepareCodexTransport(alloc, request);
     defer prepared.deinit(alloc);
+
+    const full_input = try buildResponseInput(alloc, request.messages, request.verified_images);
+    defer alloc.free(full_input);
+    const shape_payload = try buildWebSocketRequestWithInput(alloc, request.data(), "", null);
+    defer alloc.free(shape_payload);
+    var shape: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(shape_payload, &shape, .{});
 
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
@@ -436,6 +503,7 @@ fn streamWebSocketPrepared(
     try admitCodexTransport(request.admission);
 
     var acquisition_attempt: u8 = 0;
+    var continuation_recovery_attempted = false;
     while (true) {
         const checkout = codex_websocket_session.acquire(alloc, .{
             .session_id = request.session_id,
@@ -458,6 +526,22 @@ fn streamWebSocketPrepared(
             checkout.handshake_ms,
             checkout.health_failures,
         });
+        const continued = if (continuation_recovery_attempted)
+            null
+        else
+            codex_websocket_session.continuation(checkout.slot, full_input, shape);
+        const payload = try buildWebSocketRequestWithInput(
+            alloc,
+            request.data(),
+            if (continued) |value| value.delta_input else full_input,
+            if (continued) |value| value.previous_response_id else null,
+        );
+        defer alloc.free(payload);
+        debug_trace.eventf("codex.ws", "continuation", request.trace_ctx, "used={d} delta_bytes={d} recovery={d}", .{
+            @as(u8, @intFromBool(continued != null)),
+            if (continued) |value| value.delta_input.len else full_input.len,
+            @as(u8, @intFromBool(continuation_recovery_attempted)),
+        });
         websocket_transport.streamOn(checkout.connection, alloc, .{
             .endpoint = prepared.endpoint,
             .authorization = prepared.authorization,
@@ -469,6 +553,12 @@ fn streamWebSocketPrepared(
             .delivery = request.delivery,
         }, &bridge, WebSocketBridge.event) catch |err| {
             codex_websocket_session.release(checkout.slot, .failed);
+            if (err == error.PreviousResponseNotFound and continued != null and !continuation_recovery_attempted) {
+                continuation_recovery_attempted = true;
+                reducer.deinit(alloc);
+                reducer = responses_protocol.Reducer.init(alloc);
+                continue;
+            }
             debug_trace.eventf("codex.ws", "poison", request.trace_ctx, "reason={s} close={d}", .{ websocketFailureReason(err), @as(u16, 0) });
             return err;
         };
@@ -477,6 +567,36 @@ fn streamWebSocketPrepared(
             debug_trace.eventf("codex.ws", "poison", request.trace_ctx, "reason={s} close={d}", .{ "protocol", @as(u16, 0) });
             return mapReducerError(err);
         };
+        if (completion.generation_id) |response_id| {
+            const response_message = [_]types.ChatMessage{.{
+                .role = .assistant,
+                .content = completion.content,
+                .tool_calls = completion.tool_calls,
+                .provider_state_json = completion.provider_state_json,
+            }};
+            if (buildResponseInput(alloc, &response_message, null)) |response_input| {
+                defer alloc.free(response_input);
+                if (buildContinuationBaseline(alloc, full_input, response_input)) |baseline| {
+                    defer alloc.free(baseline);
+                    if (buildDurableResponseInput(alloc, request.messages)) |durable_full_input| {
+                        defer alloc.free(durable_full_input);
+                        if (buildDurableResponseInput(alloc, &response_message)) |durable_response_input| {
+                            defer alloc.free(durable_response_input);
+                            if (buildContinuationBaseline(alloc, durable_full_input, durable_response_input)) |durable_baseline| {
+                                defer alloc.free(durable_baseline);
+                                codex_websocket_session.recordCompletion(
+                                    checkout.slot,
+                                    response_id,
+                                    baseline,
+                                    durable_baseline,
+                                    shape,
+                                );
+                            } else |_| {}
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+            } else |_| {}
+        }
         codex_websocket_session.release(checkout.slot, .completed);
         return .{ .completed = .{
             .completion = completion,
@@ -661,6 +781,7 @@ fn consumeSse(
 fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
+        error.PreviousResponseNotFound => error.PreviousResponseNotFound,
         error.ResponseFailed => error.OpenAICodexResponseFailed,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
