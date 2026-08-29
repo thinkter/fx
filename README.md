@@ -51,6 +51,8 @@ fx
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
+Codex uses HTTP streaming by default. To require the WebSocket transport, start fx with `FX_CODEX_TRANSPORT=websocket`. WebSocket sessions retain compatible connections and continuation state; concurrent requests use separate ordered lanes rather than sharing one response stream. Each session identity retains at most four lanes by default. Set `FX_CODEX_WEBSOCKET_MAX_LANES` to a positive integer to choose a different limit.
+
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
 
 To use an AI Gateway API key instead:
