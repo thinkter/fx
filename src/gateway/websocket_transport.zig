@@ -20,10 +20,22 @@ pub const Error = error{
 
 pub const EventHandler = *const fn (context: *anyopaque, json: []const u8) anyerror!bool;
 
-const connect_timeout_ms: i64 = 30_000;
-const event_idle_timeout_ms: i64 = 30_000;
+const default_connect_timeout_ms: i64 = 30_000;
+const default_event_idle_timeout_ms: i64 = 30_000;
+const connect_timeout_env = "FX_CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS";
+const event_idle_timeout_env = "FX_CODEX_WEBSOCKET_EVENT_IDLE_TIMEOUT_MS";
 
-pub const Request = struct {
+pub const ConnectArgs = struct {
+    endpoint: []const u8,
+    authorization: []const u8,
+    account_id: []const u8,
+    session_id: ?[]const u8,
+    deadline: ?std.Io.Clock.Timestamp,
+    cancel_flag: *std.atomic.Value(bool),
+    delivery: *gateway_client.DeliveryCertainty,
+};
+
+pub const StreamArgs = struct {
     endpoint: []const u8,
     authorization: []const u8,
     account_id: []const u8,
@@ -33,6 +45,47 @@ pub const Request = struct {
     cancel_flag: *std.atomic.Value(bool),
     delivery: *gateway_client.DeliveryCertainty,
 };
+
+pub const Request = StreamArgs;
+
+pub const Connection = struct {
+    alloc: Allocator,
+    client: std.http.Client,
+    request: std.http.Client.Request,
+    opened_at_ms: i64,
+    close_sent: bool = false,
+    watcher_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    timeout_fired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    last_progress_ms: std.atomic.Value(i64),
+    watcher: ?std.Thread = null,
+
+    fn socket(self: *Connection) !*std.http.Client.Connection {
+        return self.request.connection orelse error.WebSocketConnectionMissing;
+    }
+
+    fn startWatcher(self: *Connection, cancel_flag: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp) !void {
+        self.watcher_done.store(false, .seq_cst);
+        self.timeout_fired.store(false, .seq_cst);
+        self.last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
+        const http_connection = try self.socket();
+        self.watcher = try spawnConnectionWatcher(
+            &self.watcher_done,
+            cancel_flag,
+            deadline,
+            &self.timeout_fired,
+            &self.last_progress_ms,
+            try eventIdleTimeoutMs(),
+            http_connection.stream_writer.stream,
+        );
+    }
+
+    fn stopWatcher(self: *Connection) void {
+        self.watcher_done.store(true, .seq_cst);
+        if (self.watcher) |thread| thread.join();
+        self.watcher = null;
+    }
+};
+
 const OpenedRequest = struct {
     request: ?std.http.Client.Request,
 
@@ -68,17 +121,24 @@ const OpenWebSocketOperation = struct {
     }
 };
 
-/// Opens one socket, sends one request, and consumes one terminal response.
-/// The caller owns delivery certainty: this function returns an error after a
-/// frame write without retrying the request.
-pub fn stream(
-    alloc: Allocator,
-    request: Request,
-    context: *anyopaque,
-    on_event: EventHandler,
-) !void {
-    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const uri = try std.Uri.parse(request.endpoint);
+fn positiveTimeoutFromEnv(name: []const u8, fallback: i64) !i64 {
+    const value = io_mod.getenv(name) orelse return fallback;
+    const parsed = std.fmt.parseInt(i64, value, 10) catch return error.InvalidOpenAICodexTransport;
+    if (parsed <= 0) return error.InvalidOpenAICodexTransport;
+    return parsed;
+}
+
+fn connectTimeoutMs() !i64 {
+    return positiveTimeoutFromEnv(connect_timeout_env, default_connect_timeout_ms);
+}
+
+fn eventIdleTimeoutMs() !i64 {
+    return positiveTimeoutFromEnv(event_idle_timeout_env, default_event_idle_timeout_ms);
+}
+
+pub fn connect(alloc: Allocator, args: ConnectArgs) !*Connection {
+    if (args.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const uri = try std.Uri.parse(args.endpoint);
     var nonce: [16]u8 = undefined;
     try io_mod.getIo().randomSecure(&nonce);
     var key_buffer: [std.base64.standard.Encoder.calcSize(nonce.len)]u8 = undefined;
@@ -88,7 +148,7 @@ pub fn stream(
 
     var extra_headers: [7]std.http.Header = undefined;
     var count: usize = 0;
-    extra_headers[count] = .{ .name = "chatgpt-account-id", .value = request.account_id };
+    extra_headers[count] = .{ .name = "chatgpt-account-id", .value = args.account_id };
     count += 1;
     extra_headers[count] = .{ .name = "originator", .value = "fx" };
     count += 1;
@@ -100,67 +160,53 @@ pub fn stream(
     count += 1;
     extra_headers[count] = .{ .name = "Sec-WebSocket-Key", .value = &key_buffer };
     count += 1;
-    if (request.session_id) |session_id| if (session_id.len > 0) {
+    if (args.session_id) |session_id| if (session_id.len > 0) {
         extra_headers[count] = .{ .name = "session-id", .value = session_id };
         count += 1;
     };
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
+    const connection = try alloc.create(Connection);
+    errdefer alloc.destroy(connection);
+    connection.* = undefined;
+    connection.alloc = alloc;
+    connection.client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    errdefer connection.client.deinit();
     var open_operation = OpenWebSocketOperation{
-        .client = &client,
+        .client = &connection.client,
         .uri = uri,
-        .authorization = request.authorization,
+        .authorization = args.authorization,
         .headers = extra_headers[0..count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
-        .raw = .fromMilliseconds(connect_timeout_ms),
+        .raw = .fromMilliseconds(try connectTimeoutMs()),
     });
-    if (request.deadline) |deadline| {
-        if (std.Io.Clock.Timestamp.compare(deadline, .lt, connect_deadline)) {
-            connect_deadline = deadline;
-        }
+    if (args.deadline) |deadline| {
+        if (std.Io.Clock.Timestamp.compare(deadline, .lt, connect_deadline)) connect_deadline = deadline;
     }
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,
-        request.cancel_flag,
+        args.cancel_flag,
         connect_deadline,
         &open_operation,
     );
-    var http_request = opened.take();
-    defer {
-        // An upgraded connection must never return to the HTTP pool.
-        if (http_request.connection) |connection| connection.closing = true;
-        http_request.deinit();
-    }
-    var watcher_done = std.atomic.Value(bool).init(false);
-    var timeout_fired = std.atomic.Value(bool).init(false);
-    var last_progress_ms = std.atomic.Value(i64).init(io_mod.milliTimestamp());
-    const watcher = if (http_request.connection) |connection|
-        try spawnConnectionWatcher(
-            &watcher_done,
-            request.cancel_flag,
-            request.deadline,
-            &timeout_fired,
-            &last_progress_ms,
-            connection.stream_writer.stream,
-        )
-    else
-        null;
-    defer {
-        watcher_done.store(true, .seq_cst);
-        if (watcher) |thread| thread.join();
-    }
-    http_request.sendBodiless() catch |err| {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (timeout_fired.load(.seq_cst)) return error.Timeout;
+    errdefer opened.deinit(alloc);
+    connection.request = opened.take();
+    errdefer connection.request.deinit();
+    connection.opened_at_ms = io_mod.milliTimestamp();
+    connection.close_sent = false;
+    connection.watcher_done = std.atomic.Value(bool).init(true);
+    connection.timeout_fired = std.atomic.Value(bool).init(false);
+    connection.last_progress_ms = std.atomic.Value(i64).init(connection.opened_at_ms);
+    connection.watcher = null;
+
+    connection.request.sendBodiless() catch |err| {
+        if (args.cancel_flag.load(.seq_cst)) return error.Cancelled;
         return err;
     };
-    const response = http_request.receiveHead(&.{}) catch |err| {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (timeout_fired.load(.seq_cst)) return error.Timeout;
+    const response = connection.request.receiveHead(&.{}) catch |err| {
+        if (args.cancel_flag.load(.seq_cst)) return error.Cancelled;
         return err;
     };
     if (response.head.status != .switching_protocols) return error.WebSocketUpgradeRejected;
@@ -170,61 +216,81 @@ pub fn stream(
     {
         return error.WebSocketAcceptInvalid;
     }
+    _ = try connection.socket();
+    return connection;
+}
 
-    // `receiveHead` leaves any already-buffered WebSocket bytes on this reader.
-    const reader = http_request.reader.in;
-    const connection = http_request.connection orelse return error.WebSocketConnectionMissing;
-    const writer = connection.writer();
-    var close_sent = false;
-    defer if (!close_sent and !request.cancel_flag.load(.seq_cst)) {
-        // Cancellation force-releases the socket from the watcher. Do not race
-        // that release with a best-effort close frame from this I/O owner.
-        // A fresh Phase 1 socket is never returned to the HTTP pool.
-        writeFrame(writer, .close, &.{ 0x03, 0xe8 }) catch {};
-        connection.flush() catch {};
-    };
+fn operationError(connection: *Connection, cancel_flag: *std.atomic.Value(bool), err: anyerror) anyerror {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (connection.timeout_fired.load(.seq_cst)) return error.Timeout;
+    return err;
+}
+
+pub fn ping(
+    connection: *Connection,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+    _: *gateway_client.DeliveryCertainty,
+) !void {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    try connection.startWatcher(cancel_flag, deadline);
+    defer connection.stopWatcher();
+    const socket = try connection.socket();
+    const writer = socket.writer();
+    writeFrame(writer, .ping, &.{}) catch |err| return operationError(connection, cancel_flag, err);
+    socket.flush() catch |err| return operationError(connection, cancel_flag, err);
+    while (true) {
+        const frame = readFrame(connection.alloc, connection.request.reader.in) catch |err| return operationError(connection, cancel_flag, err);
+        defer connection.alloc.free(frame.payload);
+        connection.last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
+        switch (frame.opcode) {
+            .pong => return,
+            .ping => {
+                writeFrame(writer, .pong, frame.payload) catch |err| return operationError(connection, cancel_flag, err);
+                socket.flush() catch |err| return operationError(connection, cancel_flag, err);
+            },
+            .close => return closeError(try validateClosePayload(frame.payload)),
+            .binary => return error.WebSocketUnexpectedBinary,
+            else => return error.WebSocketProtocolViolation,
+        }
+    }
+}
+
+pub fn streamOn(
+    connection: *Connection,
+    alloc: Allocator,
+    request: StreamArgs,
+    context: *anyopaque,
+    on_event: EventHandler,
+) !void {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    try connection.startWatcher(request.cancel_flag, request.deadline);
+    defer connection.stopWatcher();
+    const socket = try connection.socket();
+    const reader = connection.request.reader.in;
+    const writer = socket.writer();
+    var succeeded = false;
+    defer if (!succeeded) closeAfterFailure(connection, request.cancel_flag);
     request.delivery.markPossiblySent();
-    writeFrame(writer, .text, request.payload) catch |err| {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (timeout_fired.load(.seq_cst)) return error.Timeout;
-        return err;
-    };
-    connection.flush() catch |err| {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (timeout_fired.load(.seq_cst)) return error.Timeout;
-        return err;
-    };
-    last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
+    writeFrame(writer, .text, request.payload) catch |err| return operationError(connection, request.cancel_flag, err);
+    socket.flush() catch |err| return operationError(connection, request.cancel_flag, err);
+    connection.last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
 
     var message: std.ArrayList(u8) = .empty;
     defer message.deinit(alloc);
     var fragmented_opcode: ?Opcode = null;
     while (true) {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        const frame = readFrame(alloc, reader) catch |err| {
-            if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-            if (timeout_fired.load(.seq_cst)) return error.Timeout;
-            return err;
-        };
-        last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
+        const frame = readFrame(alloc, reader) catch |err| return operationError(connection, request.cancel_flag, err);
+        connection.last_progress_ms.store(io_mod.milliTimestamp(), .seq_cst);
         defer alloc.free(frame.payload);
         switch (frame.opcode) {
             .ping => {
-                writeFrame(writer, .pong, frame.payload) catch |err| {
-                    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-                    if (timeout_fired.load(.seq_cst)) return error.Timeout;
-                    return err;
-                };
-                connection.flush() catch |err| {
-                    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-                    if (timeout_fired.load(.seq_cst)) return error.Timeout;
-                    return err;
-                };
+                writeFrame(writer, .pong, frame.payload) catch |err| return operationError(connection, request.cancel_flag, err);
+                socket.flush() catch |err| return operationError(connection, request.cancel_flag, err);
             },
             .pong => {},
-            .close => {
-                return closeError(try validateClosePayload(frame.payload));
-            },
+            .close => return closeError(try validateClosePayload(frame.payload)),
             .binary => return error.WebSocketUnexpectedBinary,
             .continuation => {
                 if (fragmented_opcode == null) return error.WebSocketProtocolViolation;
@@ -234,11 +300,7 @@ pub fn stream(
                 fragmented_opcode = null;
                 if (opcode != .text) return error.WebSocketUnexpectedBinary;
                 if (try dispatchTextMessage(context, on_event, message.items)) {
-                    closeAfterCompletion(alloc, reader, writer, connection, request.cancel_flag, &timeout_fired) catch |err| {
-                        if (err == error.Cancelled or err == error.Timeout) close_sent = true;
-                        return err;
-                    };
-                    close_sent = true;
+                    succeeded = true;
                     return;
                 }
                 message.clearRetainingCapacity();
@@ -251,17 +313,82 @@ pub fn stream(
                     continue;
                 }
                 if (try dispatchTextMessage(context, on_event, message.items)) {
-                    closeAfterCompletion(alloc, reader, writer, connection, request.cancel_flag, &timeout_fired) catch |err| {
-                        if (err == error.Cancelled or err == error.Timeout) close_sent = true;
-                        return err;
-                    };
-                    close_sent = true;
+                    succeeded = true;
                     return;
                 }
                 message.clearRetainingCapacity();
             },
         }
     }
+}
+
+fn closeAfterFailure(connection: *Connection, cancel_flag: *std.atomic.Value(bool)) void {
+    if (connection.close_sent or cancel_flag.load(.seq_cst)) return;
+    const socket = connection.socket() catch return;
+    writeFrame(socket.writer(), .close, &.{ 0x03, 0xe8 }) catch return;
+    socket.flush() catch {};
+    connection.close_sent = true;
+}
+
+fn closeChecked(
+    connection: *Connection,
+    alloc: Allocator,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
+    connection.stopWatcher();
+    defer {
+        if (connection.request.connection) |http_connection| http_connection.closing = true;
+        connection.request.deinit();
+        connection.client.deinit();
+        alloc.destroy(connection);
+    }
+    if (!connection.close_sent) {
+        try connection.startWatcher(cancel_flag, deadline);
+        defer connection.stopWatcher();
+        const http_connection = try connection.socket();
+        try closeAfterCompletion(
+            alloc,
+            connection.request.reader.in,
+            http_connection.writer(),
+            http_connection,
+            cancel_flag,
+            &connection.timeout_fired,
+        );
+        connection.close_sent = true;
+    }
+}
+
+pub fn close(connection: *Connection, alloc: Allocator) void {
+    var cancelled = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1_000),
+    });
+    closeChecked(connection, alloc, &cancelled, deadline) catch {};
+}
+
+/// Opens one socket, sends one request, and consumes one terminal response.
+pub fn stream(
+    alloc: Allocator,
+    request: Request,
+    context: *anyopaque,
+    on_event: EventHandler,
+) !void {
+    const connection = try connect(alloc, .{
+        .endpoint = request.endpoint,
+        .authorization = request.authorization,
+        .account_id = request.account_id,
+        .session_id = request.session_id,
+        .deadline = request.deadline,
+        .cancel_flag = request.cancel_flag,
+        .delivery = request.delivery,
+    });
+    var owned = true;
+    defer if (owned) close(connection, alloc);
+    try streamOn(connection, alloc, request, context, on_event);
+    owned = false;
+    return closeChecked(connection, alloc, request.cancel_flag, request.deadline);
 }
 
 const Opcode = enum(u4) { continuation = 0, text = 1, binary = 2, close = 8, ping = 9, pong = 10 };
@@ -350,6 +477,7 @@ const ConnectionWatcher = struct {
         deadline: ?std.Io.Clock.Timestamp,
         timeout_fired: *std.atomic.Value(bool),
         last_progress_ms: *std.atomic.Value(i64),
+        event_idle_timeout_ms: i64,
         socket: std.Io.net.Stream,
     ) void {
         while (!done.load(.seq_cst)) {
@@ -382,6 +510,7 @@ fn spawnConnectionWatcher(
     deadline: ?std.Io.Clock.Timestamp,
     timeout_fired: *std.atomic.Value(bool),
     last_progress_ms: *std.atomic.Value(i64),
+    event_idle_timeout_ms: i64,
     socket: std.Io.net.Stream,
 ) !std.Thread {
     return std.Thread.spawn(.{}, ConnectionWatcher.run, .{
@@ -390,6 +519,7 @@ fn spawnConnectionWatcher(
         deadline,
         timeout_fired,
         last_progress_ms,
+        event_idle_timeout_ms,
         socket,
     });
 }
