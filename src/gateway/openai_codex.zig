@@ -8,8 +8,7 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
-const websocket_transport = @import("websocket_transport.zig");
-const codex_websocket_session = @import("codex_websocket_session.zig");
+const codex_websocket = @import("openai_codex_websocket.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
@@ -29,12 +28,33 @@ const connect_timeout_ms: i64 = 30_000;
 const transport_env = "FX_CODEX_TRANSPORT";
 
 const Transport = enum { sse, websocket };
+var sse_fallback_active = std.atomic.Value(bool).init(false);
 
 fn selectedTransport() !Transport {
     const value = io_mod.getenv(transport_env) orelse return .sse;
     if (std.mem.eql(u8, value, "sse") or std.mem.eql(u8, value, "auto")) return .sse;
-    if (std.mem.eql(u8, value, "websocket")) return .websocket;
+    if (std.mem.eql(u8, value, "websocket")) {
+        return if (sse_fallback_active.load(.seq_cst)) .sse else .websocket;
+    }
     return error.InvalidOpenAICodexTransport;
+}
+
+fn allowsSseFallback(err: anyerror, delivery: gateway_client.DeliveryCertainty.State) bool {
+    if (delivery != .definitely_unsent) return false;
+    return switch (err) {
+        error.Cancelled,
+        error.OutOfMemory,
+        error.ProviderAdmissionMissing,
+        error.ProviderAdmissionRepeated,
+        error.InvalidOpenAICodexTransport,
+        => false,
+        else => true,
+    };
+}
+
+fn armSseFallback(err: anyerror) void {
+    sse_fallback_active.store(true, .seq_cst);
+    debug_trace.logf("stream", "Codex WebSocket transport disabled for this process error={s}", .{@errorName(err)});
 }
 
 const CodexLimits = struct {
@@ -64,7 +84,7 @@ pub const agent_stream_provider = stream_provider.Provider{
 };
 
 pub fn shutdownWebSockets() void {
-    codex_websocket_session.shutdown();
+    codex_websocket.shutdown();
 }
 
 fn validateModel(model: []const u8) !void {
@@ -221,21 +241,6 @@ fn buildResponseInput(
     return out.toOwnedSlice();
 }
 
-fn buildContinuationBaseline(
-    alloc: Allocator,
-    full_input: []const u8,
-    response_input: []const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try out.writer.writeAll(full_input);
-    if (response_input.len > 0) {
-        if (out.written().len > 0) try out.writer.writeByte(',');
-        try out.writer.writeAll(response_input);
-    }
-    return out.toOwnedSlice();
-}
-
 fn buildDurableResponseInput(
     alloc: Allocator,
     messages: []const types.ChatMessage,
@@ -323,10 +328,14 @@ const PreparedStreamOperation = struct {
     transport: Transport,
 
     pub fn run(self: *@This()) !stream_provider.Result {
-        return switch (self.transport) {
-            .sse => streamPrepared(self.alloc, self.request, self.payload),
-            .websocket => streamWebSocketPrepared(self.alloc, self.request),
-        };
+        if (self.transport == .websocket) {
+            if (streamWebSocketPrepared(self.alloc, self.request)) |result| return result else |err| {
+                if (self.request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+                if (!allowsSseFallback(err, self.request.delivery.load())) return err;
+                armSseFallback(err);
+            }
+        }
+        return streamPreparedWithAdmission(self.alloc, self.request, self.payload, !self.request.attempt_evidence.provider_admitted);
     }
 };
 
@@ -367,6 +376,15 @@ pub fn streamPrepared(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
+) !stream_provider.Result {
+    return streamPreparedWithAdmission(alloc, request, payload, true);
+}
+
+fn streamPreparedWithAdmission(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+    should_admit: bool,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
@@ -410,7 +428,7 @@ pub fn streamPrepared(
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
-    try admitCodexTransport(request.admission);
+    if (should_admit) try admitCodexTransport(request.admission);
     var opened = try gateway_client.openBoundedPost(
         alloc,
         request.cancel_flag,
@@ -541,169 +559,20 @@ fn streamWebSocketPrepared(
     var prepared = try prepareCodexTransport(alloc, request);
     defer prepared.deinit(alloc);
 
-    const full_input = try buildRequestInput(alloc, request.data());
-    defer alloc.free(full_input);
-    const shape_payload = try buildWebSocketRequestWithInput(alloc, request.data(), "", null);
-    defer alloc.free(shape_payload);
-    var shape: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(shape_payload, &shape, .{});
-
-    var reducer = responses_protocol.Reducer.init(alloc);
-    defer reducer.deinit(alloc);
-    var bridge = WebSocketBridge{
-        .alloc = alloc,
-        .reducer = &reducer,
-        .events = request.events,
-        .cancel_flag = request.cancel_flag,
-        .content_capture_limit = request.content_capture_limit,
-        .stream_limits = codexStreamLimits(.{}),
-    };
-    try admitCodexTransport(request.admission);
-
-    var acquisition_attempt: u8 = 0;
-    var continuation_recovery_attempted = false;
-    while (true) {
-        const checkout = codex_websocket_session.acquire(alloc, .{
-            .session_id = request.session_id,
-            .account_id = prepared.account_id,
-            .model = request.model,
-            .endpoint = prepared.endpoint,
-            .authorization = prepared.authorization,
-            .deadline = request.deadline,
-            .cancel_flag = request.cancel_flag,
-            .delivery = request.delivery,
-            .continuation_input = if (continuation_recovery_attempted) null else full_input,
-            .continuation_shape = if (continuation_recovery_attempted) null else shape,
-        }) catch |err| {
-            if (acquisition_attempt == 0 and request.delivery.load() == .definitely_unsent) {
-                acquisition_attempt += 1;
-                continue;
-            }
-            return err;
-        };
-        debug_trace.eventf("codex.ws", "turn", request.trace_ctx, "lane={d} reused={d} handshake_ms={d} health={d} auth=chatgpt_subscription", .{
-            checkout.slot,
-            @as(u8, @intFromBool(checkout.reused)),
-            checkout.handshake_ms,
-            checkout.health_failures,
-        });
-        const continued = if (continuation_recovery_attempted)
-            null
-        else
-            codex_websocket_session.continuation(checkout.slot, full_input, shape);
-        const payload = try buildWebSocketRequestWithInput(
-            alloc,
-            request.data(),
-            if (continued) |value| value.delta_input else full_input,
-            if (continued) |value| value.previous_response_id else null,
-        );
-        defer alloc.free(payload);
-        debug_trace.eventf("codex.ws", "continuation", request.trace_ctx, "used={d} delta_bytes={d} recovery={d}", .{
-            @as(u8, @intFromBool(continued != null)),
-            if (continued) |value| value.delta_input.len else full_input.len,
-            @as(u8, @intFromBool(continuation_recovery_attempted)),
-        });
-        websocket_transport.streamOn(checkout.connection, alloc, .{
-            .endpoint = prepared.endpoint,
-            .authorization = prepared.authorization,
-            .account_id = prepared.account_id,
-            .session_id = request.session_id,
-            .payload = payload,
-            .deadline = request.deadline,
-            .cancel_flag = request.cancel_flag,
-            .delivery = request.delivery,
-        }, &bridge, WebSocketBridge.event) catch |err| {
-            codex_websocket_session.release(checkout.slot, .failed);
-            if (err == error.PreviousResponseNotFound and continued != null and !continuation_recovery_attempted) {
-                continuation_recovery_attempted = true;
-                reducer.deinit(alloc);
-                reducer = responses_protocol.Reducer.init(alloc);
-                continue;
-            }
-            debug_trace.eventf("codex.ws", "poison", request.trace_ctx, "reason={s} close={d}", .{ websocketFailureReason(err), @as(u16, 0) });
-            return err;
-        };
-        const completion = reducer.finish(alloc, request.cancel_flag, bridge.stream_limits) catch |err| {
-            codex_websocket_session.release(checkout.slot, .failed);
-            debug_trace.eventf("codex.ws", "poison", request.trace_ctx, "reason={s} close={d}", .{ "protocol", @as(u16, 0) });
-            return mapReducerError(err);
-        };
-        if (completion.generation_id) |response_id| {
-            const response_message = [_]types.ChatMessage{.{
-                .role = .assistant,
-                .content = completion.content,
-                .tool_calls = completion.tool_calls,
-                .provider_replay = if (completion.provider_state_json) |state| .{
-                    .source = .{ .provider = .codex, .model = request.model },
-                    .parts_json = state,
-                } else null,
-            }};
-            if (buildResponseInput(alloc, &response_message, null, .{})) |response_input| {
-                defer alloc.free(response_input);
-                if (buildContinuationBaseline(alloc, full_input, response_input)) |baseline| {
-                    defer alloc.free(baseline);
-                    if (buildDurableResponseInput(alloc, request.messages)) |durable_full_input| {
-                        defer alloc.free(durable_full_input);
-                        if (buildDurableResponseInput(alloc, &response_message)) |durable_response_input| {
-                            defer alloc.free(durable_response_input);
-                            if (buildContinuationBaseline(alloc, durable_full_input, durable_response_input)) |durable_baseline| {
-                                defer alloc.free(durable_baseline);
-                                codex_websocket_session.recordCompletion(
-                                    checkout.slot,
-                                    response_id,
-                                    baseline,
-                                    durable_baseline,
-                                    shape,
-                                );
-                            } else |_| {}
-                        } else |_| {}
-                    } else |_| {}
-                } else |_| {}
-            } else |_| {}
-        }
-        codex_websocket_session.release(checkout.slot, .completed);
-        return finishCodexCompletion(alloc, request.model, completion);
-    }
-}
-
-fn websocketFailureReason(err: anyerror) []const u8 {
-    return switch (err) {
-        error.Cancelled => "cancel",
-        error.Timeout => "timeout",
-        error.WebSocketPolicyClosed => "policy",
-        error.WebSocketUnexpectedBinary => "binary",
-        error.WebSocketProtocolViolation, error.WebSocketInvalidUtf8 => "protocol",
-        error.WebSocketUpgradeRejected, error.WebSocketAcceptInvalid => "auth",
-        else => "close",
+    const result = try codex_websocket.stream(alloc, request, .{
+        .endpoint = prepared.endpoint,
+        .authorization = prepared.authorization,
+        .account_id = prepared.account_id,
+    }, .{
+        .build_input = buildRequestInput,
+        .build_request = buildWebSocketRequestWithInput,
+        .build_durable_input = buildDurableResponseInput,
+    }, codexStreamLimits(.{}));
+    return switch (result) {
+        .completed => |completed| finishCodexCompletion(alloc, request.model, completed.completion),
+        else => result,
     };
 }
-
-const WebSocketBridge = struct {
-    alloc: Allocator,
-    reducer: *responses_protocol.Reducer,
-    events: stream_provider.EventSink,
-    cancel_flag: *std.atomic.Value(bool),
-    content_capture_limit: ?usize,
-    stream_limits: responses_protocol.StreamLimits,
-
-    fn event(raw: *anyopaque, json_text: []const u8) !bool {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        return self.reducer.applyJson(
-            self.alloc,
-            json_text,
-            .{
-                .context = &self.events,
-                .on_content = EventBridge.content,
-                .on_tool_start = EventBridge.toolStart,
-                .on_reasoning = EventBridge.reasoning,
-                .on_tool_input = EventBridge.toolInput,
-            },
-            self.cancel_flag,
-            self.content_capture_limit,
-            self.stream_limits,
-        ) catch |err| return mapReducerError(err);
-    }
-};
 
 const EventBridge = struct {
     fn sink(raw: *anyopaque) *stream_provider.EventSink {
@@ -841,6 +710,14 @@ test "OpenAI Codex transport policy keeps auto on SSE during Phase 1" {
     if (io_mod.getenv(transport_env) == null) {
         try std.testing.expectEqual(Transport.sse, try selectedTransport());
     }
+}
+
+test "OpenAI Codex SSE fallback requires definitely unsent delivery" {
+    try std.testing.expect(allowsSseFallback(error.WebSocketUpgradeRejected, .definitely_unsent));
+    try std.testing.expect(!allowsSseFallback(error.WebSocketUpgradeRejected, .possibly_sent));
+    try std.testing.expect(!allowsSseFallback(error.Cancelled, .definitely_unsent));
+    try std.testing.expect(!allowsSseFallback(error.OutOfMemory, .definitely_unsent));
+    try std.testing.expect(!allowsSseFallback(error.ProviderAdmissionRepeated, .definitely_unsent));
 }
 
 test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas" {
@@ -1199,25 +1076,24 @@ test "OpenAI Codex SSE and WebSocket reducers preserve callback order and comple
 
     var websocket_capture: Capture = .{};
     defer websocket_capture.deinit();
-    const websocket_events = stream_provider.EventSink{ .context = &websocket_capture, .emit_fn = Capture.emit };
+    var websocket_events = stream_provider.EventSink{ .context = &websocket_capture, .emit_fn = Capture.emit };
     var websocket_cancelled = std.atomic.Value(bool).init(false);
     var websocket_reducer = responses_protocol.Reducer.init(std.testing.allocator);
     defer websocket_reducer.deinit(std.testing.allocator);
-    var bridge = WebSocketBridge{
-        .alloc = std.testing.allocator,
-        .reducer = &websocket_reducer,
-        .events = websocket_events,
-        .cancel_flag = &websocket_cancelled,
-        .content_capture_limit = null,
-        .stream_limits = codexStreamLimits(.{}),
-    };
+    const stream_limits = codexStreamLimits(.{});
     for (raw_events) |raw_event| {
-        if (try WebSocketBridge.event(&bridge, raw_event)) break;
+        if (try websocket_reducer.applyJson(std.testing.allocator, raw_event, .{
+            .context = &websocket_events,
+            .on_content = EventBridge.content,
+            .on_tool_start = EventBridge.toolStart,
+            .on_reasoning = EventBridge.reasoning,
+            .on_tool_input = EventBridge.toolInput,
+        }, &websocket_cancelled, null, stream_limits)) break;
     }
     const websocket_completion = try websocket_reducer.finish(
         std.testing.allocator,
         &websocket_cancelled,
-        bridge.stream_limits,
+        stream_limits,
     );
     defer freeOpenAICodexTestCompletion(websocket_completion);
 

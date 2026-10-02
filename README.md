@@ -43,7 +43,7 @@ Sign in with one of:
 
 fx loads Grok models from your subscription's live catalog, so new supported models appear without a static model list. Public xAI metadata enriches image support but does not filter subscription models.
 
-Codex uses HTTP streaming by default. To require the experimental WebSocket transport, start fx with `FX_CODEX_TRANSPORT=websocket`. WebSocket sessions retain compatible connections and continuation state; concurrent requests use separate ordered lanes rather than sharing one response stream. Each session identity retains at most four lanes by default. Set `FX_CODEX_WEBSOCKET_MAX_LANES` to a positive integer to choose a different limit.
+Codex uses HTTP streaming by default. To prefer the experimental WebSocket transport, start fx with `FX_CODEX_TRANSPORT=websocket`. If connection setup fails before the request can be delivered, fx completes that turn over HTTP and keeps using HTTP for the rest of the process. It never replays a request whose delivery is uncertain. WebSocket sessions retain compatible connections and continuation state; concurrent requests use separate ordered lanes rather than sharing one response stream. Each session identity retains at most four lanes by default, and the process retains at most 32 lanes across identities. Set `FX_CODEX_WEBSOCKET_MAX_LANES` or `FX_CODEX_WEBSOCKET_MAX_SLOTS` to a positive integer to choose different limits.
 
 Then start the interactive shell from a project:
 

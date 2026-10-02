@@ -152,7 +152,7 @@ pub fn connect(alloc: Allocator, args: ConnectArgs) !*Connection {
     count += 1;
     extra_headers[count] = .{ .name = "originator", .value = "fx" };
     count += 1;
-    extra_headers[count] = .{ .name = "OpenAI-Beta", .value = "responses_websockets=v2" };
+    extra_headers[count] = .{ .name = "OpenAI-Beta", .value = "responses_websockets=2026-02-06" };
     count += 1;
     extra_headers[count] = .{ .name = "Upgrade", .value = "websocket" };
     count += 1;
