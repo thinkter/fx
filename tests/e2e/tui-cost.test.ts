@@ -50,14 +50,14 @@ function gatewayEnvironment(home: string) {
   };
 }
 
-function eventLogs(directory: string): string[] {
-  const logs: string[] = [];
+function filesNamed(directory: string, name: string): string[] {
+  const files: string[] = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) logs.push(...eventLogs(path));
-    if (entry.isFile() && entry.name === "events.jsonl") logs.push(path);
+    if (entry.isDirectory()) files.push(...filesNamed(path, name));
+    if (entry.isFile() && entry.name === name) files.push(path);
   }
-  return logs;
+  return files;
 }
 
 type UsageCheckpoint = {
@@ -69,28 +69,28 @@ type UsageCheckpoint = {
   models: Array<{ model: string }>;
 };
 
-type SessionEvent = {
-  kind: string;
-  payload?: { usage?: UsageCheckpoint };
-};
-
-function eventRecords(events: string): SessionEvent[] {
-  return events
-    .trim()
-    .split("\n")
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as SessionEvent);
+function readUsageCheckpoint(path: string): UsageCheckpoint {
+  return JSON.parse(readFileSync(path, "utf8")).snapshot;
 }
 
-function latestUsageCheckpoint(events: string): UsageCheckpoint {
-  const records = eventRecords(events);
-  for (let index = records.length - 1; index >= 0; index -= 1) {
-    const record = records[index]!;
-    if (record.kind === "usage_checkpointed" && record.payload?.usage) {
-      return record.payload.usage;
+function latestUsageCheckpoint(home: string): UsageCheckpoint {
+  const paths = filesNamed(home, "usage-v2.json");
+  if (paths.length === 0) throw new Error("missing usage sidecar");
+  return readUsageCheckpoint(paths[paths.length - 1]!);
+}
+
+function conversationTurnCount(home: string): number {
+  let count = 0;
+  for (const path of filesNamed(home, "events.jsonl")) {
+    for (const line of readFileSync(path, "utf8").trim().split("\n")) {
+      if (line.length === 0) continue;
+      const event = JSON.parse(line).event;
+      if (event?.turn_completed !== undefined || event?.interrupted !== undefined) {
+        count += 1;
+      }
     }
   }
-  throw new Error("missing usage checkpoint");
+  return count;
 }
 
 function authoritativeGeneration(generationId: string): Response {
@@ -138,6 +138,33 @@ async function waitForProfileUsage(
     await Bun.sleep(20);
   }
   throw new Error("Timed out waiting for profile usage publication");
+}
+
+// Holds the profile-wide usage ledger lock the way another fx process would.
+async function holdProfileUsageLock(home: string) {
+  const holder = Bun.spawn(
+    [
+      "python3",
+      "-c",
+      "import fcntl, os, sys, time\n" +
+        "fd = os.open(sys.argv[1], os.O_RDWR)\n" +
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n" +
+        "print('locked', flush=True)\n" +
+        "time.sleep(120)",
+      join(home, ".fx", "usage.lock"),
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  const reader = holder.stdout.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  while (!output.includes("locked")) {
+    const chunk = await reader.read();
+    if (chunk.done) throw new Error("usage lock holder exited early");
+    output += decoder.decode(chunk.value);
+  }
+  reader.releaseLock();
+  return holder;
 }
 
 test(
@@ -212,15 +239,11 @@ test(
     expect(exitCode).toBe(0);
     expect(gateway.generationRequests).toEqual([]);
     await waitForProfileUsage(home, GENERATION_ID);
-    const events = eventLogs(home)
+    const events = filesNamed(home, "events.jsonl")
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");
-    const checkpoint = events.indexOf('"kind":"usage_checkpointed"');
-    const history = events.indexOf('"kind":"history_turn_committed"');
-    expect(checkpoint).toBeGreaterThanOrEqual(0);
-    expect(checkpoint).toBeLessThan(history);
-    expect(events).toContain(GENERATION_ID);
-    const usage = latestUsageCheckpoint(events);
+    expect(events).toContain('"turn_completed"');
+    const usage = latestUsageCheckpoint(home);
     expect(usage.billing).toBe("complete");
     expect(usage.pending).toEqual([]);
     expect(usage.total_cost).toBe(0.0123);
@@ -274,10 +297,7 @@ test("fx ask gives immediate generation reconciliation a bounded drain", async (
   expect(exitCode, stderr).toBe(0);
   expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 
-  const events = eventLogs(home)
-    .map((path) => readFileSync(path, "utf8"))
-    .join("\n");
-  const usage = latestUsageCheckpoint(events);
+  const usage = latestUsageCheckpoint(home);
   expect(usage.billing).toBe("complete");
   expect(usage.total_cost).toBe(0.0123);
   expect(usage.pending).toEqual([]);
@@ -468,12 +488,9 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         expect(await fixture.exited).toBe(0);
         expect(gateway.generationRequests).toEqual([GENERATION_ID]);
 
-        const fixtureLogs = eventLogs(home);
-        expect(fixtureLogs).toHaveLength(1);
-        const resumedEventsPath = fixtureLogs[0]!;
-        const beforeResume = latestUsageCheckpoint(
-          readFileSync(resumedEventsPath, "utf8"),
-        );
+        const usageSidecars = filesNamed(home, "usage-v2.json");
+        expect(usageSidecars).toHaveLength(1);
+        const beforeResume = readUsageCheckpoint(usageSidecars[0]!);
         expect(beforeResume.billing).toBe("pending");
         expect(beforeResume.pending.map((item) => item.id))
           .toEqual([GENERATION_ID]);
@@ -492,7 +509,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
             TIMEOUT,
           );
           await session.sendKeys("Enter");
-          await session.waitForText("● Session resumed:", TIMEOUT);
+          await session.waitForText("* session resumed:", TIMEOUT);
         }
 
         await waitForGenerationRequests(gateway, 2);
@@ -521,16 +538,12 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         session = null;
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
-        const resumedEvents = readFileSync(resumedEventsPath, "utf8");
-        const afterResume = latestUsageCheckpoint(resumedEvents);
+        const afterResume = readUsageCheckpoint(usageSidecars[0]!);
         expect(afterResume.pending).toEqual([]);
         expect(afterResume.total_cost).toBe(0.0123);
         expect(afterResume.models.map((item) => item.model))
           .toContain(MODEL);
-        expect(
-          eventRecords(resumedEvents)
-            .filter((record) => record.kind === "history_turn_committed"),
-        ).toHaveLength(2);
+        expect(conversationTurnCount(home)).toBe(2);
       },
       TIMEOUT * 2,
     );
@@ -641,6 +654,86 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(resumedSession).toMatch(/5 reasoning/);
       expect(resumedSession).toMatch(/1 request/);
       expect(gateway.generationRequests).toEqual([GENERATION_ID, GENERATION_ID]);
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
+    "interactive exit keeps pending usage without waiting on a held ledger lock",
+    async () => {
+      root = mkdtempSync(join(tmpdir(), "fx-cost-held-ledger-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      gateway = startFakeGateway(
+        [
+          fakeGatewaySse([
+            { type: "response-metadata", modelId: MODEL },
+            {
+              type: "text-start",
+              id: "answer_1",
+              providerMetadata: {
+                gateway: { generationId: GENERATION_ID },
+              },
+            },
+            { type: "text-delta", id: "answer_1", delta: RESPONSE_TEXT },
+            { type: "text-end", id: "answer_1" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+            },
+          ]),
+        ],
+        {
+          models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+          generationResponse() {
+            return new Response("unauthorized", { status: 401 });
+          },
+        },
+      );
+
+      const fixture = Bun.spawn([FX_BIN, "ask", "Create pending usage."], {
+        cwd: workspace,
+        env: { ...process.env, ...gatewayEnvironment(home) },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(await fixture.exited).toBe(0);
+      await waitForProfileUsage(home, GENERATION_ID);
+
+      const holder = await holdProfileUsageLock(home);
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-last`,
+          cwd: workspace,
+          env: gatewayEnvironment(home),
+          stderrPath,
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+      } finally {
+        holder.kill();
+        await holder.exited;
+      }
+
+      const report = JSON.parse(
+        readFileSync(
+          join(home, ".fx", "diagnostics", "last-shutdown.json"),
+          "utf8",
+        ),
+      );
+      const persistence = report.stages.find(
+        (stage: { name: string }) => stage.name === "persistence_finalized",
+      );
+      // Waiting on the held lock costs at least its 2s deadline per attempt.
+      expect(persistence.step_ms).toBeLessThan(1000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(latestUsageCheckpoint(home).pending.map((item) => item.id))
+        .toEqual([GENERATION_ID]);
     },
     TIMEOUT * 3,
   );

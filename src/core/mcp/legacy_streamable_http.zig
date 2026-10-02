@@ -115,6 +115,19 @@ pub const Client = struct {
     auth_challenge: ?[]u8 = null,
 
     pub fn deinit(self: *Client) void {
+        self.retire();
+        self.terminateSession();
+        self.destroy();
+    }
+
+    /// Teardown for process exit and cancelled connections: skips the session
+    /// DELETE round trip. The server expires sessions its client abandons.
+    pub fn deinitWithoutSessionTermination(self: *Client) void {
+        self.retire();
+        self.destroy();
+    }
+
+    fn retire(self: *Client) void {
         self.lifecycle_mutex.lockUncancelable(io_mod.getIo());
         self.retiring = true;
         self.stopping.store(true, .release);
@@ -122,7 +135,9 @@ pub const Client = struct {
             self.lifecycle_cond.waitUncancelable(io_mod.getIo(), &self.lifecycle_mutex);
         }
         self.lifecycle_mutex.unlock(io_mod.getIo());
-        self.terminateSession();
+    }
+
+    fn destroy(self: *Client) void {
         if (self.session_id) |value| self.owner_allocator.free(value);
         if (self.auth_challenge) |value| self.owner_allocator.free(value);
         const alloc = self.owner_allocator;
@@ -1506,6 +1521,41 @@ test "deinit waits for an in-flight lease before it frees the session id" {
     try std.testing.expect(released.load(.acquire));
     try std.testing.expect(id_stayed_valid.load(.acquire));
     probe.join();
+}
+
+fn listenerHasPendingConnection(listener: *const std.Io.net.Server) !bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = listener.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    return try std.posix.poll(&fds, 0) > 0;
+}
+
+test "process-exit teardown skips the session DELETE that discard teardown sends" {
+    const os_tag = @import("builtin").os.tag;
+    if (os_tag == .windows or os_tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    const url = try std.fmt.allocPrint(
+        alloc,
+        "http://127.0.0.1:{d}/mcp",
+        .{listener.socket.address.getPort()},
+    );
+    defer alloc.free(url);
+
+    const exiting = try testClientWithSession(alloc, "session-exit");
+    exiting.url = url;
+    exiting.deinitWithoutSessionTermination();
+    try std.testing.expect(!try listenerHasPendingConnection(&listener));
+
+    // Nothing accepts, so this DELETE connects and then waits out its bound.
+    const discarded = try testClientWithSession(alloc, "session-discard");
+    discarded.url = url;
+    discarded.deinit();
+    try std.testing.expect(try listenerHasPendingConnection(&listener));
 }
 
 test "a retired session refuses new leases and skips the delete on teardown" {

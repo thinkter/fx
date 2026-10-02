@@ -2,12 +2,10 @@ name: macOS arm64 PGSO candidate
 
 on:
   workflow_call:
-    inputs:
-      package_release:
-        description: Package the eligible candidate as the stable macOS arm64 artifact
-        required: false
-        type: boolean
-        default: false
+    outputs:
+      artifact-id:
+        description: Qualified PGSO evidence artifact ID
+        value: ${{ jobs.aggregate.outputs.artifact-id }}
   workflow_dispatch:
   pull_request:
     paths:
@@ -36,6 +34,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 60
     outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
       training: ${{ steps.plan.outputs.training }}
       behavior: ${{ steps.plan.outputs.behavior }}
       startup: ${{ steps.plan.outputs.startup }}
@@ -88,9 +87,11 @@ jobs:
           echo "Heavy matrix: $heavy"
 
       - name: Upload immutable seed
+        id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pgso-seed-${{ github.sha }}
+          name: pgso-seed-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-seed/manifest.json
             ${{ runner.temp }}/fx-pgso-seed/control/bin/fx
@@ -132,7 +133,8 @@ jobs:
       - name: Download immutable seed
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: pgso-seed-${{ github.sha }}
+          artifact-ids: ${{ needs.seed.outputs.artifact-id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/fx-pgso-seed
 
       - name: Restore executable mode
@@ -152,7 +154,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pgso-training-${{ github.sha }}-${{ matrix.id }}
+          name: pgso-training-${{ github.sha }}-${{ matrix.id }}-attempt-${{ github.run_attempt }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/manifest.json
             ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/failure.json
@@ -166,6 +169,8 @@ jobs:
     needs: [seed, train]
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -183,7 +188,8 @@ jobs:
       - name: Download immutable seed
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: pgso-seed-${{ github.sha }}
+          artifact-ids: ${{ needs.seed.outputs.artifact-id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/fx-pgso-seed
 
       - name: Download all training shards
@@ -204,10 +210,12 @@ jobs:
             --llvm-bin "${{ steps.setup.outputs.llvm-bin }}"
 
       - name: Upload candidate and build evidence
+        id: upload
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pgso-candidate-${{ github.sha }}
+          name: pgso-candidate-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-candidate/manifest.json
             ${{ runner.temp }}/fx-pgso-candidate/failure.json
@@ -265,7 +273,8 @@ jobs:
       - name: Download candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: pgso-candidate-${{ github.sha }}
+          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/fx-pgso-candidate
 
       - name: Restore executable mode
@@ -284,7 +293,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pgso-behavior-${{ github.sha }}-${{ matrix.id }}
+          name: pgso-behavior-${{ github.sha }}-${{ matrix.id }}-attempt-${{ github.run_attempt }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/manifest.json
             ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/failure.json
@@ -320,7 +330,8 @@ jobs:
       - name: Download candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: pgso-candidate-${{ github.sha }}
+          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/fx-pgso-candidate
 
       - name: Restore executable mode
@@ -340,7 +351,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pgso-startup-${{ github.sha }}-${{ matrix.name }}
+          name: pgso-startup-${{ github.sha }}-${{ matrix.name }}-attempt-${{ github.run_attempt }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/manifest.json
             ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/failure.json
@@ -369,7 +381,8 @@ jobs:
       - name: Download candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: pgso-candidate-${{ github.sha }}
+          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/fx-pgso-candidate
 
       - name: Restore executable mode
@@ -384,6 +397,12 @@ jobs:
             "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/external-control/approval-review-bench" \
             "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/candidate/approval-review-bench"
 
+      - name: Setup pinned Hyperfine
+        id: setup
+        uses: ./.github/actions/setup-pgso
+        with:
+          hyperfine: "true"
+
       - name: Measure immutable profile-linked benchmark pair
         run: |
           python3 -m scripts.pgso.distributed measure \
@@ -391,13 +410,15 @@ jobs:
             --name "${{ matrix.name }}" \
             --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
             --output-dir "$RUNNER_TEMP/fx-pgso-heavy-${{ matrix.name }}" \
+            --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}" \
             --samples 50
 
       - name: Upload heavy-workload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pgso-heavy-${{ github.sha }}-${{ matrix.name }}
+          name: pgso-heavy-${{ github.sha }}-${{ matrix.name }}-attempt-${{ github.run_attempt }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/manifest.json
             ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/failure.json
@@ -411,6 +432,8 @@ jobs:
     needs: [candidate, behavior, startup, heavy]
     runs-on: macos-15
     timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -422,7 +445,8 @@ jobs:
       - name: Download candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: pgso-candidate-${{ github.sha }}
+          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/fx-pgso-candidate
 
       - name: Download behavior evidence
@@ -456,63 +480,12 @@ jobs:
             --output-dir "$RUNNER_TEMP/fx-pgso-aggregate"
 
       - name: Upload aggregate evidence
+        id: upload
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pgso-evidence-macos-arm64-${{ github.sha }}
+          name: pgso-evidence-macos-arm64-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          overwrite: true
           path: ${{ runner.temp }}/fx-pgso-aggregate
           if-no-files-found: error
           retention-days: 14
-
-  sign-stable-release:
-    name: Sign stable macOS arm64 release
-    needs: aggregate
-    if: inputs.package_release
-    runs-on: macos-15
-    environment: apple-signing
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Require native arm64 host
-        run: test "$(uname -m)" = arm64
-
-      - name: Download eligible candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: pgso-evidence-macos-arm64-${{ github.sha }}
-          path: ${{ runner.temp }}/fx-pgso-aggregate
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
-
-      - name: Confirm release eligibility
-        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
-
-      - name: Sign and notarize stable release candidate
-        env:
-          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
-
-      - name: Package stable release candidate
-        run: |
-          archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
-          package_dir="$RUNNER_TEMP/fx-release-package"
-          mkdir -p "$package_dir"
-          cp "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "$archive" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
-          cd "$RUNNER_TEMP"
-          shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
-
-      - name: Upload stable release artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: fx-macos-aarch64
-          path: |
-            ${{ runner.temp }}/fx-macos-aarch64.tar.gz
-            ${{ runner.temp }}/fx-macos-aarch64.tar.gz.sha256
-          if-no-files-found: error

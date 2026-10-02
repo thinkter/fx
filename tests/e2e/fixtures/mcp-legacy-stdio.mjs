@@ -23,6 +23,18 @@ let completionStage = 0;
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
 
+// Startup failure modes model a package runner that exits before the server
+// answers initialize, printing npm-style diagnostics to stderr.
+const startupFailure = mode === "startup_exit" || mode === "startup_exit_after_delay";
+if (startupFailure) {
+  const fail = () => process.stderr.write(
+    "npm error code E401\nnpm error Incorrect or missing password.\n",
+    () => process.exit(7),
+  );
+  if (mode === "startup_exit") fail();
+  else setTimeout(fail, 400);
+}
+
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
@@ -180,6 +192,7 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
+    if (process.env.FX_MCP_IGNORE_DISCOVERY === "1") return;
     if (discoveryInvalidParams) {
       send({
         jsonrpc: "2.0",
@@ -220,6 +233,12 @@ function handle(message) {
     return;
   }
   if (message.method === "initialize") {
+    if (startupFailure) return;
+    // Answer with output fx must reject; the process itself stays up.
+    if (mode === "startup_garbage") {
+      process.stdout.write("not json\n");
+      return;
+    }
     if (messageCount !== 1) process.exit(2);
     const requestedVersion = message.params?.protocolVersion;
     if (requestedVersion !== legacyVersion && rejectNewerInitialize) process.exit(5);
@@ -358,6 +377,10 @@ function handle(message) {
     return;
   }
   if (message.method === "tools/call") {
+    if (mode === "draft7_schema" && draft7Pattern && !new RegExp(draft7Pattern, "u").test(message.params?.arguments?.text)) {
+      send({ jsonrpc: "2.0", id: message.id, result: { isError: true, content: [{ type: "text", text: "text violates the server pattern" }] } });
+      return;
+    }
     const progressToken = message.params?._meta?.progressToken;
     if (!Number.isInteger(progressToken)) process.exit(4);
     if (mode === "direct_form") {

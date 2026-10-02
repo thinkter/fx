@@ -1,5 +1,7 @@
 const runtime_assistant_stream = @import("runtime/assistant_stream.zig");
+const runtime_agent = @import("runtime/agent.zig");
 const runtime_config = @import("runtime/config.zig");
+const runtime_checkpoint = @import("runtime/checkpoint.zig");
 const runtime_deps = @import("runtime/deps.zig");
 const runtime_execution_memory = @import("runtime/execution_memory.zig");
 const runtime_finalization = @import("runtime/finalization.zig");
@@ -8,6 +10,8 @@ const runtime_orchestrator = @import("runtime/orchestrator.zig");
 const runtime_tool_contracts = @import("runtime/tool_contracts.zig");
 
 pub const ToolExecutionStatus = runtime_tool_contracts.ToolExecutionStatus;
+pub const Agent = runtime_agent.Agent;
+pub const checkpoint = runtime_checkpoint;
 pub const DeferredToolCompletion = runtime_tool_contracts.DeferredToolCompletion;
 pub const TransportPublicationOutcome = runtime_tool_contracts.TransportPublicationOutcome;
 pub const SecondarySinkOutcome = runtime_tool_contracts.SecondarySinkOutcome;
@@ -20,6 +24,7 @@ pub const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
 pub const DiffEntryPayload = runtime_tool_contracts.DiffEntryPayload;
 pub const ToolCallValidationResult = runtime_tool_contracts.ToolCallValidationResult;
 pub const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
+pub const TurnProgress = runtime_deps.TurnProgress;
 pub const TextEmission = runtime_deps.TextEmission;
 pub const ParentTurnDeliveryAck = runtime_deps.ParentTurnDeliveryAck;
 pub const PreparedParentTurnContext = runtime_deps.PreparedParentTurnContext;
@@ -28,23 +33,28 @@ pub const RouteRecoveryRequest = runtime_deps.RouteRecoveryRequest;
 pub const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 pub const SemanticPresentationSink = runtime_assistant_stream.SemanticPresentationSink;
 pub const LifecycleContext = runtime_lifecycle.LifecycleContext;
-pub const PreparedToolBlockKind = runtime_lifecycle.PreparedToolBlockKind;
 pub const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
 pub const prepareToolCallForLifecycle = runtime_lifecycle.prepareToolCallForLifecycle;
 pub const dispatchAttentionRequiredCheckpoint = runtime_lifecycle.dispatchAttentionRequiredCheckpoint;
 pub const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 pub const Config = runtime_config.Config;
-pub const processQueuedPrompt = runtime_orchestrator.processQueuedPrompt;
+pub const processAgentPrompt = runtime_orchestrator.processAgentPrompt;
+pub const compactContext = runtime_orchestrator.compactContext;
+pub const compactionSize = runtime_orchestrator.compactionSize;
+pub const CompactorCaller = @import("runtime/text_completion.zig").CompactorCaller;
 pub const persistedStatusForCurrentFxLocalResult = runtime_execution_memory.persistedStatusForCurrentFxLocalResult;
 pub const classifyProviderExecutedResultStatus = runtime_execution_memory.classifyProviderExecutedResultStatus;
 pub const normalizeAssistantTextForDisplay = runtime_assistant_stream.normalizeAssistantTextForDisplay;
 
 test {
     _ = @import("stream_provider.zig");
+    _ = @import("../compactor/compactor.zig");
+    _ = @import("runtime/parallel_execution.zig");
     _ = @import("runtime/tests/gateway_flow.zig");
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");
     _ = @import("runtime/orchestrator.zig");
+    _ = @import("runtime/text_completion.zig");
     _ = @import("runtime/vision_contracts.zig");
 }

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const mcp_auth = @import("mcp_auth.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
@@ -96,13 +97,26 @@ fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) KeychainError!bool {
 fn selectStorageBackend(
     os_tag: std.Target.Os.Tag,
     keychain_disabled: bool,
+    keychain_available: bool,
 ) StorageBackend {
-    if (os_tag == .macos and !keychain_disabled) return .macos_keychain;
+    if (os_tag == .macos and !keychain_disabled and keychain_available) {
+        return .macos_keychain;
+    }
     return .profile_file;
 }
 
-fn storageBackend() StorageBackend {
-    return selectStorageBackend(builtin.os.tag, native_keychain.isDisabled());
+fn storageBackend(
+    alloc: Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !StorageBackend {
+    const disabled = native_keychain.isDisabled();
+    const available = if (builtin.os.tag == .macos and !disabled) blk: {
+        break :blk if (cancel_flag) |flag|
+            try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
+        else
+            try native_keychain.userDefaultKeychainAvailable(alloc);
+    } else false;
+    return selectStorageBackend(builtin.os.tag, disabled, available);
 }
 
 fn selectReadDecision(
@@ -209,7 +223,7 @@ fn loadControlled(
     configured_issuer: ?[]const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?mcp_auth.Credentials {
-    const backend = storageBackend();
+    const backend = try storageBackend(alloc, cancel_flag);
     var locked = (try openLockedDirForReadControlled(
         backend,
         cancel_flag,
@@ -274,7 +288,7 @@ pub fn save(
     server_identity: []const u8,
     credentials: mcp_auth.Credentials,
 ) !SaveResult {
-    const backend = storageBackend();
+    const backend = try storageBackend(alloc, null);
     var locked = try openOrCreateLockedDir();
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
@@ -306,7 +320,7 @@ pub fn delete(
     server_identity: []const u8,
     endpoint: []const u8,
 ) !DeleteResult {
-    const backend = storageBackend();
+    const backend = try storageBackend(alloc, null);
     var locked = (try openLockedDirForRead(backend)) orelse return .{};
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
@@ -618,13 +632,13 @@ fn parseCredentials(
     object: std.json.ObjectMap,
 ) !mcp_auth.Credentials {
     const endpoint = try dupeRequiredString(alloc, object, "endpoint");
-    errdefer alloc.free(endpoint);
+    errdefer mem_utils.free(alloc, endpoint);
     const resource = try dupeRequiredString(alloc, object, "resource");
-    errdefer alloc.free(resource);
+    errdefer mem_utils.free(alloc, resource);
     const issuer = try dupeRequiredString(alloc, object, "issuer");
-    errdefer alloc.free(issuer);
+    errdefer mem_utils.free(alloc, issuer);
     const client_id = try dupeRequiredString(alloc, object, "client_id");
-    errdefer alloc.free(client_id);
+    errdefer mem_utils.free(alloc, client_id);
     const client_secret = try dupeOptionalString(alloc, object, "client_secret");
     errdefer if (client_secret) |value| secret.zeroAndFree(alloc, value);
     const access_token = try dupeRequiredString(alloc, object, "access_token");
@@ -632,29 +646,29 @@ fn parseCredentials(
     const refresh_token = try dupeOptionalString(alloc, object, "refresh_token");
     errdefer if (refresh_token) |value| secret.zeroAndFree(alloc, value);
     const scope = try dupeStringAllowEmpty(alloc, object, "scope");
-    errdefer alloc.free(scope);
+    errdefer mem_utils.free(alloc, scope);
     const token_type = try dupeRequiredString(alloc, object, "token_type");
-    errdefer alloc.free(token_type);
+    errdefer mem_utils.free(alloc, token_type);
     const token_endpoint_auth_method = try dupeRequiredString(
         alloc,
         object,
         "token_endpoint_auth_method",
     );
-    errdefer alloc.free(token_endpoint_auth_method);
+    errdefer mem_utils.free(alloc, token_endpoint_auth_method);
     const authorization_endpoint = try dupeRequiredString(
         alloc,
         object,
         "authorization_endpoint",
     );
-    errdefer alloc.free(authorization_endpoint);
+    errdefer mem_utils.free(alloc, authorization_endpoint);
     const token_endpoint = try dupeRequiredString(alloc, object, "token_endpoint");
-    errdefer alloc.free(token_endpoint);
+    errdefer mem_utils.free(alloc, token_endpoint);
     const revocation_endpoint = try dupeOptionalString(
         alloc,
         object,
         "revocation_endpoint",
     );
-    errdefer if (revocation_endpoint) |value| alloc.free(value);
+    errdefer if (revocation_endpoint) |value| mem_utils.free(alloc, value);
     const expires_at_value = object.get("expires_at_ms") orelse
         return error.InvalidMcpCredentialStore;
     const expires_at_ms: i64 = switch (expires_at_value) {
@@ -1033,19 +1047,23 @@ test "credential store isolation cleans up every allocation failure" {
 test "credential backend selection is explicit and platform scoped" {
     try std.testing.expectEqual(
         StorageBackend.macos_keychain,
-        selectStorageBackend(.macos, false),
+        selectStorageBackend(.macos, false, true),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.macos, true),
+        selectStorageBackend(.macos, false, false),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.linux, false),
+        selectStorageBackend(.macos, true, true),
     );
     try std.testing.expectEqual(
         StorageBackend.profile_file,
-        selectStorageBackend(.windows, false),
+        selectStorageBackend(.linux, false, true),
+    );
+    try std.testing.expectEqual(
+        StorageBackend.profile_file,
+        selectStorageBackend(.windows, false, true),
     );
 }
 

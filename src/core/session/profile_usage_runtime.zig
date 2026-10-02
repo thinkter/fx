@@ -73,6 +73,13 @@ pub const Runtime = struct {
         return self.store != null;
     }
 
+    /// Process exit must not wait on another process holding the profile
+    /// ledger lock. Skips `mutex`, which a blocked publisher holds for the
+    /// whole wait; only the host thread that is exiting reassigns `store`.
+    pub fn abandonLedgerForProcessExit(self: *Runtime) void {
+        if (self.store) |*store| store.abandonLock();
+    }
+
     pub fn snapshot(
         self: *Runtime,
         alloc: Allocator,
@@ -138,6 +145,7 @@ pub const Runtime = struct {
         event: usage_report.ProfileEvent,
     ) anyerror!void {
         const self: *Runtime = @ptrCast(@alignCast(context));
+        const started_ms = io_mod.milliTimestamp();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         const store = if (self.store) |*value| value else return error.ProfileUsageUnavailable;
@@ -145,6 +153,11 @@ pub const Runtime = struct {
             self.last_error = err;
             return err;
         };
+        debug_trace.logf(
+            "session",
+            "usage profile append ms={d} outcome={s}",
+            .{ io_mod.milliTimestamp() - started_ms, @tagName(outcome) },
+        );
         if (outcome == .conflict) {
             self.last_error = error.ConflictingUsagePublication;
             return error.ConflictingUsagePublication;
@@ -267,6 +280,10 @@ fn buildSnapshot(
         facts,
         incidents[0..incident_count],
     );
+}
+
+test {
+    _ = profile_usage_store;
 }
 
 test "profile runtime snapshots only durable profile facts" {

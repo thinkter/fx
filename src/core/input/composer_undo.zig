@@ -138,7 +138,7 @@ pub const State = struct {
         self.vertical_navigation.reset();
         self.picker.clearModelPickerFlow();
         self.picker.reconcileInlinePickerAfterEdit(self.edit);
-        self.picker.resetActiveModelPickerIndex();
+        self.picker.resetActiveCompletionIndex();
         self.picker.resetFilePickerIndex();
         self.input_limit_rejection.* = input_limit_rejection.clear();
         return true;
@@ -200,7 +200,7 @@ test "composer undo and redo apply the recorded transition and reset edit policy
 
     try fixture.edit.setText(alloc, "ab ");
     try fixture.record(alloc, 1, "", "b", 1, 2);
-    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, true, .effort);
+    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, true, false, .effort);
     fixture.picker.file_completion_index = 3;
     fixture.picker.file_completion_window_start = 1;
     fixture.entities.markFileCompletionSeparator(

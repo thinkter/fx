@@ -207,9 +207,10 @@ fn openExistingRegularFileWithPolicy(
     const initial = try dir.statFile(getIo(), sub_path, .{
         .follow_symlinks = policy.final_symlink == .follow,
     });
-    if (initial.kind != .file or (policy.hardlinks == .reject and initial.nlink != 1)) {
-        return error.DurablePathUnsafe;
-    }
+    // A lookup that races an atomic replacement can return the replaced file
+    // after its last link is gone. Apply the opened-file policy, so a
+    // read-only open accepts that snapshot as the check after the open does.
+    try verifyOpenedRegularFileWithPolicy(initial, policy);
 
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         var file = try dir.openFile(getIo(), sub_path, .{
@@ -327,6 +328,37 @@ test "read-only regular files remain valid when atomic replacement unlinks the d
     const bytes = try readFileToEnd(alloc, &file, 16);
     defer alloc.free(bytes);
     try std.testing.expectEqualStrings("old", bytes);
+}
+
+test "read-only opens accept a file that a concurrent atomic replacement unlinks" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "target", .data = "v" });
+    const Replacer = struct {
+        dir: std.Io.Dir,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                self.dir.writeFile(getIo(), .{ .sub_path = "next", .data = "v" }) catch return;
+                self.dir.rename("next", self.dir, "target", getIo()) catch return;
+            }
+        }
+    };
+    var replacer: Replacer = .{ .dir = tmp.dir };
+    const thread = try std.Thread.spawn(.{}, Replacer.run, .{&replacer});
+    defer {
+        replacer.stop.store(true, .release);
+        thread.join();
+    }
+    // Some lookups see the replaced file after its last link is gone.
+    for (0..5000) |_| {
+        var file = try openExistingRegularFile(tmp.dir, "target", .read_only);
+        file.close(getIo());
+    }
 }
 
 test "read-only regular file policy accepts hardlinks while durable policy rejects" {
@@ -532,6 +564,9 @@ pub const DurableOps = struct {
     ctx: ?*anyopaque = null,
     sync_file: *const fn (?*anyopaque, std.Io.File) anyerror!void = defaultSyncFile,
     sync_dir: *const fn (?*anyopaque, std.Io.Dir) anyerror!void = defaultSyncDir,
+    /// When set, a replace that fails before its rename also records the
+    /// error that stopped it, which `DurableReplacePreRenameFailed` omits.
+    pre_rename_cause: ?*?anyerror = null,
 };
 
 fn defaultTryLock(_: ?*anyopaque, file: std.Io.File) anyerror!bool {
@@ -632,6 +667,24 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
     return .{ .dir = dir };
 }
 
+/// Opens an existing private folder, checked as
+/// `openOrCreateVerifiedPrivateDir` checks it, without creating it: null
+/// when it is missing.
+pub fn openVerifiedPrivateDirIfPresent(parent: *VerifiedDir, name: []const u8) !?VerifiedDir {
+    try validateRelativeLeaf(name);
+    var dir = parent.dir.openDir(getIo(), name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    errdefer dir.close(getIo());
+    try verifyPrivateDirectory(dir);
+    return .{ .dir = dir };
+}
+
 pub fn openOrCreateVerifiedPrivateDir(parent: *VerifiedDir, name: []const u8) !VerifiedDir {
     return openOrCreateVerifiedPrivateChild(parent.dir, name);
 }
@@ -665,6 +718,11 @@ pub fn durableReplaceVerified(
     return durableReplaceVerifiedWithOps(alloc, dir, name, bytes, .{});
 }
 
+fn preRenameFailed(ops: DurableOps, cause: anyerror) error{DurableReplacePreRenameFailed} {
+    if (ops.pre_rename_cause) |slot| slot.* = cause;
+    return error.DurableReplacePreRenameFailed;
+}
+
 pub fn durableReplaceVerifiedWithOps(
     alloc: std.mem.Allocator,
     dir: *VerifiedDir,
@@ -676,7 +734,7 @@ pub fn durableReplaceVerifiedWithOps(
     try validateRelativeLeaf(name);
     validateReplaceTarget(dir.dir, name) catch |err| switch (err) {
         error.DurablePathUnsafe, error.AccessDenied => return err,
-        else => return error.DurableReplacePreRenameFailed,
+        else => return preRenameFailed(ops, err),
     };
 
     var random_bytes: [16]u8 = undefined;
@@ -694,18 +752,18 @@ pub fn durableReplaceVerifiedWithOps(
         .exclusive = true,
         .permissions = private_file_permissions,
         .resolve_beneath = true,
-    }) catch return error.DurableReplacePreRenameFailed;
+    }) catch |err| return preRenameFailed(ops, err);
     temp_exists = true;
     defer file.close(getIo());
 
     file.setPermissions(getIo(), private_file_permissions) catch return error.PrivateStatePermissionsUnsupported;
     verifyPrivateRegularFile(file) catch |err| switch (err) {
         error.DurablePathUnsafe, error.PrivateStatePermissionsUnsupported => return err,
-        else => return error.DurableReplacePreRenameFailed,
+        else => return preRenameFailed(ops, err),
     };
-    file.writeStreamingAll(getIo(), bytes) catch return error.DurableReplacePreRenameFailed;
-    ops.sync_file(ops.ctx, file) catch return error.DurableReplacePreRenameFailed;
-    dir.dir.rename(temp_name, dir.dir, name, getIo()) catch return error.DurableReplacePreRenameFailed;
+    file.writeStreamingAll(getIo(), bytes) catch |err| return preRenameFailed(ops, err);
+    ops.sync_file(ops.ctx, file) catch |err| return preRenameFailed(ops, err);
+    dir.dir.rename(temp_name, dir.dir, name, getIo()) catch |err| return preRenameFailed(ops, err);
     temp_exists = false;
 
     const final_stat = dir.dir.statFile(getIo(), name, .{ .follow_symlinks = false }) catch {
@@ -903,9 +961,22 @@ pub fn makeDirRecursive(path: []const u8) !void {
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+    const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.NameTooLong;
     var result_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ptr = std.c.realpath(path_z, &result_buf) orelse return error.FileNotFound;
+    const ptr = std.c.realpath(path_z, &result_buf) orelse {
+        return switch (std.posix.errno(-1)) {
+            .NOENT => error.FileNotFound,
+            .NOTDIR => error.NotDir,
+            .LOOP => error.SymLinkLoop,
+            .ACCES => error.AccessDenied,
+            .PERM => error.PermissionDenied,
+            .NAMETOOLONG => error.NameTooLong,
+            .INVAL => error.BadPathName,
+            .IO => error.InputOutput,
+            .NOMEM => error.OutOfMemory,
+            else => |err| std.posix.unexpectedErrno(err),
+        };
+    };
     const resolved = std.mem.sliceTo(ptr, 0);
     return alloc.dupe(u8, resolved);
 }
@@ -1274,6 +1345,23 @@ test "realpathAlloc on nonexistent path returns FileNotFound" {
     try std.testing.expectError(error.FileNotFound, realpathAlloc(alloc, missing));
 }
 
+test "realpathAlloc distinguishes non-directory and symlink-loop paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "file", "content");
+    try tmp.dir.symLink(getIo(), "loop", "loop", .{});
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const not_dir = try std.fs.path.join(alloc, &.{ root, "file/child" });
+    defer alloc.free(not_dir);
+    const loop = try std.fs.path.join(alloc, &.{ root, "loop/child" });
+    defer alloc.free(loop);
+
+    try std.testing.expectError(error.NotDir, realpathAlloc(alloc, not_dir));
+    try std.testing.expectError(error.SymLinkLoop, realpathAlloc(alloc, loop));
+}
+
 const DurableFailureState = struct {
     fail_temp_sync: bool = false,
     fail_parent_sync: bool = false,
@@ -1334,6 +1422,29 @@ test "durable replace reports pre-rename failure without changing target" {
     const bytes = try readFileToEnd(alloc, &file, 16);
     defer alloc.free(bytes);
     try std.testing.expectEqualStrings("old", bytes);
+}
+
+test "durable replace can record what stopped it before the rename" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir = VerifiedDir{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    var state = DurableFailureState{ .fail_temp_sync = true };
+    var cause: ?anyerror = null;
+    const ops = DurableOps{ .ctx = &state, .sync_file = testDurableSyncFile, .pre_rename_cause = &cause };
+    try std.testing.expectError(
+        error.DurableReplacePreRenameFailed,
+        durableReplaceVerifiedWithOps(alloc, &dir, "marker", "new", ops),
+    );
+    try std.testing.expectEqual(@as(?anyerror, error.InjectedSyncFailure), cause);
+    try std.testing.expectError(error.FileNotFound, dir.dir.statFile(getIo(), "marker", .{ .follow_symlinks = false }));
+
+    // A replace that succeeds records nothing.
+    cause = null;
+    try durableReplaceVerifiedWithOps(alloc, &dir, "marker", "new", .{ .pre_rename_cause = &cause });
+    try std.testing.expectEqual(@as(?anyerror, null), cause);
 }
 
 test "durable replace reports post-rename sync failure as indeterminate" {

@@ -1,5 +1,5 @@
 const std = @import("std");
-const background_runtime = @import("../background/background_runtime.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
@@ -15,6 +15,7 @@ const read_tracker_mod = @import("../workspace/read_tracker.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_runner = @import("../execution/command_runner.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
@@ -30,6 +31,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const tool_args = @import("tool_args.zig");
+const result_commit = @import("result_commit.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -49,13 +51,12 @@ pub const default_max_read_file_lines: usize = 400;
 pub const default_max_read_file_line_len: usize = 2000;
 
 pub const web_search_unavailable_message = "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed";
-pub const web_fetch_unavailable_message = "web_fetch is unavailable: no local WebFetch runtime is installed";
 pub const terminal_unavailable_message =
-    "{\"error\":{\"tool\":\"terminal\",\"code\":\"unsupported_host\",\"retryable\":false}}";
+    "{\"error\":{\"tool\":\"shell\",\"code\":\"unsupported_host\",\"retryable\":false}}";
 const terminal_saved_session_required_message =
-    "Durable terminal actions require a saved fx session.";
+    "TTY shell actions require a saved fx session.";
 const terminal_saved_session_required_suggestion =
-    "Use terminal.exec, or rerun without --no-save.";
+    "Use shell.run with tty=false, or rerun without --no-save.";
 
 pub const ToolCapabilities = struct {
     web_search_runtime_ready: bool = false,
@@ -115,6 +116,7 @@ pub const SelectedDynamicToolSinkFn = *const fn (
     ?*anyopaque,
     []const u8,
     []const u8,
+    ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void;
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
@@ -139,13 +141,60 @@ pub const ToolInput = struct {
 pub const ToolResult = union(enum) {
     success: []u8,
     failure: []u8,
+    rich: struct { text: []u8, images: []core_types.ToolImage, is_error: bool = false },
 
-    /// Frees the owned result text.
+    /// Frees the owned result text and media.
     pub fn deinit(self: ToolResult, alloc: Allocator) void {
         switch (self) {
             .success => |body| alloc.free(body),
             .failure => |body| alloc.free(body),
+            .rich => |content| {
+                alloc.free(content.text);
+                core_types.freeToolImages(alloc, content.images);
+            },
         }
+    }
+
+    pub fn intoAuthorized(self: ToolResult) AuthorizedDispatchResult {
+        return switch (self) {
+            .success => |body| .{ .status = .success, .body = body },
+            .failure => |body| .{ .status = .failure, .body = body },
+            .rich => |content| .{ .status = if (content.is_error) .failure else .success, .body = content.text, .images = content.images },
+        };
+    }
+};
+
+pub const ModelContentKind = enum { ordinary, complete_skill };
+
+pub const HostToolProviderFn = *const fn (
+    *anyopaque,
+    Allocator,
+    []const u8,
+    []const u8,
+    usize,
+    ?*std.atomic.Value(bool),
+) DispatchError!ToolResult;
+
+pub const HostToolProvider = struct {
+    context: *anyopaque,
+    call_fn: HostToolProviderFn,
+
+    pub fn call(
+        self: HostToolProvider,
+        alloc: Allocator,
+        name: []const u8,
+        arguments_json: []const u8,
+        max_result_bytes: usize,
+        cancel_flag: ?*std.atomic.Value(bool),
+    ) DispatchError!ToolResult {
+        return self.call_fn(
+            self.context,
+            alloc,
+            name,
+            arguments_json,
+            max_result_bytes,
+            cancel_flag,
+        );
     }
 };
 
@@ -208,32 +257,32 @@ pub const DispatchContext = struct {
     max_read_file_lines: usize = default_max_read_file_lines,
     max_read_file_line_len: usize = default_max_read_file_line_len,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
+    skill_locations: ?*const skill_contract.Locations = null,
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
     context_limits: context_limits.Values = .{},
-    permission_ctx: ?*const PermissionContext = null,
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
     change_tracker: ?*change_tracker.ChangeTracker = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?core_types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
-    background_ctx: ?*background_runtime.BackgroundRuntime = null,
-    background_url_ctx: ?*anyopaque = null,
-    on_background_url_ready: ?*const fn (*anyopaque, []const u8, []const u8) void = null,
-    background_log_dir: ?[]const u8 = null,
     command_artifact_dir: ?[]const u8 = null,
+    managed_executions: ?*managed_execution.Runtime = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     terminal_owner_session_id: ?[]const u8 = null,
     terminal_transport_role: terminal_contracts.TransportRole = .interactive,
-    background_lifecycle_allocator: Allocator = std.heap.c_allocator,
+    lifecycle_allocator: Allocator = std.heap.c_allocator,
     command_timeout_ms: ?usize = null,
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
     vision_provider: ?VisionProvider = null,
+    host_tool_provider: ?HostToolProvider = null,
     ask_question_ctx: ?*anyopaque = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
     tool_capabilities: ToolCapabilities = .{},
@@ -266,6 +315,9 @@ pub const DispatchContext = struct {
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
+    model_content_kind_sink: ?*ModelContentKind = null,
+    command_result_json_sink: ?*?[]const u8 = null,
+    result_commit_sink: ?*?result_commit.Token = null,
 };
 
 /// Function pointer used by ask_user_question to request live user answers.
@@ -278,22 +330,6 @@ pub const AskQuestionBatchFn = *const fn (
 /// Function pointer used to override permission decisions in tests and callers.
 pub const PermissionDecider = *const fn (*const Tool, ToolInput, DispatchContext) permission_gate.Decision;
 
-/// Rule-engine lookup function carried through dispatch for test injection.
-pub const PermissionRuleLookup = *const fn (
-    Allocator,
-    core_types.PermissionRuleSet,
-    []const u8,
-    []const u8,
-    []const u8,
-    PermissionTargetKind,
-) anyerror!core_permissions.RuleDecision;
-
-/// Permission state shared by a noninteractive turn.
-pub const PermissionContext = struct {
-    rules: ?*const core_types.PermissionRuleSet = null,
-    rule_lookup: PermissionRuleLookup = core_permissions.ruleDecisionFor,
-};
-
 /// Function pointer that decodes JSON arguments into a concrete input.
 pub const DecodeFn = *const fn (DispatchContext, []const u8) DispatchError!DecodeResult;
 
@@ -302,21 +338,6 @@ pub const ValidateFn = *const fn (DispatchContext, ToolInput) DispatchError!?[]u
 
 /// Function pointer that executes a validated and allowed tool input.
 pub const CallFn = *const fn (DispatchContext, ToolInput) DispatchError!ToolResult;
-
-/// Optional Core adapter selected by a registered tool descriptor when the
-/// ordinary decode/validate/call path needs a focused lifecycle wrapper.
-pub const AuthorizedCallAdapterFn = *const fn (
-    DispatchContext,
-    Registry,
-    message.ToolCall,
-) DispatchError!DispatchResult;
-
-/// Optional Core mapper selected by a registered tool descriptor after an
-/// authorized call has produced its structured dispatch result.
-pub const AuthorizedResultMapperFn = *const fn (
-    Allocator,
-    DispatchResult,
-) Allocator.Error!DispatchResult;
 
 pub const RunCommandCompatibility = struct {
     matches: *const fn ([]const u8) bool,
@@ -358,9 +379,10 @@ pub const LabelArgKind = enum {
     command,
     description,
     source,
-    old_path,
+    resource,
     action,
     query,
+    server,
     selector,
     session_id,
 };
@@ -368,21 +390,12 @@ pub const LabelArgKind = enum {
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
 
 pub const ExecutorKind = enum {
-    list_files,
     glob_files,
     grep_files,
     read_file,
     read_tool_result,
     write_file,
     edit_file,
-    delete_file,
-    rename_file,
-    copy_file,
-    create_folder,
-    file_info,
-    memory,
-    semantic_search,
-    open_file,
     web_fetch,
     web_search,
     run_command,
@@ -390,11 +403,12 @@ pub const ExecutorKind = enum {
     skill,
     install_skill,
     subagent,
-    mcp_search_tools,
+    capability_search,
     mcp_select_tool,
     mcp_features,
     ask_user_question,
     vision,
+    host,
 };
 
 pub const ApprovalPolicy = enum {
@@ -411,6 +425,7 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
+pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
     activity_kind: core_types.ToolActivityKind,
@@ -430,12 +445,15 @@ pub const Tool = struct {
     description: []const u8,
     model_schema: model_tool_schema.FunctionSchema,
     model_visible: bool = true,
+    /// fx's own discovery or bookkeeping step rather than work the user asked
+    /// for. Hosts may hide these calls.
+    internal: bool = false,
     write_provider_advertisement_fn: ?WriteProviderAdvertisementFn = null,
     /// Set when the provider runs the tool instead of fx dispatch. Such a tool
     /// never reaches a call-time permission check, so advertisement is its only
     /// enforcement point and requires an already-settled allow.
     provider_executed: bool = false,
-    executor_kind: ExecutorKind = .list_files,
+    executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,
     approval_policy: ApprovalPolicy = .standard,
@@ -452,11 +470,11 @@ pub const Tool = struct {
     captured_command_host: command_environment.Host = .native,
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
-    authorized_call_adapter: ?AuthorizedCallAdapterFn = null,
-    authorized_result_mapper: ?AuthorizedResultMapperFn = null,
+    process_local_fn: ?ProcessLocalFn = null,
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
     take_file_mutation_input_fn: ?TakeFileMutationInputFn = null,
+    prepare_skill_call_fn: ?*const fn (DispatchContext, []const u8) DispatchError!skill_contract.CallPreparation = null,
     reads_only_fn: ReadsOnlyFn,
     irreversible_fn: IrreversibleFn,
 };
@@ -586,9 +604,10 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .command => optionalStringArg(args, "command"),
         .description => optionalStringArg(args, "description"),
         .source => optionalStringArg(args, "source"),
-        .old_path => optionalStringArg(args, "old_path"),
+        .resource => optionalStringArg(args, "resource"),
         .action => optionalStringArg(args, "action"),
         .query => optionalStringArg(args, "query"),
+        .server => optionalStringArg(args, "server"),
         .selector => optionalStringArg(args, "selector"),
         .session_id => optionalStringArg(args, "session_id"),
     };
@@ -758,13 +777,16 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
 
 /// Owned tool-result message body produced by dispatch.
 pub const DispatchResult = struct {
+    model_content_kind: ModelContentKind = .ordinary,
     status: Status,
     body: []u8,
+    images: []core_types.ToolImage = &.{},
     status_detail: ?[]u8 = null,
     inner_usage: ?core_types.ToolUsage = null,
     web_search_completion: ?core_types.WebSearchCompletion = null,
     web_fetch_completion: ?core_types.WebFetchCompletion = null,
     tool_result_memory: ?core_types.ToolResultMemory = null,
+    command_result_json: ?[]const u8 = null,
 
     /// Tool-result status used only by tests and diagnostics.
     pub const Status = enum {
@@ -775,7 +797,29 @@ pub const DispatchResult = struct {
     /// Frees the owned tool-result body and optional diagnostic detail.
     pub fn deinit(self: DispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
+        core_types.freeToolImages(alloc, self.images);
         if (self.status_detail) |detail| alloc.free(detail);
+        if (self.command_result_json) |json| alloc.free(@constCast(json));
+        if (self.tool_result_memory) |memory| {
+            if (memory.command_output_replay) |replay| switch (replay) {
+                .available => |descriptor| alloc.free(@constCast(descriptor.handle)),
+                .unavailable => {},
+            };
+        }
+    }
+};
+
+/// Owned authorized-dispatch result. Runtime metadata is published through
+/// the caller-provided sinks in `DispatchContext` instead of being copied into
+/// this transport result.
+pub const AuthorizedDispatchResult = struct {
+    status: DispatchResult.Status,
+    body: []u8,
+    images: []core_types.ToolImage = &.{},
+
+    pub fn deinit(self: AuthorizedDispatchResult, alloc: Allocator) void {
+        alloc.free(self.body);
+        core_types.freeToolImages(alloc, self.images);
     }
 };
 
@@ -785,11 +829,16 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
+    var captured_model_content_kind: ModelContentKind = .ordinary;
+    var captured_command_result_json: ?[]const u8 = null;
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
     if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
     if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
+    if (call_ctx.model_content_kind_sink == null) call_ctx.model_content_kind_sink = &captured_model_content_kind;
+    call_ctx.model_content_kind_sink.?.* = .ordinary;
+    if (call_ctx.command_result_json_sink == null) call_ctx.command_result_json_sink = &captured_command_result_json;
 
     const admission = try admitToolCall(call_ctx, registry, call);
     switch (admission) {
@@ -803,97 +852,48 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const web_search_completion = if (admitted.context.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
             const web_fetch_completion = if (admitted.context.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
             const tool_result_memory = if (admitted.context.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
-            return switch (result) {
-                .success => |body| .{
-                    .status = .success,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                },
-                .failure => |body| .{
-                    .status = .failure,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                },
+            const command_result_json = if (admitted.context.command_result_json_sink) |slot| slot.* else captured_command_result_json;
+            const output = result.intoAuthorized();
+            return .{
+                .status = output.status,
+                .model_content_kind = if (output.status == .success)
+                    if (admitted.context.model_content_kind_sink) |kind| kind.* else .ordinary
+                else
+                    .ordinary,
+                .body = output.body,
+                .images = output.images,
+                .inner_usage = inner_usage,
+                .web_search_completion = web_search_completion,
+                .web_fetch_completion = web_fetch_completion,
+                .tool_result_memory = tool_result_memory,
+                .command_result_json = command_result_json,
             };
         },
     }
 }
 
 /// Runs one already-authorized registered tool call through lookup, validation, and call.
-pub fn dispatchAuthorizedToolCall(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
-    const tool = registry.lookup(call.name) orelse return failure(
-        try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}),
-    );
-    const result = if (tool.authorized_call_adapter) |adapter|
-        try adapter(ctx, registry, call)
-    else
-        try dispatchAuthorizedToolCallDefault(ctx, registry, call);
-    if (tool.authorized_result_mapper) |mapper| {
-        return mapper(ctx.allocator, result) catch |err| {
-            result.deinit(ctx.allocator);
-            return err;
-        };
-    }
-    return result;
-}
-
-/// Runs the ordinary authorized decode/validate/call path without consulting a
-/// descriptor's lifecycle adapter. Focused adapters use this to wrap one call
-/// without recursively selecting themselves again.
-pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
-    var captured_usage: ?core_types.ToolUsage = null;
-    var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
-    var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
-    var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
-    var call_ctx = ctx;
-    if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
-    if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
-    if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
-    if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
-
-    const validated = try decodeAndValidateRegisteredToolCall(call_ctx, registry, call);
+pub fn dispatchAuthorizedToolCall(
+    ctx: DispatchContext,
+    registry: Registry,
+    call: message.ToolCall,
+) DispatchError!AuthorizedDispatchResult {
+    const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
-        .not_registered => return failure(try std.fmt.allocPrint(call_ctx.allocator, "unknown tool: {s}", .{call.name})),
-        .failure => |reason| return failure(reason),
+        .not_registered => return .{ .status = .failure, .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}) },
+        .failure => |reason| return .{ .status = .failure, .body = reason },
         .input => |input| {
-            defer input.value.deinit(call_ctx.allocator);
+            defer input.value.deinit(ctx.allocator);
 
-            const result = try input.tool.call(call_ctx, input.value);
+            const result = try input.tool.call(ctx, input.value);
             if (input.tool.cancel_if_requested_after_call and
-                call_ctx.cancel_flag != null and
-                call_ctx.cancel_flag.?.load(.seq_cst))
+                ctx.cancel_flag != null and
+                ctx.cancel_flag.?.load(.seq_cst))
             {
-                result.deinit(call_ctx.allocator);
+                result.deinit(ctx.allocator);
                 return error.Cancelled;
             }
-            const inner_usage = if (call_ctx.inner_usage_sink) |slot| slot.* else captured_usage;
-            const web_search_completion = if (call_ctx.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
-            const web_fetch_completion = if (call_ctx.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
-            const tool_result_memory = if (call_ctx.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
-            return switch (result) {
-                .success => |body| .{
-                    .status = .success,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                },
-                .failure => |body| .{
-                    .status = .failure,
-                    .body = body,
-                    .inner_usage = inner_usage,
-                    .web_search_completion = web_search_completion,
-                    .web_fetch_completion = web_fetch_completion,
-                    .tool_result_memory = tool_result_memory,
-                },
-            };
+            return result.intoAuthorized();
         },
     }
 }
@@ -918,13 +918,24 @@ pub fn reportToolResultMemory(ctx: DispatchContext, memory: core_types.ToolResul
     sink.* = memory;
 }
 
+pub fn reportCommandResultJson(ctx: DispatchContext, json: []const u8) void {
+    const sink = ctx.command_result_json_sink orelse return;
+    sink.* = json;
+}
+
+pub fn reportResultCommit(ctx: DispatchContext, token: result_commit.Token) void {
+    const sink = ctx.result_commit_sink orelse return;
+    sink.* = token;
+}
+
 pub fn reportSelectedDynamicTool(
     ctx: DispatchContext,
     name: []const u8,
     schema_json: []const u8,
+    binding: ?tool_mcp_runtime.Binding,
 ) error{OutOfMemory}!void {
     const sink = ctx.on_selected_dynamic_tool orelse return;
-    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json);
+    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json, binding);
 }
 
 pub fn reportContextNotice(ctx: DispatchContext, notice: []const u8) error{OutOfMemory}!void {
@@ -943,6 +954,10 @@ pub fn localToolAvailabilityFailure(
         else
             try ctx.allocator.dupe(u8, web_search_unavailable_message),
         .terminal => if (tool.captured_command_fn != null and tool.captured_command_fn.?(input))
+            null
+        else if (tool.process_local_fn != null and
+            tool.process_local_fn.?(input) and
+            ctx.managed_executions != null)
             null
         else if (!ctx.tool_capabilities.terminalAvailable())
             try ctx.allocator.dupe(u8, terminal_unavailable_message)
@@ -1466,10 +1481,6 @@ test "DispatchContext command runner fields default to inactive values" {
     try std.testing.expect(ctx.cancel_flag == null);
     try std.testing.expect(ctx.output_chunk_ctx == null);
     try std.testing.expect(ctx.on_output_chunk == null);
-    try std.testing.expect(ctx.background_ctx == null);
-    try std.testing.expect(ctx.background_url_ctx == null);
-    try std.testing.expect(ctx.on_background_url_ready == null);
-    try std.testing.expect(ctx.background_log_dir == null);
     try std.testing.expect(ctx.command_artifact_dir == null);
     try std.testing.expect(ctx.command_timeout_ms == null);
     try std.testing.expect(ctx.run_command_backend == null);

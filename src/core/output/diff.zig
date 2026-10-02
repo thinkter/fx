@@ -25,9 +25,52 @@ const trailing_newline_removed_marker = "(trailing newline removed)";
 pub const DiffEntry = struct {
     id: u32,
     full: ?FullDiff = null,
+    /// Set instead of `full` for resumed history: the full review is built
+    /// from the saved snapshots only when someone asks to see it.
+    deferred: ?DeferredFullDiff = null,
 
     pub fn deinit(self: *DiffEntry, alloc: Allocator) void {
         if (self.full) |full| full.deinit(alloc);
+        if (self.deferred) |deferred| deferred.deinit(alloc);
+    }
+};
+
+/// A saved edit whose full before/after review has not been built yet. The
+/// strings name the session artifact holding both snapshots and the tool call
+/// that artifact is bound to. All strings are owned by the holder.
+pub const DeferredFullDiff = struct {
+    call_id: []u8,
+    content_handle: []u8,
+    lifecycle_id: types.ToolLifecycleId,
+
+    /// Copies every borrowed string. Caller owns the result.
+    pub fn clone(
+        alloc: Allocator,
+        call_id: []const u8,
+        content_handle: []const u8,
+        lifecycle_id: types.ToolLifecycleId,
+    ) !DeferredFullDiff {
+        const owned_call = try alloc.dupe(u8, call_id);
+        errdefer alloc.free(owned_call);
+        const owned_handle = try alloc.dupe(u8, content_handle);
+        errdefer alloc.free(owned_handle);
+        const lifecycle_call = try alloc.dupe(u8, lifecycle_id.call_id);
+        return .{
+            .call_id = owned_call,
+            .content_handle = owned_handle,
+            .lifecycle_id = .{ .turn_id = lifecycle_id.turn_id, .call_id = lifecycle_call },
+        };
+    }
+
+    pub fn deinit(self: DeferredFullDiff, alloc: Allocator) void {
+        alloc.free(self.call_id);
+        alloc.free(self.content_handle);
+        alloc.free(@constCast(self.lifecycle_id.call_id));
+    }
+
+    pub fn matches(self: DeferredFullDiff, lifecycle_id: types.ToolLifecycleId) bool {
+        return self.lifecycle_id.turn_id == lifecycle_id.turn_id and
+            std.mem.eql(u8, self.lifecycle_id.call_id, lifecycle_id.call_id);
     }
 };
 
@@ -46,11 +89,13 @@ pub const DiffEntryPayload = struct {
     additions: u32 = 0,
     deletions: u32 = 0,
     full: ?FullDiff = null,
+    deferred: ?DeferredFullDiff = null,
 };
 
 pub fn freeDiffEntryPayload(alloc: Allocator, payload: DiffEntryPayload) void {
     alloc.free(payload.preview);
     if (payload.full) |full| full.deinit(alloc);
+    if (payload.deferred) |deferred| deferred.deinit(alloc);
 }
 
 test "diff entry payload has one canonical preview" {

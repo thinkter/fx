@@ -8,14 +8,12 @@ pub const Event = enum {
 
 pub const Depth = enum {
     inline_mode,
-    review,
     full,
 
     pub fn transition(self: Depth, event: Event) Depth {
         return switch (event) {
-            .toggle => if (self == .inline_mode) .review else .inline_mode,
-            .left => if (self.active()) .review else .inline_mode,
-            .right => if (self.active()) .full else .inline_mode,
+            .toggle => if (self == .inline_mode) .full else .inline_mode,
+            .left, .right => if (self.active()) .full else .inline_mode,
         };
     }
 
@@ -66,22 +64,9 @@ pub const State = struct {
         if (self.depth == requested) return self;
 
         var next = self;
-        if (self.depth.active() and requested.active()) {
-            next = next.queue_bookmark();
-        }
         next = switch (requested) {
             .inline_mode => next.closed(),
-            .review => if (self.depth == .inline_mode)
-                next.open_review()
-            else blk: {
-                next.depth = .review;
-                break :blk next;
-            },
-            .full => blk: {
-                if (self.depth == .inline_mode) next = next.open_review();
-                next.depth = .full;
-                break :blk next;
-            },
+            .full => next.open_full(),
         };
         return next;
     }
@@ -116,12 +101,32 @@ pub const State = struct {
         return next;
     }
 
+    pub fn select_page_boundary(self: State, entry_id: u32) State {
+        var next = self;
+        next.scroll_rows = 0;
+        next.follow_tail = false;
+        next.anchor_pending = false;
+        next.bookmark_entry_id = entry_id;
+        next.bookmark_intra_row = 0;
+        next.bookmark_pending = true;
+        return next;
+    }
+
     pub fn prepare_projection(self: State, cols: u16) State {
         var next = self;
         if (next.projection_cols) |previous_cols| {
             if (previous_cols != cols) next = next.queue_bookmark();
         }
         next.projection_cols = cols;
+        return next;
+    }
+
+    pub fn defer_full_open(self: State) State {
+        var next = self;
+        next.bookmark_pending = !next.follow_tail;
+        next.bookmark_entry_id = null;
+        next.bookmark_intra_row = 0;
+        next.depth = .inline_mode;
         return next;
     }
 
@@ -202,9 +207,9 @@ pub const State = struct {
         };
     }
 
-    fn open_review(self: State) State {
-        var next = self.reset_viewport();
-        next.depth = .review;
+    fn open_full(self: State) State {
+        var next = if (self.bookmark_pending) self else self.reset_viewport();
+        next.depth = .full;
         // The identity remains available for retention retargeting, but a
         // normal open starts at the tail instead of consuming the old anchor.
         next.anchor_pending = false;
@@ -232,6 +237,9 @@ pub const State = struct {
         var selected: ?ItemRow = null;
         for (item_rows) |item| {
             if (item.row > offset) break;
+            // Synthetic full-detail records share the never-issued id 0 and
+            // are not addressable restore anchors.
+            if (item.entry_id == 0) continue;
             selected = item;
         }
         const item = selected orelse if (item_rows.len > 0)
@@ -275,20 +283,18 @@ fn next_bookmark_item_row(item_rows: []const ItemRow, current_row: u32) ?u32 {
 }
 
 test "transcript presentation depth preserves viewer transitions" {
+    try std.testing.expect(std.meta.stringToEnum(Depth, "review") == null);
     const Case = struct {
         from: Depth,
         input: Event,
         expected: Depth,
     };
     const cases = [_]Case{
-        .{ .from = .inline_mode, .input = .toggle, .expected = .review },
-        .{ .from = .review, .input = .toggle, .expected = .inline_mode },
+        .{ .from = .inline_mode, .input = .toggle, .expected = .full },
         .{ .from = .full, .input = .toggle, .expected = .inline_mode },
         .{ .from = .inline_mode, .input = .left, .expected = .inline_mode },
-        .{ .from = .review, .input = .left, .expected = .review },
-        .{ .from = .full, .input = .left, .expected = .review },
+        .{ .from = .full, .input = .left, .expected = .full },
         .{ .from = .inline_mode, .input = .right, .expected = .inline_mode },
-        .{ .from = .review, .input = .right, .expected = .full },
         .{ .from = .full, .input = .right, .expected = .full },
     };
 
@@ -311,54 +317,25 @@ test "transcript presentation scroll saturates and leaves follow tail" {
     try std.testing.expectEqual(std.math.maxInt(u32), at_end.scroll_rows);
 }
 
-test "transcript presentation depth changes preserve viewport intent" {
-    const item_rows = [_]ItemRow{
-        .{ .entry_id = 10, .row = 0 },
-        .{ .entry_id = 20, .row = 4 },
-        .{ .entry_id = 30, .row = 10 },
-    };
-
-    for ([_]struct { from: Depth, to: Depth }{
-        .{ .from = .review, .to = .full },
-        .{ .from = .full, .to = .review },
-    }) |transition| {
-        const tail = (State{
-            .depth = transition.from,
-            .scroll_rows = 4,
-            .follow_tail = true,
-            .bookmark_entry_id = 20,
-            .bookmark_intra_row = 2,
-        }).with_depth(transition.to);
-        try std.testing.expect(!tail.bookmark_pending);
-
-        const tail_selected = tail.select_visual_offset(20, 5, &item_rows);
-        try std.testing.expectEqual(@as(u32, 15), tail_selected.offset);
-        try std.testing.expect(tail_selected.state.follow_tail);
-
-        const history = (State{
-            .depth = transition.from,
-            .scroll_rows = 6,
-            .follow_tail = false,
-            .bookmark_entry_id = 20,
-            .bookmark_intra_row = 2,
-        }).with_depth(transition.to);
-        try std.testing.expect(history.bookmark_pending);
-
-        const history_selected = history.select_visual_offset(20, 5, &item_rows);
-        try std.testing.expectEqual(@as(u32, 6), history_selected.offset);
-        try std.testing.expectEqual(@as(?u32, 20), history_selected.state.bookmark_entry_id);
-        try std.testing.expectEqual(@as(u32, 2), history_selected.state.bookmark_intra_row);
-        try std.testing.expect(!history_selected.state.bookmark_pending);
-    }
-
-    const no_bookmark = (State{
-        .depth = .review,
-        .scroll_rows = 99,
+test "transcript presentation deferred full open retains its exact offset" {
+    const deferred = (State{
+        .depth = .full,
+        .scroll_rows = 47,
         .follow_tail = false,
-    }).with_depth(.full);
-    try std.testing.expect(!no_bookmark.bookmark_pending);
-    const clamped = no_bookmark.select_visual_offset(20, 5, &item_rows);
-    try std.testing.expectEqual(@as(u32, 15), clamped.offset);
+        .bookmark_entry_id = 2,
+        .bookmark_intra_row = 7,
+    }).defer_full_open();
+    try std.testing.expectEqual(Depth.inline_mode, deferred.depth);
+    try std.testing.expect(deferred.bookmark_pending);
+    try std.testing.expectEqual(@as(?u32, null), deferred.bookmark_entry_id);
+
+    const reopened = deferred.with_depth(.full).select_visual_offset(
+        100,
+        10,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(u32, 47), reopened.offset);
+    try std.testing.expect(!reopened.state.follow_tail);
 }
 
 test "transcript presentation clamps bookmarks and selects retained neighbor" {
@@ -408,4 +385,18 @@ test "transcript presentation snapshot round trips all state" {
         .projection_cols = 40,
     };
     try std.testing.expectEqualDeep(state, State.from_snapshot(state.snapshot()));
+}
+
+test "transcript presentation bookmark skips synthetic id-0 full-detail records" {
+    const item_rows = [_]ItemRow{
+        .{ .entry_id = 0, .row = 1 },
+        .{ .entry_id = 0, .row = 4 },
+        .{ .entry_id = 10, .row = 8 },
+    };
+    const selected = (State{}).select_visual_offset(14, 4, &item_rows);
+    try std.testing.expectEqual(@as(?u32, 10), selected.state.bookmark_entry_id);
+
+    const records_only = [_]ItemRow{.{ .entry_id = 0, .row = 1 }};
+    const degenerate = (State{}).select_visual_offset(8, 4, &records_only);
+    try std.testing.expectEqual(@as(?u32, 0), degenerate.state.bookmark_entry_id);
 }

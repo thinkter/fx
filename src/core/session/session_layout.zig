@@ -2,16 +2,25 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-const session_id_random_bytes: usize = 8;
+const session_id_random_bytes: usize = 9;
+const session_id_encoded_bytes = std.base64.url_safe_no_pad.Encoder.calcSize(session_id_random_bytes);
+const terminal_session_id_prefix = "shell-";
+const terminal_session_id_random_bytes: usize = 16;
 
 pub fn sessionDirPath(alloc: Allocator, sessions_dir: []const u8, session_id: []const u8) ![]u8 {
     try validateSessionId(session_id);
     return std.fs.path.join(alloc, &.{ sessions_dir, session_id });
 }
 
+/// The sessions v2 root inside the v1 sessions folder. No v1 id can take
+/// this name in any case (macOS folders are case-insensitive by default),
+/// so every scan of the v1 folder skips it and no v1 path reaches it.
+pub const sessions_v2_dir = "v2";
+
 pub fn validateSessionId(session_id: []const u8) !void {
     if (session_id.len == 0 or session_id.len > 255 or
-        std.mem.eql(u8, session_id, ".") or std.mem.eql(u8, session_id, ".."))
+        std.mem.eql(u8, session_id, ".") or std.mem.eql(u8, session_id, "..") or
+        std.ascii.eqlIgnoreCase(session_id, sessions_v2_dir))
     {
         return error.InvalidSessionId;
     }
@@ -25,33 +34,44 @@ pub fn validateSessionId(session_id: []const u8) !void {
 pub fn generateSessionId(alloc: Allocator) ![]u8 {
     var random_bytes: [session_id_random_bytes]u8 = undefined;
     io_mod.getIo().random(&random_bytes);
-    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-    return std.fmt.allocPrint(alloc, "{d}-{d}-{s}", .{ io_mod.milliTimestamp(), io_mod.nanoTimestamp(), random_hex });
+    const id = try alloc.alloc(u8, session_id_encoded_bytes);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(id, &random_bytes);
+    return id;
 }
 
-fn isLowerHex(text: []const u8) bool {
-    for (text) |c| {
-        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
-    }
-    return true;
+pub fn generateTerminalSessionId(alloc: Allocator) ![]u8 {
+    var random_bytes: [terminal_session_id_random_bytes]u8 = undefined;
+    io_mod.getIo().random(&random_bytes);
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(random_bytes.len);
+    const id = try alloc.alloc(u8, terminal_session_id_prefix.len + encoded_len);
+    @memcpy(id[0..terminal_session_id_prefix.len], terminal_session_id_prefix);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(
+        id[terminal_session_id_prefix.len..],
+        &random_bytes,
+    );
+    return id;
 }
 
-test "generated session id includes random hex suffix" {
+test "generated session id is a compact url-safe token" {
     const id = try generateSessionId(std.testing.allocator);
     defer std.testing.allocator.free(id);
 
-    var segments = std.mem.splitScalar(u8, id, '-');
-    const millis = segments.next() orelse return error.TestExpectedEqual;
-    const nanos = segments.next() orelse return error.TestExpectedEqual;
-    const suffix = segments.next() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 12), id.len);
+    try validateSessionId(id);
+    for (id) |byte| {
+        try std.testing.expect(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_');
+    }
 
-    try std.testing.expect(segments.next() == null);
-    try std.testing.expect(millis.len > 0);
-    try std.testing.expect(nanos.len > 0);
-    _ = try std.fmt.parseInt(i64, millis, 10);
-    _ = try std.fmt.parseInt(i128, nanos, 10);
-    try std.testing.expectEqual(@as(usize, 16), suffix.len);
-    try std.testing.expect(isLowerHex(suffix));
+    try validateSessionId("1786460757753-1786460757753277000-ef75d8fd94fdab1");
+}
+
+test "generated terminal session id is compact and path safe" {
+    const id = try generateTerminalSessionId(std.testing.allocator);
+    defer std.testing.allocator.free(id);
+
+    try std.testing.expectEqual(terminal_session_id_prefix.len + 22, id.len);
+    try std.testing.expect(std.mem.startsWith(u8, id, terminal_session_id_prefix));
+    try validateSessionId(id);
 }
 
 test "session directory path rejects unsafe ids" {
@@ -97,4 +117,10 @@ test "session directory path rejects unsafe ids" {
     const maximum = try sessionDirPath(alloc, "/tmp/sessions", &max_id);
     defer alloc.free(maximum);
     try std.testing.expect(std.mem.endsWith(u8, maximum, &max_id));
+}
+
+test "the sessions v2 root is never a v1 session id" {
+    try std.testing.expectError(error.InvalidSessionId, validateSessionId(sessions_v2_dir));
+    try std.testing.expectError(error.InvalidSessionId, validateSessionId("V2"));
+    try validateSessionId("v2x");
 }

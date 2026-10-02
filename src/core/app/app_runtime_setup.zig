@@ -20,18 +20,29 @@ pub const LoadedSkills = struct {
     }
 };
 
+pub fn resolveSkillsHome(alloc: Allocator) Allocator.Error!?[]u8 {
+    const configured_home = io_mod.getenv("HOME") orelse return null;
+    return io_mod.realpathAlloc(alloc, configured_home) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => try alloc.dupe(u8, configured_home),
+    };
+}
+
+/// The managed skills directory under the configured HOME, or null without
+/// one. The caller owns the returned path.
+pub fn resolveManagedSkillsDir(alloc: Allocator) Allocator.Error!?[]u8 {
+    const home = (try resolveSkillsHome(alloc)) orelse return null;
+    defer alloc.free(home);
+    return try profile_paths.managedSkillsDir(alloc, home);
+}
+
 pub fn loadSkills(
     alloc: Allocator,
     workspace_root: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
-    const configured_home = io_mod.getenv("HOME") orelse return .{};
-    const canonical_home = io_mod.realpathAlloc(alloc, configured_home) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => null,
-    };
-    defer if (canonical_home) |home| alloc.free(home);
-    const home = canonical_home orelse configured_home;
+    const home = (try resolveSkillsHome(alloc)) orelse return .{};
+    defer alloc.free(home);
     const dir = try profile_paths.managedSkillsDir(alloc, home);
     errdefer alloc.free(dir);
     const discovery = try skill_runtime.loadVisibleSkills(alloc, workspace_root, home, dir, root_policy);

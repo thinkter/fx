@@ -1,10 +1,249 @@
+import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { loadModule } from "./wasm-module.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 const workspaceInfoLimit = 4 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
+const maxInstructionsBytes = 64 * 1024;
+const maxApiKeyBytes = 64 * 1024;
+const maxModelBytes = 1024;
+// Matches the kernel's ReasoningEffort.max_name_bytes.
+const maxEffortBytes = 64;
+const maxUrlBytes = 16 * 1024;
+const maxModelCatalogBytes = 4 * 1024 * 1024;
+const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
+const transportActivityIntervalMs = 250;
+const maxUnreadEventBytes = 1024 * 1024;
+const maxUnreadEvents = 256;
+// Prompt images travel as raw bytes beside the ACP frame and are base64
+// encoded only in the model request. An image may use 5 MiB of encoded
+// request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
+// The kernel still validates content and media type.
+const maxPromptImages = 8;
+const maxPromptImageDataBytes = 5 * 1024 * 1024;
+const maxPromptImagesDataBytes = 8 * 1024 * 1024;
+const maxPromptImageBytes = (maxPromptImageDataBytes / 4) * 3;
+const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
+// Matches the native attachment table: one prompt's images or one checkpoint.
+const maxPendingAttachments = 8;
+const maxOutboundAttachments = 4;
+// Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
+const maxCheckpointBytes = 4 * 1024 * 1024;
+// The core's ACP reader drops frames over 8 MiB without a request id to answer
+// (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
+// envelope allowance covers the method key and request id.
+const maxPromptFrameBytes = 8 * 1024 * 1024;
+const promptFrameEnvelopeBytes = 128;
+const maxSteeringMessageBytes = 64 * 1024;
+const maxSteeringMessages = 64;
+const maxSteeringQueueBytes = 1024 * 1024;
+// tool_start events carry a bounded preview of the tool input; larger inputs
+// are marked truncated instead of dropped or sent whole.
+const maxToolStartInputBytes = 64 * 1024;
+
+function boundedString(value, name, maxBytes, required) {
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${name} ${required ? "is required and " : ""}must be a non-empty string`);
+  }
+  if (encoder.encode(value).length > maxBytes) {
+    throw new RangeError(`${name} exceeds the ${maxBytes} byte libfx limit`);
+  }
+  return value;
+}
+
+function validateGatewayChatUrl(value) {
+  if (value === undefined) return;
+  boundedString(value, "gatewayChatUrl", maxUrlBytes, false);
+  let url;
+  try { url = new URL(value); } catch { throw new TypeError("gatewayChatUrl must be a valid URL"); }
+  if (url.username || url.password || url.hash) {
+    throw new TypeError("gatewayChatUrl must not contain credentials or a fragment");
+  }
+  if (url.href === "https://ai-gateway.vercel.sh/v4/ai/language-model") return;
+  if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") return;
+  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
+  if (url.protocol !== "http:" || !loopback || !url.port) {
+    throw new TypeError("gatewayChatUrl must use the canonical Gateway or explicit loopback HTTP");
+  }
+}
+
+// Mirrors the kernel's ReasoningEffort.parse: "auto"/"adaptive"/"default" pick
+// the model default; anything else must be a bounded effort name.
+function normalizeEffort(value) {
+  if (value === undefined) return undefined;
+  boundedString(value, "effort", maxEffortBytes, false);
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new TypeError('effort must use only letters, digits, ".", "-", or "_"');
+  }
+  return value;
+}
+
+// Mirrors the CLI's --fast/--no-fast toggle: a strict boolean, with undefined
+// leaving the model default in place.
+function normalizeFast(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new TypeError("fast must be a boolean");
+  }
+  return value;
+}
+
+function normalizeUltrafast(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new TypeError("ultrafast must be a boolean");
+  }
+  return value;
+}
+
+export function normalizeAgentOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("createFxAgent() options must be an object");
+  }
+  const options = { ...value };
+  if (Object.hasOwn(options, "env")) {
+    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
+  }
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
+    if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast") || Object.hasOwn(options, "ultrafast")) {
+      throw new TypeError("model options cannot be mixed with top-level effort, fast, or ultrafast");
+    }
+    const model = options.model;
+    for (const name of Object.keys(model)) {
+      if (name !== "id" && name !== "effort" && name !== "fast" && name !== "ultrafast") {
+        throw new TypeError(`unsupported model option: ${name}`);
+      }
+    }
+    options.model = boundedString(model.id, "model.id", maxModelBytes, true);
+    options.effort = normalizeEffort(model.effort);
+    options.fast = normalizeFast(model.fast);
+    options.ultrafast = normalizeUltrafast(model.ultrafast);
+  } else {
+    options.model = boundedString(options.model, "model", maxModelBytes, false);
+    options.effort = normalizeEffort(options.effort);
+    options.fast = normalizeFast(options.fast);
+    options.ultrafast = normalizeUltrafast(options.ultrafast);
+  }
+  validateGatewayChatUrl(options.gatewayChatUrl);
+  if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
+    throw new TypeError("resizeImage must be a function");
+  }
+  return options;
+}
+
+function agentEnvironment(options) {
+  return {
+    AI_GATEWAY_API_KEY: options.apiKey,
+    ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
+    ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
+    ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
+    ...(options.ultrafast === undefined ? {} : { FX_ULTRAFAST: options.ultrafast ? "true" : "false" }),
+    ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
+  };
+}
+
+function agentRpcError(response) {
+  const error = new Error(response.message);
+  const data = response.data;
+  if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST", "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST"].includes(data.code) &&
+    typeof data.model === "string" &&
+    data.capability === (data.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ? "fast" : data.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" ? "ultrafast" : "effort")) {
+    error.code = data.code;
+    error.model = data.model;
+    error.capability = data.capability;
+  }
+  return error;
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
+
+async function readBoundedResponseText(response, limit) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    await cancelResponseBody(response);
+    throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+  }
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length > limit) throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+    return strictDecoder.decode(bytes);
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    total += value.length;
+    if (total > limit) {
+      try {
+        await reader.cancel();
+      } catch {}
+      throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return strictDecoder.decode(bytes);
+}
+
+export async function listModels(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("listModels() options must be an object");
+  }
+  const apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  const fetchModels = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  if (typeof fetchModels !== "function") throw new TypeError("fetch is unavailable");
+  const response = await fetchModels("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
+    method: "GET",
+    headers: { authorization: `Bearer ${apiKey}` },
+  });
+  if (!response.ok) {
+    await cancelResponseBody(response);
+    throw new Error(`model catalog request failed with HTTP ${response.status}`);
+  }
+
+  let catalog;
+  try {
+    catalog = JSON.parse(await readBoundedResponseText(response, maxModelCatalogBytes));
+  } catch (error) {
+    if (error instanceof RangeError) throw error;
+    throw new TypeError("model catalog response is malformed");
+  }
+  if (!catalog || typeof catalog !== "object" || !Array.isArray(catalog.data)) {
+    throw new TypeError("model catalog response is malformed");
+  }
+  if (catalog.data.length > maxModelCatalogEntries) {
+    throw new RangeError(`model catalog exceeds the ${maxModelCatalogEntries} entry libfx limit`);
+  }
+
+  const ids = new Set();
+  for (const entry of catalog.data) {
+    if (!entry || typeof entry !== "object") continue;
+    if (typeof entry.type === "string" && entry.type.toLowerCase() !== "language") continue;
+    if (typeof entry.id !== "string" || entry.id.length === 0) continue;
+    if (encoder.encode(entry.id).length > maxModelBytes) continue;
+    ids.add(entry.id);
+  }
+  return [...ids].sort();
+}
 
 function validWorkspacePath(path) {
   if (typeof path !== "string" || !path.startsWith("/") || path.includes("\0")) return false;
@@ -50,7 +289,7 @@ function utf8Prefix(value, limit) {
   return value.subarray(0, end);
 }
 
-export const fxSdkApiVersion = 1;
+export const fxSdkApiVersion = 2;
 
 export function supportsJspi() {
   return typeof WebAssembly.Suspending === "function" &&
@@ -65,14 +304,83 @@ export function encodeXtermKeyEvent(event) {
     if (event.key === "Backspace") return `\x1b[127;${modifiers + 1}u`;
     const arrow = { ArrowUp: "A", ArrowDown: "B", ArrowRight: "C", ArrowLeft: "D" }[event.key];
     if (arrow) return `\x1b[1;${modifiers + 1}${arrow}`;
+    const shortcut = { a: 97, c: 99, x: 120, z: 122 }[event.key.toLowerCase()];
+    if (shortcut) return `\x1b[${shortcut};${modifiers + 1}u`;
   }
   return null;
+}
+
+function xtermPointerCell(term, event) {
+  const root = term.element;
+  const screen = root?.querySelector?.(".xterm-screen") || root;
+  const rect = screen?.getBoundingClientRect?.();
+  if (!rect || rect.width <= 0 || rect.height <= 0 || term.cols <= 0 || term.rows <= 0) return null;
+  if (event.clientX < rect.left || event.clientX >= rect.right ||
+    event.clientY < rect.top || event.clientY >= rect.bottom) return null;
+  return {
+    column: Math.min(term.cols, Math.floor((event.clientX - rect.left) * term.cols / rect.width) + 1),
+    row: Math.min(term.rows, Math.floor((event.clientY - rect.top) * term.rows / rect.height) + 1),
+  };
+}
+
+function installXtermClickHandler(term, callback) {
+  const element = term.element;
+  if (typeof element?.addEventListener !== "function") return () => {};
+  let pointerDown = null;
+  const down = (event) => {
+    if (event.button !== 0) return;
+    pointerDown = { id: event.pointerId, x: event.clientX, y: event.clientY };
+  };
+  const up = (event) => {
+    const start = pointerDown;
+    pointerDown = null;
+    if (!start || event.button !== 0 || event.pointerId !== start.id ||
+      event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    if (dx * dx + dy * dy > 16) return;
+    if (term.modes?.mouseTrackingMode && term.modes.mouseTrackingMode !== "none") return;
+    const cell = xtermPointerCell(term, event);
+    if (!cell) return;
+    callback(`\x1b[<0;${cell.column};${cell.row}M\x1b[<0;${cell.column};${cell.row}m`);
+  };
+  const cancel = () => { pointerDown = null; };
+  element.addEventListener("pointerdown", down);
+  element.addEventListener("pointerup", up);
+  element.addEventListener("pointercancel", cancel);
+  return () => {
+    element.removeEventListener("pointerdown", down);
+    element.removeEventListener("pointerup", up);
+    element.removeEventListener("pointercancel", cancel);
+  };
+}
+
+function installXtermShortcutHandler(term, callback) {
+  const element = term.element;
+  if (typeof element?.addEventListener !== "function") return () => {};
+  const keydown = (event) => {
+    if (xtermSelectionOwnsShortcut(term, event)) return;
+    const data = encodeXtermKeyEvent(event);
+    if (data === null) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    callback(data);
+  };
+  element.addEventListener("keydown", keydown, true);
+  return () => element.removeEventListener("keydown", keydown, true);
+}
+
+function xtermSelectionOwnsShortcut(term, event) {
+  return event.type === "keydown" && event.metaKey &&
+    (event.key.toLowerCase() === "c" || event.key.toLowerCase() === "x") &&
+    term.hasSelection?.();
 }
 
 export function xtermAdapter(term) {
   let keyDataHandler = null;
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
+      if (xtermSelectionOwnsShortcut(term, event)) return true;
       const data = encodeXtermKeyEvent(event);
       if (data === null || keyDataHandler === null) return true;
       keyDataHandler(data);
@@ -84,41 +392,18 @@ export function xtermAdapter(term) {
     onData(callback) { const disposable = term.onData(callback); return () => disposable.dispose(); },
     onKeyData(callback) {
       keyDataHandler = callback;
-      return () => { if (keyDataHandler === callback) keyDataHandler = null; };
+      const removeShortcutHandler = installXtermShortcutHandler(term, callback);
+      const removeClickHandler = installXtermClickHandler(term, callback);
+      return () => {
+        removeShortcutHandler();
+        removeClickHandler();
+        if (keyDataHandler === callback) keyDataHandler = null;
+      };
     },
     get cols() { return term.cols; },
     get rows() { return term.rows; },
     onResize(callback) { const disposable = term.onResize(callback); return () => disposable.dispose(); },
   };
-}
-
-function createMemorySessionStore() {
-  const records = new Map();
-  let nextRevision = 1;
-  return {
-    async load(id) {
-      const record = records.get(id);
-      return record ? { bytes: record.bytes.slice(), revision: record.revision } : null;
-    },
-    async commit(id, bytes, expectedRevision) {
-      const current = records.get(id);
-      if ((current?.revision) !== expectedRevision) throw revisionConflict();
-      const revision = String(nextRevision++);
-      records.set(id, { bytes: bytes.slice(), revision, updatedAtMs: Date.now() });
-      return { revision };
-    },
-    async list() {
-      return [...records.entries()].map(([id, record]) => ({ id, updatedAtMs: record.updatedAtMs }))
-        .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-    },
-    async remove(id) { records.delete(id); },
-  };
-}
-
-function revisionConflict() {
-  const error = new Error("session revision conflict");
-  error.code = "FX_SESSION_REVISION_CONFLICT";
-  return error;
 }
 
 class ByteQueue {
@@ -176,25 +461,6 @@ class ByteQueue {
   }
 }
 
-async function loadModule(input) {
-  if (input instanceof WebAssembly.Module) return input;
-  if (typeof input === "string") input = fetch(input);
-  if (input instanceof Promise) input = await input;
-  if (input instanceof WebAssembly.Module) return input;
-  if (input instanceof Response) {
-    const contentType = input.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-    if (contentType === "application/wasm" && typeof WebAssembly.compileStreaming === "function") {
-      return WebAssembly.compileStreaming(input);
-    }
-    const bytes = await input.arrayBuffer();
-    return WebAssembly.compile(bytes);
-  }
-  if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
-    return WebAssembly.compile(input);
-  }
-  throw new TypeError("wasm must be a URL, Response, ArrayBuffer, typed array, or WebAssembly.Module");
-}
-
 function raceWithTimeout(promise, timeoutMs, timeoutValue) {
   let timer;
   return new Promise((resolve, reject) => {
@@ -214,8 +480,19 @@ function yieldToHostTask() {
 }
 
 function createRuntime(options) {
+  // Creating this inside a Wasm call would retain that instance through the error stack.
+  const abortReason = new DOMException("This operation was aborted", "AbortError");
   const stdin = new ByteQueue();
   const streams = new Map();
+  const httpRequests = new Set();
+  const steering = [];
+  let steeringBytes = 0;
+  let steeringOpen = false;
+  // Raw payloads beside ACP frames: the core copies inbound bytes into its
+  // own memory and publishes outbound bytes for the agent to take.
+  const inboundAttachments = new Map();
+  const outboundAttachments = new Map();
+  let nextOutboundAttachment = 1;
   const workspaceExecs = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
   const args = ["fx", ...(options.args || [])];
@@ -225,7 +502,8 @@ function createRuntime(options) {
   let exitedResolve;
   let exitCode = null;
   let aborted = false;
-  let lineBuffer = "";
+  let coreOutput;
+  let outputError;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
   const markExited = (code) => {
     if (exitCode !== null) return;
@@ -255,7 +533,7 @@ function createRuntime(options) {
   }
 
   function emitStdout(chunk) {
-    if (options.stdout) options.stdout(chunk);
+    if (options.stdout) return options.stdout(chunk);
   }
 
   function fdWrite(fd, iovs, count, nwritten) {
@@ -265,6 +543,7 @@ function createRuntime(options) {
     for (let index = 0; index < count; index++) {
       total += view.getUint32(iovs + index * 8 + 4, true);
     }
+    if (coreOutput && total > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
     if (fd === 1 || fd === 2) {
       const chunk = new Uint8Array(total);
       let offset = 0;
@@ -274,7 +553,13 @@ function createRuntime(options) {
         chunk.set(bytes(ptr, len), offset);
         offset += len;
       }
-      if (fd === 1) emitStdout(chunk);
+      if (fd === 1) {
+        const pending = emitStdout(chunk);
+        if (coreOutput && pending) return Promise.resolve(pending).then(() => {
+          writeU32(nwritten, total);
+          return 0;
+        });
+      }
       else if (typeof options.stderr === "function") options.stderr(chunk);
       else console.warn(decoder.decode(chunk));
     }
@@ -420,6 +705,7 @@ function createRuntime(options) {
       state.readResult = null;
       if (done) return 0;
       if (!value?.length) return null;
+      options.onTransportChunk?.(value.length);
       return copy(value);
     };
     const immediate = consume();
@@ -442,16 +728,118 @@ function createRuntime(options) {
   }
 
   function httpRequest(methodPtr, methodLen, urlPtr, urlLen, headersPtr, headersLen, bodyPtr, bodyLen, statusOut, responsePtr, responseCap) {
-    return options.fetch(text(urlPtr, urlLen), {
-      method: text(methodPtr, methodLen),
-      headers: headersFromJson(headersPtr, headersLen),
-      body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
-    }).then(async (response) => {
+    const controller = new AbortController();
+    httpRequests.add(controller);
+    let onAbort;
+    const cancelled = new Promise((resolve) => {
+      onAbort = () => resolve(-1);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const request = (async () => {
+      const response = await options.fetch(text(urlPtr, urlLen), {
+        method: text(methodPtr, methodLen),
+        headers: headersFromJson(headersPtr, headersLen),
+        body: bodyLen ? bytes(bodyPtr, bodyLen).slice() : undefined,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        void cancelResponseBody(response);
+        return -1;
+      }
       const body = new Uint8Array(await response.arrayBuffer());
+      if (controller.signal.aborted) return -1;
       new DataView(memory().buffer).setUint16(statusOut, response.status, true);
       if (body.length > responseCap) return -2;
       bytes(responsePtr, body.length).set(body);
       return body.length;
+    })().catch(() => -1);
+    return Promise.race([request, cancelled]).finally(() => {
+      controller.signal.removeEventListener("abort", onAbort);
+      httpRequests.delete(controller);
+    });
+  }
+
+  function clearSteering() {
+    steering.length = 0;
+    steeringBytes = 0;
+  }
+
+  function queueSteering(text) {
+    if (!steeringOpen) throw new Error("no prompt is running");
+    const value = encoder.encode(text);
+    if (value.length === 0) throw new TypeError("steering text cannot be empty");
+    if (value.length > maxSteeringMessageBytes) {
+      throw new RangeError(`steering text exceeds the ${maxSteeringMessageBytes} byte libfx limit`);
+    }
+    if (steering.length >= maxSteeringMessages || value.length > maxSteeringQueueBytes - steeringBytes) {
+      throw new Error("steering queue is full");
+    }
+    steering.push(value);
+    steeringBytes += value.length;
+  }
+
+  function steeringTake(outputPtr, outputCap) {
+    const value = steering[0];
+    if (!value) return 0;
+    const output = checkedBytes(outputPtr, outputCap);
+    if (!output || value.length > output.length) return -1;
+    output.subarray(0, value.length).set(value);
+    steering.shift();
+    steeringBytes -= value.length;
+    return value.length;
+  }
+
+  function writeAttachment(id, data) {
+    if (inboundAttachments.size >= maxPendingAttachments) throw new Error("attachment table is full");
+    inboundAttachments.set(id, data.slice());
+  }
+
+  function attachmentSize(id) {
+    return inboundAttachments.get(id >>> 0)?.length ?? -1;
+  }
+
+  function attachmentTake(id, outputPtr, outputCap) {
+    const key = id >>> 0;
+    const value = inboundAttachments.get(key);
+    if (!value) return -1;
+    // An empty payload needs no output buffer, whose pointer may be arbitrary.
+    if (value.length > 0) {
+      const output = checkedBytes(outputPtr, outputCap);
+      if (!output || value.length > output.length) return -1;
+      output.set(value);
+    }
+    inboundAttachments.delete(key);
+    return value.length;
+  }
+
+  function attachmentPut(inputPtr, inputLen) {
+    const input = checkedBytes(inputPtr, inputLen);
+    if (!input || outboundAttachments.size >= maxOutboundAttachments) return -1;
+    const id = nextOutboundAttachment;
+    nextOutboundAttachment = id === 0x7fffffff ? 1 : id + 1;
+    outboundAttachments.set(id, input.slice());
+    return id;
+  }
+
+  let pendingHostToolResult = null;
+  function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr) {
+    pendingHostToolResult = null;
+    if (typeof options.hostToolExecutor !== "function") return -1;
+    if (options.traceWasi) console.error("fx host tool call start");
+    let input;
+    try { input = JSON.parse(text(argumentsPtr, argumentsLen)); } catch { return -1; }
+    return Promise.resolve(options.hostToolExecutor(text(namePtr, nameLen), input)).then((result) => {
+      if (options.traceWasi) console.error("fx host tool call settled", result.cancelled, result.isError);
+      if (result.cancelled) return -2;
+      const output = encoder.encode(result.content);
+      bytes(statusPtr, 1)[0] = (result.isError ? 1 : 0) + (result.rich ? 2 : 0);
+      if (output.length > outputCap) {
+        if (!result.rich || output.length > 8 * 1024 * 1024) return -3;
+        pendingHostToolResult = output;
+        return output.length;
+      }
+      bytes(outputPtr, output.length).set(output);
+      return output.length;
     }).catch(() => -1);
   }
 
@@ -459,6 +847,23 @@ function createRuntime(options) {
     if (typeof options.openUrl !== "function") return 0;
     return Promise.resolve().then(() => options.openUrl(text(urlPtr, urlLen))).then((accepted) =>
       accepted === false ? 0 : 1).catch(() => 0);
+  }
+
+  function clipboardCopy(valuePtr, valueLen) {
+    let clipboard = options.clipboard;
+    if (clipboard === undefined) {
+      try { clipboard = globalThis.navigator?.clipboard; } catch { clipboard = null; }
+    }
+    if (typeof clipboard?.writeText !== "function") return Promise.resolve(0);
+    const value = text(valuePtr, valueLen);
+    return Promise.resolve().then(() => clipboard.writeText(value)).then((accepted) => {
+      if (accepted === false) return 0;
+      options.emit?.("clipboard.copy", { length: value.length });
+      return 1;
+    }).catch((error) => {
+      options.emit?.("clipboard.copy_error", { error });
+      return 0;
+    });
   }
 
   function oauthSessionLoad(outPtr, outCap, revisionPtr, revisionCap, revisionLenOut) {
@@ -714,7 +1119,9 @@ function createRuntime(options) {
   }
 
   function abortHostEffects() {
-    streams.forEach((state) => state.controller.abort());
+    pendingHostToolResult = null;
+    streams.forEach((state) => state.controller.abort(abortReason));
+    httpRequests.forEach((controller) => controller.abort(abortReason));
     workspaceExecs.forEach((state) => state.abort(-3));
   }
 
@@ -724,7 +1131,7 @@ function createRuntime(options) {
     args_get(ptrs, data) { if (options.traceWasi) console.error("wasi args_get"); writeVector(args, ptrs, data); return 0; },
     environ_sizes_get(count, size) { if (options.traceWasi) console.error("wasi environ_sizes_get"); writeU32(count, env.length); writeU32(size, env.reduce((n, v) => n + encoder.encode(v).length + 1, 0)); return 0; },
     environ_get(ptrs, data) { if (options.traceWasi) console.error("wasi environ_get"); writeVector(env, ptrs, data); return 0; },
-    fd_write: fdWrite,
+    fd_write: options.args?.[0] === "acp" ? new WebAssembly.Suspending(fdWrite) : fdWrite,
     fd_read: new WebAssembly.Suspending(fdRead),
     fd_close() { return 0; },
     fd_fdstat_get(fd, out) {
@@ -765,6 +1172,7 @@ function createRuntime(options) {
 
   const fx = {
     fx_term_poll_input: new WebAssembly.Suspending(termPollInput),
+    fx_clipboard_copy: new WebAssembly.Suspending(clipboardCopy),
     fx_prompt_history_available() { return options.promptHistoryStore ? 1 : 0; },
     fx_workspace_available() { return workspace.present ? 1 : 0; },
     fx_workspace_info: workspaceInfo,
@@ -772,8 +1180,21 @@ function createRuntime(options) {
     fx_http_stream_open: streamOpen,
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
-    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(); streams.delete(handle); },
+    fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
     fx_http_request: new WebAssembly.Suspending(httpRequest),
+    fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
+    fx_host_tool_result_read(offset, ptr, cap) {
+      if (!pendingHostToolResult || offset < 0 || offset > pendingHostToolResult.length) return -1;
+      const chunk = pendingHostToolResult.subarray(offset, offset + cap);
+      bytes(ptr, chunk.length).set(chunk);
+      return chunk.length;
+    },
+    fx_host_tool_result_release() { pendingHostToolResult = null; },
+    fx_steering_take: steeringTake,
+    fx_steering_close() { steeringOpen = false; clearSteering(); },
+    fx_attachment_size: attachmentSize,
+    fx_attachment_take: attachmentTake,
+    fx_attachment_put: attachmentPut,
     fx_open_url: new WebAssembly.Suspending(openUrl),
     fx_oauth_session_load: new WebAssembly.Suspending(oauthSessionLoad),
     fx_oauth_session_commit: new WebAssembly.Suspending(oauthSessionCommit),
@@ -800,11 +1221,23 @@ function createRuntime(options) {
     imports: { wasi_snapshot_preview1: wasi, fx }, exited,
     setInstance(value) { instance = value; },
     write(data) { stdin.push(typeof data === "string" ? encoder.encode(data) : data); },
+    writeAttachment,
+    takeAttachment(id) {
+      const value = outboundAttachments.get(id) ?? null;
+      outboundAttachments.delete(id);
+      return value;
+    },
+    discardAttachments() { inboundAttachments.clear(); },
     wake() { stdin.wake(); },
-    closeStdin() { stdin.close(); },
+    closeStdin() { steeringOpen = false; clearSteering(); stdin.close(); },
+    openSteering() { clearSteering(); steeringOpen = true; },
+    steer: queueSteering,
+    closeSteering() { steeringOpen = false; clearSteering(); },
     abortHostEffects,
-    abort() {
+    abort(error) {
       aborted = true;
+      outputError = error;
+      coreOutput?.close();
       abortHostEffects();
       stdin.close();
       markExited(130);
@@ -812,17 +1245,12 @@ function createRuntime(options) {
     markExited,
     get aborted() { return aborted; },
     get exitCode() { return exitCode; },
+    get error() { return outputError; },
     setLineHandler(handler) {
-      options.stdout = (chunk) => {
-        lineBuffer += decoder.decode(chunk, { stream: true });
-        for (;;) {
-          const newline = lineBuffer.indexOf("\n");
-          if (newline < 0) break;
-          const line = lineBuffer.slice(0, newline); lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) handler(JSON.parse(line));
-        }
-      };
+      coreOutput = new CoreOutput(handler);
+      options.stdout = (chunk) => coreOutput.write(chunk);
     },
+    finishOutput() { coreOutput?.finish(); },
   };
 }
 
@@ -834,10 +1262,21 @@ async function instantiate(options) {
   runtime.setInstance(instance);
   const start = WebAssembly.promising(instance.exports._start);
   start().then(
-    () => runtime.markExited(0),
+    () => {
+      runtime.setInstance(null);
+      try { runtime.finishOutput(); runtime.markExited(0); }
+      catch (error) { runtime.abort(error); }
+    },
     (error) => {
-      if (!String(error).includes("proc_exit")) console.error(error);
-      runtime.markExited(runtime.aborted ? 130 : 1);
+      runtime.setInstance(null);
+      if (options.args?.[0] === "acp" && !String(error).includes("proc_exit")) runtime.abort(error);
+      else {
+        if (!String(error).includes("proc_exit")) {
+          runtime.abortHostEffects();
+          console.error(error);
+        }
+        runtime.markExited(runtime.aborted ? 130 : 1);
+      }
     },
   );
   return runtime;
@@ -879,13 +1318,13 @@ export async function createFxTerminal(options) {
     if (interruptKey && data.includes(interruptKey)) runtime.abortHostEffects();
     runtime.write(data);
   };
-  const unsubscribeData = options.terminal.onData(forwardData);
-  const unsubscribeKeyData = options.terminal.onKeyData?.(forwardData) ?? (() => {});
   const signalResize = () => {
     emit("terminal.resize", { cols: options.terminal.cols, rows: options.terminal.rows });
     runtime.wake();
   };
-  const unsubscribeResize = options.terminal.onResize(signalResize);
+  let unsubscribeData;
+  let unsubscribeKeyData;
+  let unsubscribeResize;
   let subscriptionsReleased = false;
   const releaseSubscriptions = () => {
     if (subscriptionsReleased) return;
@@ -898,6 +1337,17 @@ export async function createFxTerminal(options) {
     releaseSubscriptions();
     emit("runtime.exit", { surface: "terminal", code });
   });
+  try {
+    unsubscribeData = options.terminal.onData(forwardData);
+    unsubscribeKeyData = options.terminal.onKeyData?.(forwardData);
+    unsubscribeResize = options.terminal.onResize(signalResize);
+  } catch (error) {
+    // The rejected factory never transfers this promise to a caller.
+    interactive.catch(() => {});
+    releaseSubscriptions();
+    runtime.abort();
+    throw error;
+  }
   return {
     interactive,
     exited: runtime.exited,
@@ -910,12 +1360,138 @@ export async function createFxTerminal(options) {
   };
 }
 
-function normalizePromptInput(input) {
+function blobByteLength(value) {
+  if (typeof Blob === "undefined" || value == null) return null;
+  try {
+    return Object.getOwnPropertyDescriptor(Blob.prototype, "size").get.call(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeImageSourceRef(value, name) {
+  boundedString(value, `${name} sourceRef`, 512, false);
+  if (value !== undefined && /[\x00-\x1f\x7f\uD800-\uDFFF]/u.test(value)) {
+    throw new TypeError(`${name} sourceRef must be valid UTF-8 without ASCII controls`);
+  }
+  return value;
+}
+
+function omitReferencedImageData(blocks) {
+  return blocks.map((block) => block.type !== "image" || block.sourceRef === undefined ? block : {
+    type: "image",
+    mimeType: block.mimeType,
+    sourceRef: block.sourceRef,
+  });
+}
+
+function promptImageDataBytes(prompt) {
+  return prompt.reduce((total, block) => {
+    if (block.type !== "image") return total;
+    if (typeof block.data === "string") return total + block.data.length;
+    const byteLength = block.bytes?.byteLength ?? block.byteLength ?? blobByteLength(block.data) ?? 0;
+    return total + Math.ceil(byteLength / 3) * 4;
+  }, 0);
+}
+
+// Returns a Uint8Array view of an ArrayBuffer or typed array, or null.
+function byteView(value) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return null;
+}
+
+const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Returns the decoded length of canonical, unwrapped base64, or -1.
+function canonicalBase64ByteLength(value) {
+  if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return -1;
+  const groups = value.length / 4;
+  if (value.endsWith("==")) {
+    return (base64Alphabet.indexOf(value[value.length - 3]) & 0x0f) === 0 ? groups * 3 - 2 : -1;
+  }
+  if (value.endsWith("=")) {
+    return (base64Alphabet.indexOf(value[value.length - 2]) & 0x03) === 0 ? groups * 3 - 1 : -1;
+  }
+  return groups * 3;
+}
+
+function requireImageMimeType(mimeType, index) {
+  if (typeof mimeType !== "string" || mimeType.length === 0 || mimeType.length > 128) {
+    throw new TypeError(`image prompt block ${index} requires a mimeType`);
+  }
+}
+
+function checkImageByteLength(byteLength, index) {
+  if (byteLength > maxPromptImageBytes) {
+    throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageBytes} byte per-image libfx limit`);
+  }
+}
+
+function checkPromptImagesByteLength(byteLength) {
+  if (byteLength > maxPromptImagesBytes) {
+    throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx limit`);
+  }
+}
+
+// Pixel inputs carry a private source and byteLength until preparation;
+// reference-only inputs remain public image descriptors without pixel data.
+function normalizePromptImage(block, index) {
+  const sourceRef = normalizeImageSourceRef(block.sourceRef, `image prompt block ${index}`);
+  const reference = sourceRef === undefined ? {} : { sourceRef };
+  if (block.data === undefined && sourceRef !== undefined) {
+    requireImageMimeType(block.mimeType, index);
+    return { type: "image", mimeType: block.mimeType, ...reference };
+  }
+  const size = blobByteLength(block.data);
+  if (size !== null) {
+    const mimeType = block.data.type;
+    if (block.mimeType !== undefined && block.mimeType !== mimeType) {
+      throw new TypeError(`image prompt block ${index} mimeType disagrees with Blob.type`);
+    }
+    requireImageMimeType(mimeType, index);
+    if (!Number.isSafeInteger(size) || size <= 0) {
+      throw new TypeError(`image prompt block ${index} requires a non-empty Blob with a valid size`);
+    }
+    return { type: "image", source: "blob", data: block.data, mimeType, byteLength: size, ...reference };
+  }
+  if (typeof block.data === "string" && block.data.length > 0) {
+    requireImageMimeType(block.mimeType, index);
+    const byteLength = canonicalBase64ByteLength(block.data);
+    if (byteLength <= 0) throw new TypeError(`image prompt block ${index} requires canonical base64 data`);
+    return { type: "image", source: "base64", data: block.data, mimeType: block.mimeType, byteLength, ...reference };
+  }
+  const bytes = typeof block.data === "string" ? null : byteView(block.data);
+  if (!bytes || bytes.byteLength === 0) {
+    throw new TypeError(`image prompt block ${index} requires base64 data, bytes, or a Blob`);
+  }
+  requireImageMimeType(block.mimeType, index);
+  return { type: "image", source: "bytes", data: bytes, mimeType: block.mimeType, byteLength: bytes.byteLength, ...reference };
+}
+
+// With deferImageLimits, byte limits apply after resizeImage instead.
+function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
-  return input.map((block, index) => {
+  let imageCount = 0;
+  let imageBytes = 0;
+  let prompt = input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
-    if (block.type === "image") throw new TypeError("image prompt blocks are unsupported");
+    if (block.type === "image") {
+      const image = normalizePromptImage(block, index);
+      imageCount += 1;
+      if (imageCount > maxPromptImages) {
+        throw new RangeError(`prompt cannot contain more than ${maxPromptImages} images`);
+      }
+      if (!deferImageLimits) {
+        if (image.byteLength > maxPromptImageBytes && image.sourceRef !== undefined) {
+          return omitReferencedImageData([image])[0];
+        }
+        checkImageByteLength(image.byteLength ?? 0, index);
+        imageBytes += image.byteLength ?? 0;
+      }
+      return image;
+    }
     if (block.type === "text") {
       if (typeof block.text !== "string") throw new TypeError(`text prompt block ${index} requires text`);
       return { type: "text", text: block.text };
@@ -928,22 +1504,362 @@ function normalizePromptInput(input) {
     }
     throw new TypeError(`unsupported prompt block type: ${String(block.type)}`);
   });
+  if (!deferImageLimits) {
+    if (imageBytes > maxPromptImagesBytes) {
+      prompt = omitReferencedImageData(prompt);
+      imageBytes = prompt.reduce((total, block) => total + (block.type === "image" ? block.byteLength ?? 0 : 0), 0);
+    }
+    checkPromptImagesByteLength(imageBytes);
+    if (promptFrameSize(prompt) > maxPromptFrameBytes) prompt = omitReferencedImageData(prompt);
+  }
+  return prompt;
 }
 
-export async function createFxAgent(options) {
-  options = { ...options, sessionStore: options.sessionStore || createMemorySessionStore() };
+// Image bytes travel beside the frame as attachment references, but the model
+// request carries them base64 encoded and the native host caps that request at
+// 8 MiB. Images therefore count at their encoded size, the same budget they
+// had inside the frame. With countImages false, only the frame counts.
+function promptFrameSize(prompt, countImages = true) {
+  const encodedImageBytes = countImages ? promptImageDataBytes(prompt) : 0;
+  const projected = prompt.map((block) => block.type !== "image" ? block : {
+    type: "image",
+    mimeType: block.mimeType,
+    ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
+    ...(block.data === undefined && block.bytes === undefined ? {} : { _meta: { fx: { attachment: 0xffffffff } } }),
+  });
+  return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length +
+    encodedImageBytes + promptFrameEnvelopeBytes;
+}
+
+function checkPromptFrameSize(prompt, countImages) {
+  if (promptFrameSize(prompt, countImages) > maxPromptFrameBytes) {
+    throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
+  }
+}
+
+// Returns prompt blocks whose images carry { mimeType, bytes }. Synchronous
+// sources only: base64 is decoded and caller bytes are used in place.
+function preparePromptImages(blocks) {
+  return blocks.map((block) => block.type !== "image" || block.data === undefined ? block : {
+    type: "image",
+    mimeType: block.mimeType,
+    bytes: block.source === "base64" ? base64ToBytes(block.data) : block.data,
+    ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
+  });
+}
+
+function resizedPromptImage(value, index) {
+  const bytes = byteView(value?.bytes);
+  if (!bytes || bytes.byteLength === 0 || typeof value.mimeType !== "string" ||
+    value.mimeType.length === 0 || value.mimeType.length > 128) {
+    throw new TypeError(`resizeImage must return non-empty bytes and a mimeType for image prompt block ${index}`);
+  }
+  // Copied because a hook may reuse its output buffer for the next image.
+  return { bytes: bytes.slice(), mimeType: value.mimeType };
+}
+
+// Reads Blob images and applies resizeImage, then checks the final byte and
+// frame limits. Returns null when the turn is cancelled first.
+async function materializePromptImages(blocks, isCancelled, resizeImage) {
+  let prepared = [];
+  let imageBytes = 0;
+  for (let index = 0; index < blocks.length; index++) {
+    if (isCancelled()) return null;
+    const block = blocks[index];
+    if (block.type !== "image" || block.data === undefined) {
+      prepared.push(block);
+      continue;
+    }
+    let image = block.source === "blob"
+      ? { mimeType: block.mimeType, bytes: new Uint8Array(await block.data.arrayBuffer()) }
+      : preparePromptImages([block])[0];
+    if (isCancelled()) return null;
+    if (resizeImage) {
+      image = resizedPromptImage(await resizeImage({ bytes: image.bytes, mimeType: image.mimeType }), index);
+      if (isCancelled()) return null;
+    }
+    image = {
+      type: "image",
+      mimeType: image.mimeType,
+      bytes: image.bytes,
+      ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
+    };
+    if (image.bytes.byteLength > maxPromptImageBytes && image.sourceRef !== undefined) {
+      image = omitReferencedImageData([image])[0];
+    }
+    checkImageByteLength(image.bytes?.byteLength ?? 0, index);
+    imageBytes += image.bytes?.byteLength ?? 0;
+    prepared.push(image);
+    if (imageBytes > maxPromptImagesBytes) {
+      prepared = omitReferencedImageData(prepared);
+      // Do not read more referenced Blobs after the actual aggregate overflows.
+      blocks = omitReferencedImageData(blocks);
+      imageBytes = prepared.reduce((total, entry) => total + (entry.bytes?.byteLength ?? 0), 0);
+    }
+    checkPromptImagesByteLength(imageBytes);
+  }
+  if (promptFrameSize(prepared) > maxPromptFrameBytes) prepared = omitReferencedImageData(prepared);
+  checkPromptFrameSize(prepared, true);
+  return prepared;
+}
+
+function normalizeSteeringInput(input) {
+  const blocks = normalizePromptInput(input);
+  if (blocks.some((block) => block.type !== "text")) {
+    throw new TypeError("steering accepts only text blocks");
+  }
+  const text = blocks.map((block) => block.text).join("\n");
+  if (text.length === 0) throw new TypeError("steering text cannot be empty");
+  if (encoder.encode(text).length > maxSteeringMessageBytes) {
+    throw new RangeError(`steering text exceeds the ${maxSteeringMessageBytes} byte libfx limit`);
+  }
+  return text;
+}
+
+function normalizeHostTools(value) {
+  if (value === undefined) return { descriptors: [], executors: new Map() };
+  if (!Array.isArray(value)) throw new TypeError("tools must be an array");
+  if (value.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
+  const descriptors = [];
+  const executors = new Map();
+  const names = new Set();
+  for (const [index, tool] of value.entries()) {
+    if (!tool || typeof tool !== "object") throw new TypeError(`tool ${index} must be an object`);
+    const { name, description, inputSchema, execute, providerExecuted } = tool;
+    if (typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+      throw new TypeError(`tool ${index} has an invalid name`);
+    }
+    if (names.has(name)) throw new TypeError(`duplicate tool name: ${name}`);
+    names.add(name);
+    if (providerExecuted !== undefined && typeof providerExecuted !== "boolean") {
+      throw new TypeError(`tool ${name} providerExecuted must be a boolean`);
+    }
+    if (providerExecuted === true) {
+      if (execute !== undefined) throw new TypeError(`provider-executed tool ${name} must not define execute()`);
+      descriptors.push({ name, providerExecuted: true });
+      continue;
+    }
+    if (typeof description !== "string") throw new TypeError(`tool ${name} requires a description`);
+    if (typeof execute !== "function") throw new TypeError(`tool ${name} requires execute()`);
+    if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
+      throw new TypeError(`tool ${name} requires an object inputSchema`);
+    }
+    let schema;
+    try { schema = JSON.parse(JSON.stringify(inputSchema)); } catch {
+      throw new TypeError(`tool ${name} inputSchema must be JSON-serializable`);
+    }
+    descriptors.push({ name, description, inputSchema: schema });
+    executors.set(name, execute);
+  }
+  return { descriptors, executors };
+}
+
+function normalizeInstructions(value) {
+  let instructions;
+  if (value === undefined) instructions = "";
+  else if (typeof value === "string") instructions = value;
+  if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
+    instructions = value.filter(Boolean).join("\n\n");
+  }
+  if (instructions === undefined) {
+    throw new TypeError("instructions must be a string or an array of strings");
+  }
+  if (encoder.encode(instructions).length > maxInstructionsBytes) {
+    throw new RangeError(`instructions exceed the ${maxInstructionsBytes} byte libfx limit`);
+  }
+  return instructions;
+}
+
+function hostToolContent(value) {
+  if (value?.type === "libfx.tool-result") {
+    if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
+      throw new TypeError("invalid typed tool result");
+    }
+    let images = value.images.map((image) => {
+      if (image?.type !== "image") throw new TypeError("invalid tool image");
+      const sourceRef = normalizeImageSourceRef(image.sourceRef, "tool image");
+      const referenceOnly = image.data === undefined && sourceRef !== undefined;
+      if ((!referenceOnly && typeof image.data !== "string") || typeof image.mimeType !== "string" || image.mimeType.length === 0 || image.mimeType.length > 128 || (image.data?.length > maxPromptImageDataBytes && sourceRef === undefined)) {
+        throw new TypeError("invalid tool image");
+      }
+      return {
+        type: "image",
+        ...(!referenceOnly && image.data.length <= maxPromptImageDataBytes ? { data: image.data } : {}),
+        mimeType: image.mimeType,
+        ...(sourceRef === undefined ? {} : { sourceRef }),
+      };
+    });
+    if (promptImageDataBytes(images) > maxPromptImagesDataBytes) images = omitReferencedImageData(images);
+    if (promptImageDataBytes(images) > maxPromptImagesDataBytes) throw new RangeError("tool images exceed the result limit");
+    let content = JSON.stringify({ text: value.text, images });
+    if (encoder.encode(content).length > maxPromptImagesDataBytes) {
+      images = omitReferencedImageData(images);
+      content = JSON.stringify({ text: value.text, images });
+    }
+    if (encoder.encode(content).length > maxPromptImagesDataBytes) throw new RangeError("typed tool result exceeds the result limit");
+    return { content, rich: true, isError: value.isError === true };
+  }
+  if (typeof value === "string") return { content: value, rich: false };
+  if (value === undefined) return { content: "null", rich: false };
+  const encoded = JSON.stringify(value);
+  return { content: encoded === undefined ? "null" : encoded, rich: false };
+}
+
+function checkpointBytes(value) {
+  if (value === undefined) return null;
+  if (value instanceof Uint8Array) return value.slice();
+  if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+  }
+  throw new TypeError("checkpoint must be an ArrayBuffer or typed array");
+}
+
+function base64ToBytes(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+export async function createFxAgent(options = {}) {
+  options = normalizeAgentOptions(options);
+  const hostTools = normalizeHostTools(options.tools);
+  const instructions = normalizeInstructions(options.instructions);
+  const initialCheckpoint = checkpointBytes(options.checkpoint);
+  // Checked before the core starts, and with the core's message, so both
+  // backends report it the same way.
+  if (initialCheckpoint && initialCheckpoint.byteLength > maxCheckpointBytes) {
+    throw new Error("libfx checkpoint is too large");
+  }
   const pending = new Map();
-  const turns = new Map();
   let nextId = 1;
-  let activeSession = null;
-  let loadingSessionId = null;
-  let loadingUpdates = [];
+  let sessionId = null;
+  let activeTurn = null;
   let closing = false;
+  let coreExitError = null;
+  const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
+  const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  const transportFetch = async (input, init = {}) => {
+    const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
+    let endpoint = String(input?.url ?? input);
+    try {
+      const url = new URL(endpoint);
+      endpoint = `${url.origin}${url.pathname}`;
+    } catch {}
+    for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
+      const startedAt = performance.now();
+      const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
+      if (activeTurn) {
+        activeTurn.transportBytes = 0;
+        activeTurn.lastTransportActivityAt = null;
+      }
+      emit("transport.start", { attempt, method, endpoint, model: options.model });
+      try {
+        if (activeTurn?.cancelled) {
+          runtime.abortHostEffects();
+          throw new DOMException("Aborted", "AbortError");
+        }
+        if (!hostFetch) throw new TypeError("fetch is unavailable");
+        const response = await hostFetch(input, init);
+        const headers = response.headers;
+        emit("transport.response", {
+          attempt,
+          status: response.status,
+          elapsedMs: performance.now() - startedAt,
+          requestId: headers.get("x-vercel-id"),
+          generationId: headers.get("x-generation-id"),
+          model: headers.get("x-model-id") ?? options.model,
+          provider: headers.get("x-vercel-ai-gateway-provider") ?? headers.get("x-ai-gateway-provider"),
+        });
+        return response;
+      } catch (error) {
+        const errorName = error instanceof Error ? error.name : "Error";
+        const elapsedMs = performance.now() - startedAt;
+        emit("transport.error", { attempt, elapsedMs, error: errorName });
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        if (attemptIndex === 1) throw error;
+        emit("transport.retry", {
+          attempt,
+          nextAttempt: attempt + 1,
+          elapsedMs,
+          error: errorName,
+        });
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      }
+    }
+    throw new Error("transport retry exhausted");
+  };
+  const executeHostTool = async (name, input, requestedSessionId) => {
+    const execute = hostTools.executors.get(name);
+    const turn = requestedSessionId === undefined || requestedSessionId === sessionId
+      ? activeTurn
+      : null;
+    if (!isCurrentTurn(turn)) return { content: "", isError: true, cancelled: true };
+    const controller = new AbortController();
+    turn.toolControllers.add(controller);
+    let onAbort;
+    const aborted = new Promise((resolve) => { onAbort = () => resolve(); });
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    let content = "";
+    let rich = false;
+    let isError = false;
+    try {
+      if (!execute) throw new Error(`unknown host tool: ${String(name)}`);
+      const execution = Promise.resolve().then(() => {
+        if (controller.signal.aborted || !isCurrentTurn(turn)) return;
+        return execute(input, { signal: controller.signal });
+      });
+      const value = await Promise.race([execution, aborted]);
+      if (!controller.signal.aborted) {
+        const normalized = hostToolContent(value);
+        content = normalized.content;
+        rich = normalized.rich;
+        isError = normalized.isError === true;
+      }
+    } catch (error) {
+      isError = true;
+      if (error?.toolResult?.type === "libfx.tool-result") {
+        try {
+          const normalized = hostToolContent(error.toolResult);
+          content = normalized.content;
+          rich = normalized.rich;
+        } catch {
+          content = error instanceof Error ? error.message : String(error);
+        }
+      } else {
+        content = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      controller.signal.removeEventListener("abort", onAbort);
+      turn.toolControllers.delete(controller);
+    }
+    return { content, isError, rich, cancelled: controller.signal.aborted || !isCurrentTurn(turn) };
+  };
   emit("runtime.start");
-  const runtimeOptions = { ...options, args: ["acp"] };
+  const runtimeOptions = {
+    ...options,
+    fetch: transportFetch,
+    args: ["acp"],
+    env: agentEnvironment(options),
+    hostToolExecutor: executeHostTool,
+    onTransportChunk(byteLength) {
+      const turn = activeTurn;
+      if (!isCurrentTurn(turn) || !Number.isSafeInteger(byteLength) || byteLength <= 0) return;
+      turn.transportBytes += byteLength;
+      const now = performance.now();
+      if (turn.lastTransportActivityAt !== null && now - turn.lastTransportActivityAt < transportActivityIntervalMs) return;
+      turn.lastTransportActivityAt = now;
+      emit("transport.activity", {
+        attempt: turn.transportAttempts,
+        chunkBytes: byteLength,
+        totalBytes: turn.transportBytes,
+      });
+    },
+  };
   const runtime = options.runtimeFactory
     ? await options.runtimeFactory(runtimeOptions)
     : await instantiate(runtimeOptions);
@@ -951,179 +1867,442 @@ export async function createFxAgent(options) {
   const send = (message) => {
     if (closing) throw new Error("fx agent is closing");
     emit("acp.send", { message });
+    if (message.method === "session/prompt" && activeTurn?.cancelled) throw new Error("Cancelled");
     runtime.write(`${JSON.stringify(message)}\n`);
+    if (message.method === "session/prompt") activeTurn?.promptWritten();
   };
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { resolve, reject });
     try { send({ jsonrpc: "2.0", id, method, params }); } catch (error) { pending.delete(id); reject(error); }
   });
+  // Raw payloads ride beside the next frame instead of inside it. Payloads
+  // left by an earlier frame that never reached the core are dropped first.
+  let nextAttachmentId = 1;
+  const attachBytes = (payloads) => {
+    if (typeof runtime.writeAttachment !== "function") throw new Error("fx runtime does not accept binary attachments");
+    runtime.discardAttachments?.();
+    return payloads.map((bytes) => {
+      const id = nextAttachmentId;
+      nextAttachmentId = id === 0x7fffffff ? 1 : id + 1;
+      runtime.writeAttachment(id, bytes);
+      return id;
+    });
+  };
+  let checkpointTail = null;
+  let pendingCheckpoints = 0;
+  async function takeCheckpoint() {
+    if (closing) throw new Error("fx agent is closed");
+    if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
+    const response = await request("libfx/checkpoint", { sessionId });
+    const id = response?.checkpointAttachment;
+    const bytes = Number.isSafeInteger(id) && id > 0 ? runtime.takeAttachment?.(id) : null;
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+  const sendPrompt = (blocks) => {
+    const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
+    const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
+    let next = 0;
+    const prompt = blocks.map((block) => block.type !== "image" ? block : {
+      type: "image",
+      mimeType: block.mimeType,
+      ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
+      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++] } } }),
+    });
+    return request("session/prompt", { sessionId, prompt });
+  };
   runtime.exited.then((code) => {
-    emit("runtime.exit", { code });
-    const error = new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    closing = true;
+    const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    coreExitError = error;
+    activeTurn?.failImagePrep(error);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
+    emit("runtime.exit", { code });
   });
-  runtime.setLineHandler(async (message) => {
+  runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
     if (message.method === "session/update") {
-      const turn = turns.get(message.params.sessionId);
-      if (turn) turn.push(message.params.update);
-      else if (loadingSessionId === message.params.sessionId) loadingUpdates.push(message.params.update);
+      if (message.params.sessionId === sessionId) return activeTurn?.push(message.params.update, size);
       return;
     }
+    void handleControlMessage(message).catch((error) => runtime.abort(error));
+  });
+  async function handleControlMessage(message) {
     if (message.method === "session/request_permission") {
+      const turn = activeTurn;
+      if (!isCurrentTurn(turn)) return;
       emit("permission.request", { request: message.params });
+      if (!isCurrentTurn(turn)) return;
       let optionId = null;
       try { optionId = await options.onPermission?.(message.params); } catch {}
+      if (!isCurrentTurn(turn)) return;
       emit("permission.resolve", { optionId });
+      if (!isCurrentTurn(turn)) return;
       send({ jsonrpc: "2.0", id: message.id, result: optionId ? { outcome: { outcome: "selected", optionId } } : { outcome: { outcome: "cancelled" } } });
       return;
     }
+    if (message.method === "libfx/tool_call") {
+      const { content, isError, rich, cancelled } = await executeHostTool(
+        message.params?.name,
+        message.params?.input,
+        message.params?.sessionId,
+      );
+      if (cancelled || closing) return;
+      const response = { jsonrpc: "2.0", id: message.id, result: { content, isError, ...(rich ? { contentType: "rich" } : {}) } };
+      if (rich && encoder.encode(JSON.stringify(response)).length + 1 > maxPromptFrameBytes) {
+        const result = JSON.parse(content);
+        response.result.content = JSON.stringify({ ...result, images: omitReferencedImageData(result.images) });
+      }
+      if (encoder.encode(JSON.stringify(response)).length + 1 > 8 * 1024 * 1024) {
+        response.result = { content: "Host tool result exceeded the response frame limit", isError: true };
+      }
+      send(response);
+      return;
+    }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
-    if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
-  });
-  await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    if (message.error) waiter.reject(agentRpcError(message.error)); else waiter.resolve(message.result);
+  }
+  try {
+    await request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {
+        ...(hostTools.descriptors.length || instructions
+          ? { libfx: { tools: hostTools.descriptors, instructions } }
+          : {}),
+      },
+    });
+
+    const sessionResult = await request("libfx/new");
+    sessionId = sessionResult.sessionId;
+    if (initialCheckpoint) {
+      const [checkpointAttachment] = attachBytes([initialCheckpoint]);
+      await request("libfx/restore", { sessionId, checkpointAttachment });
+    }
+  } catch (error) {
+    closing = true;
+    try { runtime.abortHostEffects(); } catch {}
+    try { runtime.closeStdin(); } catch {}
+    try { await runtime.exited; } catch {}
+    throw error;
+  }
 
   const agent = {
-    exited: runtime.exited,
-    abort() { closing = true; runtime.abort(); },
+    prompt(input, promptOptions = {}) {
+      if (closing) throw new Error("fx agent is closed");
+      if (activeTurn) throw new Error("a prompt is already in progress for this session");
+      return normalizeTurn(startTurn(input, promptOptions));
+    },
+    checkpoint() {
+      // One checkpoint runs at a time: each holds an outbound attachment until
+      // it is taken, and the native table holds only a few. An idle call still
+      // sends its request before returning, ahead of a later prompt(). The slot
+      // is claimed before that send, so a call from an event handler during it
+      // still waits. The count drops before the caller's own reaction to `run`,
+      // so a call made right after awaiting the previous one is idle.
+      const previous = pendingCheckpoints > 0 ? checkpointTail : null;
+      pendingCheckpoints++;
+      let release;
+      checkpointTail = new Promise((resolve) => { release = resolve; });
+      const run = previous ? previous.then(takeCheckpoint) : takeCheckpoint();
+      const settle = () => { pendingCheckpoints--; release(); };
+      run.then(settle, settle);
+      return run;
+    },
     async close() {
-      if (closing) return runtime.exited;
-      if (activeSession) await activeSession.close();
+      if (closing) { await runtime.exited; return; }
+      const turn = activeTurn;
+      turn?.cancel();
+      if (turn) await turn.result.catch(() => {});
       closing = true;
       runtime.closeStdin();
-      return runtime.exited;
-    },
-    async createSession() {
-      if (activeSession) await activeSession.close();
-      const result = await request("session/new");
-      activeSession = await makeSession(result);
-      return activeSession;
-    },
-    async listSessions() {
-      return (await request("session/list")).sessions || [];
-    },
-    async openSession(id) {
-      if (activeSession) await activeSession.close();
-      loadingSessionId = id;
-      loadingUpdates = [];
-      try {
-        const result = await request("session/load", { sessionId: id });
-        activeSession = await makeSession({ sessionId: id, history: loadingUpdates, ...result });
-        return activeSession;
-      } finally {
-        loadingSessionId = null;
-        loadingUpdates = [];
-      }
+      await runtime.exited;
     },
   };
   return agent;
 
-  async function makeSession(result) {
-    let configOptions = result.configOptions || [];
-    let closed = false;
-    let activeTurn = null;
-    const assertOpen = () => {
-      if (closed) throw new Error("fx session is closed");
-      if (activeSession !== session) throw new Error("fx session is no longer active");
-    };
-    const updateConfig = (response) => {
-      configOptions = response.configOptions || configOptions;
-      return configOptions;
-    };
-    const session = {
-      id: result.sessionId,
-      modes: result.modes,
-      history: result.history || [],
-      get configOptions() { return configOptions; },
-      async setConfigOption(configId, value, source = "sdk") {
-        assertOpen();
-        const previousValue = configOptions.find((option) => option.id === configId)?.currentValue;
-        const updated = updateConfig(await request("session/set_config_option", { sessionId: result.sessionId, configId, value }));
-        const accepted = updated.find((option) => option.id === configId)?.currentValue;
-        if (configId === "mode" && accepted) this.modes.currentModeId = accepted;
-        if (accepted === value) {
-          if (options.configStore?.set) {
-            try { await options.configStore.set(configId, value); } catch (error) { emit("config.persist_error", { configId, error }); }
-          }
-          emit("config.changed", { configId, previousValue, value: accepted, source });
-        }
-        return updated;
-      },
-      setModel(value) { return this.setConfigOption("model", value); },
-      setMode(value) { return this.setConfigOption("mode", value); },
-      async setConfig(config) {
-        for (const [key, value] of Object.entries(config)) await this.setConfigOption(key, value);
-        return configOptions;
-      },
-      async close() {
-        if (closed) return;
-        activeTurn?.cancel();
-        if (activeTurn) await activeTurn.result.catch(() => {});
-        closed = true;
-        activeTurn = null;
-        if (activeSession === session) activeSession = null;
-      },
-      async remove() {
-        if (activeTurn) throw new Error("cannot remove a session while a prompt is active");
-        await request("session/remove", { sessionId: result.sessionId });
-        closed = true;
-        if (activeSession === session) activeSession = null;
-      },
-      prompt(input, promptOptions = {}) {
-        assertOpen();
-        if (activeTurn) throw new Error("a prompt is already in progress for this session");
-        const prompt = normalizePromptInput(input);
-        const signal = promptOptions.signal;
-        if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
-        const queue = [];
-        const waiters = [];
-        let finished = false;
-        let cancelled = false;
-        const turn = {
-          push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
-          cancel() {
-            if (finished || cancelled) return;
-            cancelled = true;
-            send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: result.sessionId } });
-            runtime.abortHostEffects();
-          },
-          [Symbol.asyncIterator]() { return { next() { if (queue.length) return Promise.resolve({ value: queue.shift(), done: false }); if (finished) return Promise.resolve({ done: true }); return new Promise((resolve) => waiters.push(resolve)); } }; },
-        };
-        turns.set(result.sessionId, turn);
-        activeTurn = turn;
-        const abort = () => turn.cancel();
-        signal?.addEventListener("abort", abort, { once: true });
-        turn.result = request("session/prompt", { sessionId: result.sessionId, prompt })
-          .then((response) => ({ stopReason: response.stopReason }))
-          .catch((error) => {
-            if (error.message === "Cancelled") return { stopReason: "cancelled" };
-            throw error;
-          })
-          .finally(() => {
-            finished = true;
-            signal?.removeEventListener("abort", abort);
-            turns.delete(result.sessionId);
-            if (activeTurn === turn) activeTurn = null;
-            waiters.splice(0).forEach((resolve) => resolve({ done: true }));
-          });
-        turn.stopReason = turn.result.then((turnResult) => turnResult.stopReason);
-        void turn.stopReason.catch(() => {});
-        if (signal?.aborted) turn.cancel();
-        return turn;
-      },
-    };
-    if (options.configStore?.get) {
-      activeSession = session;
-      for (const config of [...configOptions]) {
-        let value;
-        try { value = await options.configStore.get(config.id); } catch (error) { emit("config.restore_error", { configId: config.id, error }); continue; }
-        if (typeof value !== "string" || value === config.currentValue) continue;
-        try { await session.setConfigOption(config.id, value, "restore"); } catch (error) { emit("config.restore_error", { configId: config.id, error }); }
+  function normalizeTurn(rawTurn) {
+    const toolNames = new Map();
+    const started = new Set();
+    const eventFor = (update) => {
+      if (update.sessionUpdate === "agent_message_chunk") {
+        const delta = update.content?.text;
+        if (!delta || delta.startsWith("[context]")) return null;
+        return { type: "text_delta", delta };
       }
+      if (update.sessionUpdate === "agent_thought_chunk") {
+        const delta = update.content?.text;
+        return delta ? { type: "reasoning_delta", delta } : null;
+      }
+      if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
+        return { type: "user_message", text: update.content.text };
+      }
+      if (update.sessionUpdate === "tool_call") {
+        toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
+        if (started.has(update.toolCallId)) return null;
+        started.add(update.toolCallId);
+        return {
+          type: "tool_start",
+          id: update.toolCallId,
+          name: toolNames.get(update.toolCallId),
+          ...toolStartInput(update.rawInput),
+        };
+      }
+      if (update.sessionUpdate === "tool_call_update" &&
+        (update.status === "completed" || update.status === "failed")) {
+        const content = update.content?.find((entry) => entry.content?.type === "text")?.content?.text;
+        return {
+          type: "tool_end",
+          id: update.toolCallId,
+          name: toolNames.get(update.toolCallId) || "tool",
+          ...(content === undefined ? {} : { content }),
+          isError: update.status === "failed",
+        };
+      }
+      return null;
+    };
+    const result = rawTurn.result.then((value) => ({
+      stopReason: value.stopReason,
+      usage: normalizeTurnUsage(value.usage),
+    }));
+    void result.catch(() => {});
+    return {
+      cancel() { rawTurn.cancel(); },
+      steer(input) { return rawTurn.steer(normalizeSteeringInput(input)); },
+      [Symbol.asyncIterator]() {
+        const iterator = (async function* () {
+          for await (const update of rawTurn) {
+            const event = eventFor(update);
+            if (event) yield event;
+          }
+        })();
+        return {
+          next(value) { return iterator.next(value); },
+          return(value) { rawTurn.cancel(); return iterator.return(value); },
+          throw(error) { rawTurn.cancel(); return iterator.throw(error); },
+          [Symbol.asyncIterator]() { return this; },
+        };
+      },
+      result,
+    };
+  }
+
+  function normalizeTurnUsage(usage) {
+    const result = {};
+    if (Number.isSafeInteger(usage?.inputTokens)) result.inputTokens = usage.inputTokens;
+    if (Number.isSafeInteger(usage?.outputTokens)) result.outputTokens = usage.outputTokens;
+    if (Number.isSafeInteger(usage?.cacheReadTokens)) result.cacheReadTokens = usage.cacheReadTokens;
+    if (Number.isSafeInteger(usage?.cacheWriteTokens)) result.cacheWriteTokens = usage.cacheWriteTokens;
+    if (Number.isSafeInteger(usage?.reasoningTokens)) result.reasoningTokens = usage.reasoningTokens;
+    return result;
+  }
+
+  // The input object rides the event when it fits the preview budget; larger
+  // inputs become a bounded JSON prefix plus an explicit marker.
+  function toolStartInput(rawInput) {
+    if (rawInput === undefined || rawInput === null) return {};
+    const serialized = JSON.stringify(rawInput);
+    if (serialized === undefined) return {};
+    const bytes = encoder.encode(serialized);
+    if (bytes.length <= maxToolStartInputBytes) return { input: rawInput };
+    return { inputTruncated: true, inputPreview: decoder.decode(utf8Prefix(bytes, maxToolStartInputBytes)) };
+  }
+
+  function startTurn(input, promptOptions) {
+    const resizeImage = options.resizeImage;
+    const normalized = normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
+    const hasPixels = normalized.some((block) => block.type === "image" && block.data !== undefined);
+    // Blob reads and resizeImage run before the prompt frame is sent.
+    const asyncImages = hasPixels && (resizeImage !== undefined ||
+      normalized.some((block) => block.type === "image" && block.source === "blob"));
+    // resizeImage decides the final image sizes, so they are counted after it runs.
+    checkPromptFrameSize(normalized, resizeImage === undefined);
+    // Snapshot caller-owned bytes, which could change before an async send.
+    const prompt = asyncImages
+      ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)
+      : preparePromptImages(normalized);
+    const signal = promptOptions.signal;
+    if (signal !== undefined && (typeof signal?.addEventListener !== "function" || typeof signal?.removeEventListener !== "function")) throw new TypeError("prompt signal must be an AbortSignal");
+    const queue = [];
+    const waiters = [];
+    let queuedBytes = 0;
+    let resumeOutput;
+    let iteratorTaken = false;
+    let terminalError;
+    let reportedPressure = false;
+    let discardedBytes = 0;
+    let cancelImagePrep = null;
+    let rejectImagePrep = null;
+    let resolvePromptStart = null;
+    const promptStarted = asyncImages ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
+    let pendingSteeringCount = 0;
+    let pendingSteeringBytes = 0;
+    const toolControllers = new Set();
+    let finished = false;
+    let cancelled = false;
+    const turn = {
+      push(update, size = encoder.encode(JSON.stringify(update)).length) {
+        if (cancelled || finished) { discardedBytes += size; return; }
+        if (size > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
+        if (queue.length && (queue.length >= maxUnreadEvents || size > maxUnreadEventBytes - queuedBytes)) {
+          const capacity = new Promise((resolveCapacity) => { resumeOutput = resolveCapacity; });
+          if (!reportedPressure) {
+            reportedPressure = true;
+            emit("output.backpressure", { bufferedBytes: queuedBytes, bufferedEvents: queue.length });
+          }
+          return capacity.then(() => turn.push(update, size));
+        }
+        const waiter = waiters.shift();
+        if (waiter) waiter.resolve({ value: update, done: false });
+        else { queue.push({ update, size }); queuedBytes += size; }
+      },
+      toolControllers,
+      transportAttempts: 0,
+      transportBytes: 0,
+      lastTransportActivityAt: null,
+      get cancelled() { return cancelled; },
+      failImagePrep(error) {
+        rejectImagePrep?.(error);
+        rejectImagePrep = null;
+        cancelImagePrep = null;
+      },
+      promptWritten() {
+        resolvePromptStart?.(true);
+        resolvePromptStart = null;
+      },
+      steer(text) {
+        if (finished || cancelled || activeTurn !== turn) {
+          return Promise.reject(new Error("no prompt is running"));
+        }
+        if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
+        const apply = () => {
+          if (finished || cancelled || activeTurn !== turn) {
+            return Promise.reject(new Error("no prompt is running"));
+          }
+          if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
+          try {
+            if (typeof runtime.steer === "function") {
+              runtime.steer(text);
+              void turn.push({
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text },
+              });
+              return Promise.resolve();
+            }
+            return request("libfx/steer", { sessionId, text });
+          } catch (error) {
+            return Promise.reject(error);
+          }
+        };
+        if (!resolvePromptStart) return apply();
+        const bytes = encoder.encode(text).length;
+        if (pendingSteeringCount >= maxSteeringMessages || bytes > maxSteeringQueueBytes - pendingSteeringBytes) {
+          return Promise.reject(new Error("steering queue is full"));
+        }
+        pendingSteeringCount++;
+        pendingSteeringBytes += bytes;
+        return promptStarted.then((started) => {
+          if (coreExitError && !cancelled) throw coreExitError;
+          return started === true ? apply() : Promise.reject(started instanceof Error ? started : new Error("no prompt is running"));
+        }).finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
+      },
+      cancel() {
+        if (finished || cancelled) return;
+        cancelled = true;
+        cancelImagePrep?.();
+        cancelImagePrep = null;
+        rejectImagePrep = null;
+        resolvePromptStart?.(false);
+        resolvePromptStart = null;
+        runtime.closeSteering?.();
+        resumeOutput?.();
+        resumeOutput = null;
+        if (!closing) send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+        for (const controller of toolControllers) controller.abort();
+        runtime.abortHostEffects();
+      },
+      [Symbol.asyncIterator]() {
+        if (iteratorTaken) throw new Error("a turn has only one event consumer");
+        iteratorTaken = true;
+        return {
+          next() {
+            if (queue.length) {
+              const { update, size } = queue.shift();
+              queuedBytes -= size;
+              resumeOutput?.();
+              resumeOutput = null;
+              return Promise.resolve({ value: update, done: false });
+            }
+            if (terminalError) return Promise.reject(terminalError);
+            if (finished) return Promise.resolve({ done: true });
+            return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+          },
+          return() { turn.cancel(); return Promise.resolve({ done: true }); },
+        };
+      },
+    };
+    if (signal?.aborted) {
+      resolvePromptStart?.(false);
+      resolvePromptStart = null;
+      finished = true;
+      turn.result = Promise.resolve({ stopReason: "cancelled" });
+      return turn;
     }
-    session.modes.currentModeId = configOptions.find((option) => option.id === "mode")?.currentValue || session.modes.currentModeId;
-    return session;
+    activeTurn = turn;
+    runtime.openSteering?.();
+    const abort = () => turn.cancel();
+    signal?.addEventListener("abort", abort, { once: true });
+    const imagePrepCancelled = asyncImages ? new Promise((resolve, reject) => {
+      cancelImagePrep = () => resolve(null);
+      rejectImagePrep = reject;
+    }) : null;
+    let response;
+    if (asyncImages) {
+      response = Promise.race([
+        Promise.resolve().then(() => materializePromptImages(prompt, () => cancelled || closing, resizeImage)),
+        imagePrepCancelled,
+      ]).then((prepared) => {
+        cancelImagePrep = null;
+        rejectImagePrep = null;
+        if (coreExitError && !cancelled) throw coreExitError;
+        if (prepared === null || cancelled || closing) {
+          resolvePromptStart?.(false);
+          resolvePromptStart = null;
+          return { stopReason: "cancelled" };
+        }
+        return sendPrompt(prepared);
+      });
+    } else {
+      try { response = sendPrompt(prompt); } catch (error) { response = Promise.reject(error); }
+    }
+    turn.result = response
+      .then((value) => ({ stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage }))
+      .catch((error) => {
+        cancelImagePrep = null;
+        rejectImagePrep = null;
+        resolvePromptStart?.(error);
+        resolvePromptStart = null;
+        if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };
+        terminalError = error;
+        throw error;
+      })
+      .finally(() => {
+        finished = true;
+        resumeOutput?.();
+        resumeOutput = null;
+        signal?.removeEventListener("abort", abort);
+        if (activeTurn === turn) activeTurn = null;
+        runtime.closeSteering?.();
+        toolControllers.clear();
+        if (discardedBytes) emit("output.discarded", { reason: "cancelled", bytes: discardedBytes });
+        for (const waiter of waiters.splice(0)) {
+          if (terminalError) waiter.reject(terminalError);
+          else waiter.resolve({ done: true });
+        }
+      });
+    if (signal?.aborted) turn.cancel();
+    void turn.result.catch(() => {});
+    return turn;
   }
 }

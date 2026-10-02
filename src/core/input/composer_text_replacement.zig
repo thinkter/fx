@@ -79,6 +79,7 @@ pub const State = struct {
         self.vertical_navigation.reset();
         input_reset.discardSelectionWithTrace(self.edit, "input_replaced");
         self.picker.clearModelPickerFlow();
+        self.picker.clearProviderPickerFlow();
         traceDroppedEntities(prepared_replacement.dropped_entities);
         pasted_blocks.clearBlocks(alloc, &self.entities.pasted_blocks);
         self.entities.clearImageAndSkillTokens(alloc);
@@ -163,6 +164,7 @@ const Fixture = struct {
             "provider/model",
             2,
             true,
+            false,
             .effort,
         );
         self.picker.slash_completion_index = 4;

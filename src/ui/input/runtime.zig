@@ -1,7 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_decision = @import("../../core/permissions/approval_decision.zig");
-const subagent_input = @import("../../core/subagent/input_action.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const native_clear_probe_runtime = @import("native_clear_probe.zig");
@@ -39,18 +38,15 @@ pub const DeferredTerminalInputSource = enum {
 pub const TerminalInputOwner = enum {
     theme_monitor,
     paste,
-    takeover,
     fx_input,
 };
 
 pub fn terminalInputOwner(
     monitor: *const theme_monitor.Monitor,
     paste_active: bool,
-    takeover_active: bool,
 ) TerminalInputOwner {
     if (monitor.ownsInput()) return .theme_monitor;
     if (paste_active) return .paste;
-    if (takeover_active) return .takeover;
     if (monitor.enabled) return .theme_monitor;
     return .fx_input;
 }
@@ -59,8 +55,6 @@ const InputEscapeAction = input_action.Action;
 const MouseInput = escape_parser.MouseInput;
 
 pub const shortcutFromControlByte = shortcuts.fromControlByte;
-pub const shortcutFromFocusedEditorControlByte = shortcuts.fromFocusedEditorControlByte;
-pub const shortcutFromEscapeAction = shortcuts.fromEscapeAction;
 
 pub fn approvalActionFromByte(byte: u8) ?approval_decision.Action {
     return switch (byte) {
@@ -262,179 +256,6 @@ fn withQuestionInput(
     return typed;
 }
 
-fn subagentActionFromShortcut(
-    action: input_action.ShortcutAction,
-) ?subagent_input.Action {
-    return switch (action) {
-        .move => |intent| if (intent.extend_selection)
-            null
-        else switch (intent.kind) {
-            .character_left => .left,
-            .character_right => .right,
-            .word_left => .word_left,
-            .word_right => .word_right,
-            .line_start, .draft_start => .home,
-            .line_end, .draft_end => .end,
-            .visual_up => .up,
-            .visual_down => .down,
-            .page_up => .page_up,
-            .page_down => .page_down,
-            .paragraph_up, .paragraph_down => null,
-        },
-        .delete_backward => .delete_backward,
-        .delete_forward => .delete_next,
-        .delete_word_left => .delete_word_left,
-        .delete_word_right => .delete_word_right,
-        .delete_to_line_start => .delete_to_line_start,
-        .delete_to_line_end => .delete_to_line_end,
-        .insert_newline => .insert_newline,
-        .select_all,
-        .copy_selection,
-        .cut_selection,
-        .undo,
-        .redo,
-        .history_previous,
-        .history_next,
-        .delete_whitespace_word_left,
-        .yank,
-        .redraw,
-        => null,
-    };
-}
-
-fn subagentActionFromRawByte(byte: u8) ?subagent_input.Action {
-    return switch (byte) {
-        3 => .ctrl_c,
-        24 => .toggle,
-        '\r' => .enter,
-        '\t' => .focus_next,
-        1 => .home,
-        5 => .end,
-        0x7f, 8 => .delete_backward,
-        11 => .delete_to_line_end,
-        21 => .clear_line,
-        23 => .delete_word_left,
-        else => null,
-    };
-}
-
-fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action {
-    return switch (action) {
-        .escape => .escape,
-        .history_up, .cursor_up => .up,
-        .history_down, .cursor_down => .down,
-        .cursor_left => .left,
-        .cursor_right => .right,
-        .home => .home,
-        .end => .end,
-        .word_left => .word_left,
-        .word_right => .word_right,
-        .delete_next => .delete_next,
-        .delete_word_left => .delete_word_left,
-        .delete_word_right => .delete_word_right,
-        .delete_to_line_start => .delete_to_line_start,
-        .delete_to_line_end => .delete_to_line_end,
-        .clear_line => .clear_line,
-        .insert_newline => .insert_newline,
-        .page_up => .page_up,
-        .page_down => .page_down,
-        .composer_shortcut => |typed| subagentActionFromShortcut(typed),
-        .remapped_byte => |byte| subagentActionFromRawByte(byte),
-        .mouse_wheel,
-        .mouse_pointer,
-        .toggle_full_transcript,
-        .toggle_permission_mode,
-        .open_all_sessions,
-        .paste_start,
-        .paste_end,
-        .ignore,
-        => null,
-    };
-}
-
-fn withSubagentInput(
-    ingress: input_action.TerminalInputIngress,
-) input_action.TerminalInputIngress {
-    var typed = ingress;
-    const event = typed.event orelse return typed;
-    typed.event = switch (event) {
-        .raw => |raw| input_action.TerminalInputEvent{ .raw = .{
-            .byte = raw.byte,
-            .composer_shortcut = raw.composer_shortcut,
-            .approval_action = raw.approval_action,
-            .question_action = raw.question_action,
-            .subagent_action = subagentActionFromRawByte(raw.byte),
-        } },
-        .action => |decoded| input_action.TerminalInputEvent{ .action = .{
-            .action = decoded.action,
-            .composer_shortcut = decoded.composer_shortcut,
-            .approval_focused_edit = decoded.approval_focused_edit,
-            .question_action = decoded.question_action,
-            .subagent_action = subagentActionFromDecoded(decoded.action),
-            .cancel_pending = decoded.cancel_pending,
-        } },
-        .paste_byte => event,
-    };
-    return typed;
-}
-
-test "terminal input carries typed subagent controls and shortcuts" {
-    var runtime = Runtime{};
-    defer runtime.deinit(std.testing.allocator);
-    const context: input_action.TerminalDecodeContext = .{
-        .now_ms = 1,
-        .paste_active = false,
-        .cancel_pending = false,
-        .child_route_active = true,
-    };
-
-    const toggle = runtime.decodeTerminalByte(24, context);
-    try std.testing.expectEqual(
-        subagent_input.Action.toggle,
-        toggle.event.?.raw.subagent_action.?,
-    );
-
-    const line_start = runtime.decodeTerminalByte(1, context);
-    try std.testing.expectEqual(
-        subagent_input.Action.home,
-        line_start.event.?.raw.subagent_action.?,
-    );
-
-    const clear_line = runtime.decodeTerminalByte(21, context);
-    try std.testing.expectEqual(
-        subagent_input.Action.clear_line,
-        clear_line.event.?.raw.subagent_action.?,
-    );
-
-    const child_only_shortcut = runtime.decodeTerminalByte(2, context);
-    try std.testing.expect(child_only_shortcut.event.?.raw.subagent_action == null);
-    try std.testing.expectEqual(
-        input_action.ShortcutAction{ .move = .{ .kind = .character_left } },
-        child_only_shortcut.event.?.raw.composer_shortcut.?,
-    );
-
-    const text = runtime.decodeTerminalByte('j', context);
-    try std.testing.expect(text.event.?.raw.subagent_action == null);
-
-    var word_delete = input_action.TerminalInputIngress{};
-    for ("\x1bd") |byte| {
-        word_delete = runtime.decodeTerminalByte(byte, context);
-    }
-    try std.testing.expectEqual(
-        subagent_input.Action.delete_word_right,
-        word_delete.event.?.action.subagent_action.?,
-    );
-
-    var arrow = input_action.TerminalInputIngress{};
-    for ("\x1b[A") |byte| {
-        arrow = runtime.decodeTerminalByte(byte, context);
-    }
-    try std.testing.expectEqual(
-        subagent_input.Action.up,
-        arrow.event.?.action.subagent_action.?,
-    );
-}
-
 test "question bytes translate to typed prompt actions" {
     try std.testing.expectEqual(
         question_prompt.Action.cancel,
@@ -473,7 +294,6 @@ test "terminal input carries typed question decisions and focused edits" {
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = false,
-        .child_route_active = false,
         .question_freeform_selected = false,
     };
     const choice = runtime.decodeTerminalByte('3', choice_context);
@@ -486,7 +306,6 @@ test "terminal input carries typed question decisions and focused edits" {
         .now_ms = 2,
         .paste_active = false,
         .cancel_pending = false,
-        .child_route_active = false,
         .question_freeform_selected = true,
     };
     const digit = runtime.decodeTerminalByte('3', freeform_context);
@@ -528,95 +347,6 @@ test "terminal input carries typed question decisions and focused edits" {
     );
 }
 
-test "fx terminal reply ownership survives takeover transition" {
-    const alloc = std.testing.allocator;
-    var monitor = theme_monitor.Monitor{};
-    monitor.start();
-
-    try std.testing.expect(monitor.takeQueryRequest(0) == null);
-    for ("\x1b[?997;1n") |byte| _ = monitor.feed(byte, 1);
-    try std.testing.expectEqual(
-        theme_monitor.QueryRequest.response_fence,
-        monitor.takeQueryRequest(1000).?,
-    );
-
-    var child: std.ArrayList(u8) = .empty;
-    defer child.deinit(alloc);
-    var composer: std.ArrayList(u8) = .empty;
-    defer composer.deinit(alloc);
-
-    const Driver = struct {
-        fn forwarded(
-            takeover_active: bool,
-            bytes: []const u8,
-            child_bytes: *std.ArrayList(u8),
-            composer_bytes: *std.ArrayList(u8),
-        ) !void {
-            if (takeover_active) {
-                try child_bytes.appendSlice(alloc, bytes);
-            } else {
-                try composer_bytes.appendSlice(alloc, bytes);
-            }
-        }
-
-        fn byte(
-            theme: *theme_monitor.Monitor,
-            takeover_active: bool,
-            input_byte: u8,
-            now_ms: i64,
-            child_bytes: *std.ArrayList(u8),
-            composer_bytes: *std.ArrayList(u8),
-        ) !void {
-            switch (terminalInputOwner(theme, false, takeover_active)) {
-                .paste => unreachable,
-                .takeover => try child_bytes.append(alloc, input_byte),
-                .fx_input => try composer_bytes.append(alloc, input_byte),
-                .theme_monitor => switch (theme.feed(input_byte, now_ms)) {
-                    .pending, .consumed => {},
-                    .forward => |bytes| try forwarded(
-                        takeover_active,
-                        bytes.slice(),
-                        child_bytes,
-                        composer_bytes,
-                    ),
-                },
-            }
-        }
-    };
-
-    const response = "\x1b[?1;2;4c";
-    for (response[0..3]) |byte| {
-        try Driver.byte(&monitor, true, byte, 1001, &child, &composer);
-    }
-    for (response[3..]) |byte| {
-        try Driver.byte(&monitor, true, byte, 1002, &child, &composer);
-    }
-    try std.testing.expectEqual(@as(usize, 0), child.items.len);
-    try std.testing.expectEqual(@as(usize, 0), composer.items.len);
-
-    for (response) |byte| {
-        try Driver.byte(&monitor, true, byte, 1003, &child, &composer);
-    }
-    try std.testing.expectEqualStrings(response, child.items);
-
-    const raw_input = "\x1b[Akey";
-    for (raw_input) |byte| {
-        try Driver.byte(&monitor, true, byte, 1004, &child, &composer);
-    }
-    try std.testing.expectEqualStrings(response ++ raw_input, child.items);
-    try std.testing.expectEqual(@as(usize, 0), composer.items.len);
-
-    try Driver.byte(&monitor, false, 0x1b, 1005, &child, &composer);
-    try Driver.byte(&monitor, true, '[', 1005, &child, &composer);
-    monitor.poll(1005 + theme_monitor.response_idle_timeout_ms);
-    while (monitor.takeDeferredByte()) |byte| {
-        try Driver.forwarded(true, &.{byte}, &child, &composer);
-        try std.testing.expect(monitor.consumeDeferredInputDispatch());
-    }
-    try std.testing.expectEqualStrings(response ++ raw_input ++ "\x1b[", child.items);
-    try std.testing.expectEqual(@as(usize, 0), composer.items.len);
-}
-
 test "terminal reply ownership precedes active paste transport" {
     var monitor = theme_monitor.Monitor{};
     monitor.start();
@@ -629,7 +359,7 @@ test "terminal reply ownership precedes active paste transport" {
     );
     try std.testing.expectEqual(
         TerminalInputOwner.theme_monitor,
-        terminalInputOwner(&monitor, true, false),
+        terminalInputOwner(&monitor, true),
     );
 
     for ("\x1b[?1;2;4c") |byte| {
@@ -637,7 +367,7 @@ test "terminal reply ownership precedes active paste transport" {
     }
     try std.testing.expectEqual(
         TerminalInputOwner.paste,
-        terminalInputOwner(&monitor, true, false),
+        terminalInputOwner(&monitor, true),
     );
 }
 
@@ -664,7 +394,6 @@ test "terminal input carries typed approval decisions and focused edits" {
         .now_ms = 1,
         .paste_active = false,
         .cancel_pending = false,
-        .child_route_active = false,
     };
 
     const decision = runtime.decodeTerminalByte('3', context);
@@ -843,15 +572,77 @@ test "text edits undo and redo without snapshotting structured state" {
     try std.testing.expectEqualStrings("ab", runtime.edit_state.input.items);
 }
 
+pub const DeferredSessionInput = union(enum) {
+    byte: u8,
+    delivery_epoch,
+};
+
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
+    deferred_session_input: std.ArrayList(DeferredSessionInput) = .empty,
+    deferred_session_input_index: usize = 0,
+    deferred_session_completed_end: usize = 0,
     native_clear_probe: native_clear_probe_runtime.Runtime = .{},
     terminal_action_decoder: terminal_action_decoder.Decoder = .{},
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
+        const dropped = self.discardDeferredSessionInput();
+        if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=shutdown", .{dropped});
+        self.deferred_session_input.deinit(alloc);
         self.native_clear_probe.deinit(alloc);
+    }
+
+    pub fn hasDeferredSessionInput(self: *const Runtime) bool {
+        return self.deferred_session_input_index < self.deferred_session_input.items.len;
+    }
+
+    pub fn deferSessionInputByte(self: *Runtime, alloc: Allocator, byte: u8, limit: usize) !bool {
+        if (self.deferred_session_input.items.len - self.deferred_session_input_index >= limit) return false;
+        if (self.deferred_session_input_index > 0) {
+            const remaining = self.deferred_session_input.items[self.deferred_session_input_index..];
+            std.mem.copyForwards(DeferredSessionInput, self.deferred_session_input.items[0..remaining.len], remaining);
+            self.deferred_session_input.items.len = remaining.len;
+            self.deferred_session_completed_end -|= self.deferred_session_input_index;
+            self.deferred_session_input_index = 0;
+        }
+        try self.deferred_session_input.append(alloc, .{ .byte = byte });
+        return true;
+    }
+
+    pub fn markDeferredSessionDeliveryEpoch(self: *Runtime, alloc: Allocator) !void {
+        if (!self.hasDeferredSessionInput() or self.deferred_session_input.items[self.deferred_session_input.items.len - 1] == .delivery_epoch) return;
+        try self.deferred_session_input.append(alloc, .delivery_epoch);
+        self.deferred_session_completed_end = self.deferred_session_input.items.len;
+    }
+
+    pub fn allowCurrentDeferredSessionInputForReplay(self: *Runtime) void {
+        self.deferred_session_completed_end = self.deferred_session_input.items.len;
+    }
+
+    pub fn takeDeferredSessionInput(self: *Runtime) ?DeferredSessionInput {
+        if (self.deferred_session_input_index == self.deferred_session_input.items.len) {
+            self.deferred_session_input.clearRetainingCapacity();
+            self.deferred_session_input_index = 0;
+            self.deferred_session_completed_end = 0;
+            return null;
+        }
+        if (self.deferred_session_input_index >= self.deferred_session_completed_end) return null;
+        const item = self.deferred_session_input.items[self.deferred_session_input_index];
+        self.deferred_session_input_index += 1;
+        return item;
+    }
+
+    pub fn discardDeferredSessionInput(self: *Runtime) usize {
+        var dropped: usize = 0;
+        for (self.deferred_session_input.items[self.deferred_session_input_index..]) |item| {
+            if (item == .byte) dropped += 1;
+        }
+        self.deferred_session_input.clearRetainingCapacity();
+        self.deferred_session_input_index = 0;
+        self.deferred_session_completed_end = 0;
+        return dropped;
     }
 
     pub fn resetEscapeDecoder(self: *Runtime) void {
@@ -874,10 +665,10 @@ pub const Runtime = struct {
         context: input_action.TerminalDecodeContext,
     ) input_action.TerminalInputIngress {
         if (context.paste_active) return terminal_action_decoder.pasteByteIngress(byte);
-        return withSubagentInput(withQuestionInput(
+        return withQuestionInput(
             withApprovalInput(self.terminal_action_decoder.feed(byte, context)),
             context.question_freeform_selected,
-        ));
+        );
     }
 
     pub fn flushTerminalAction(
@@ -922,6 +713,25 @@ pub const Runtime = struct {
         };
     }
 };
+
+test "deferred session input preserves delivery epochs and enforces a byte limit" {
+    var runtime: Runtime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'a', 2));
+    try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'b', 2));
+    try std.testing.expect(!(try runtime.deferSessionInputByte(std.testing.allocator, 'c', 2)));
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
+    try runtime.markDeferredSessionDeliveryEpoch(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 'a'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expectEqual(@as(u8, 'b'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expect(runtime.takeDeferredSessionInput().? == .delivery_epoch);
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
+    try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'c', 2));
+    try runtime.markDeferredSessionDeliveryEpoch(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 'c'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expect(runtime.takeDeferredSessionInput().? == .delivery_epoch);
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
+}
 
 pub fn scanInputCursorVertical(
     input: *const InputRuntime,
@@ -1075,7 +885,7 @@ test "model picker flow stores pending model and selections" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 4, true, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 4, true, false, .effort);
 
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, runtime.picker.model_picker_stage);
     try std.testing.expectEqualStrings("openai/gpt-5", runtime.picker.model_picker_pending_model.items);
@@ -1087,10 +897,10 @@ test "model picker flow accepts aliased pending model slice" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 2, false, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 2, false, false, .effort);
     const aliased_model = runtime.picker.model_picker_pending_model.items;
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, aliased_model, 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, aliased_model, 3, true, false, .fast);
 
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, runtime.picker.model_picker_stage);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", runtime.picker.model_picker_pending_model.items);
@@ -1102,7 +912,7 @@ test "editing input clears model picker flow" {
     var runtime = InputRuntime{};
     defer runtime.deinit(std.testing.allocator);
 
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 3, false, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 3, false, false, .fast);
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model ");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
 
@@ -1118,7 +928,7 @@ test "preserving picker edit keeps effort flow" {
 
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model openai/gpt-5 ");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 2, false, .effort);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "openai/gpt-5", 2, false, false, .effort);
 
     try runtime.insertionState().insertByte(std.testing.allocator, 'h', .preserve);
 
@@ -1134,7 +944,7 @@ test "active model picker query tracks fast token start" {
 
     try runtime.edit_state.input.appendSlice(std.testing.allocator, "/model anthropic/claude-opus-4.6 high f");
     runtime.edit_state.cursor = runtime.edit_state.input.items.len;
-    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(std.testing.allocator, "anthropic/claude-opus-4.6", 3, true, false, .fast);
 
     const query = runtime.picker.activeModelPickerQuery(&runtime.edit_state).?;
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, query.stage);
@@ -1332,19 +1142,24 @@ test "active inline skill query recognizes a later whitespace-delimited prefix" 
     try std.testing.expectEqual(picker_state.InlinePickerKind.skill, runtime.picker.inlinePickerTriggerKind(&runtime.edit_state).?);
 }
 
-test "active inline skill query rejects leading empty embedded and mid-cursor tokens" {
-    const cases = [_][]const u8{
+test "active inline skill query accepts root empty and embedded tokens" {
+    const accepted = [_][]const u8{
         "$man",
         "explain $",
         "explain$man",
-        "explain $man ",
+        "explain one$two$man",
     };
-    for (cases) |input| {
+    for (accepted) |input| {
         var runtime = InputRuntime{};
         defer runtime.deinit(std.testing.allocator);
         try runtime.textReplacementState().replace(std.testing.allocator, input);
-        try std.testing.expectEqual(@as(?picker_state.InlineSkillQuery, null), runtime.picker.activeInlineSkillQuery(&runtime.edit_state));
+        try std.testing.expect(runtime.picker.activeInlineSkillQuery(&runtime.edit_state) != null);
     }
+
+    var terminated = InputRuntime{};
+    defer terminated.deinit(std.testing.allocator);
+    try terminated.textReplacementState().replace(std.testing.allocator, "explain $man ");
+    try std.testing.expectEqual(@as(?picker_state.InlineSkillQuery, null), terminated.picker.activeInlineSkillQuery(&terminated.edit_state));
 
     var mid_cursor = InputRuntime{};
     defer mid_cursor.deinit(std.testing.allocator);
@@ -2343,6 +2158,109 @@ test "input escape parser preserves modified arrow intent" {
     try expectEscapeAction("[1;4D", moveEscape(.word_left, true));
 }
 
+test "input escape parser maps kitty keypad keys to their main-row characters" {
+    // Kitty reports keypad keys as dedicated codes: KP_0..KP_9 = 57399-57408.
+    try expectEscapeAction("[57399u", .{ .remapped_byte = '0' });
+    try expectEscapeAction("[57408u", .{ .remapped_byte = '9' });
+    try expectEscapeAction("[57400;1u", .{ .remapped_byte = '1' });
+    // Num Lock (bit 7) is a lock state, not a modifier.
+    try expectEscapeAction("[57400;129u", .{ .remapped_byte = '1' });
+    try expectEscapeAction("[57409u", .{ .remapped_byte = '.' });
+    try expectEscapeAction("[57410u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57411u", .{ .remapped_byte = '*' });
+    try expectEscapeAction("[57412u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57413u", .{ .remapped_byte = '+' });
+    try expectEscapeAction("[57415u", .{ .remapped_byte = '=' });
+    // Shift keeps the character; the main row has no text for the other
+    // modifiers, and Hyper/Meta must not start typing digits either.
+    try expectEscapeAction("[57412;2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57410;3u", .ignore);
+    try expectEscapeAction("[57410;5u", .ignore);
+    try expectEscapeAction("[57412;9u", .ignore);
+    try expectEscapeAction("[57412;17u", .ignore);
+    try expectEscapeAction("[57412;33u", .ignore);
+    try expectEscapeAction("\x1b[57412u", .ignore);
+    try expectEscapeAction("\x1b[57412;2u", .ignore);
+}
+
+test "input escape parser keeps keypad Enter, navigation, and Delete contracts" {
+    try expectEscapeAction("[57414u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;5u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;2u", .insert_newline);
+    try expectEscapeAction("[57414;3u", .insert_newline);
+    try expectEscapeAction("[57419;1u", .cursor_up);
+    try expectEscapeAction("[57420;1u", .cursor_down);
+    try expectEscapeAction("[57417;1u", .cursor_left);
+    try expectEscapeAction("[57418;1u", .cursor_right);
+    try expectEscapeAction("[57423;1u", .home);
+    try expectEscapeAction("[57424;1u", .end);
+    try expectEscapeAction("[57419;2u", moveEscape(.visual_up, true));
+    try expectEscapeAction("[57417;5u", moveEscape(.word_left, false));
+    try expectEscapeAction("[57421u", .page_up);
+    try expectEscapeAction("[57422u", .page_down);
+    try expectEscapeAction("[57426u", .delete_next);
+    try expectEscapeAction("[3;1~", .delete_next);
+    try expectEscapeAction("[57426;2u", .ignore);
+    try expectEscapeAction("[3;2~", .ignore);
+    try expectEscapeAction("[57426;3u", .delete_word_right);
+    try expectEscapeAction("[3;3~", .delete_word_right);
+    try expectEscapeAction("[57426;5u", .delete_word_right);
+    try expectEscapeAction("[3;5~", .delete_word_right);
+    try expectEscapeAction("[57426;9u", .delete_to_line_end);
+    try expectEscapeAction("[3;9~", .delete_to_line_end);
+    // Keypad keys with no main-row equivalent stay unmapped.
+    try expectEscapeAction("[57416u", .ignore);
+    try expectEscapeAction("[57425u", .ignore);
+    try expectEscapeAction("[57427u", .ignore);
+}
+
+test "input escape parser resolves keypad keys reported with an event type" {
+    // Ghostty can append the Kitty event type as a colon-qualified modifier.
+    try expectEscapeAction("[57412;1:1u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:3u", .ignore);
+    // A multi-digit event type stays non-actionable instead of collapsing to
+    // its last digit.
+    try expectEscapeAction("[57412;1:12u", .ignore);
+    // A colon-qualified report with no event type is not a press.
+    try expectEscapeAction("[57412;1:0u", .ignore);
+    try expectEscapeAction("[57414;1:0u", .ignore);
+    try expectEscapeAction("[57410;1:1u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57414;1:1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57419;1:1u", .cursor_up);
+}
+
+test "input escape parser decodes application-keypad SS3 keys" {
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    try expectEscapeAction("Op", .{ .remapped_byte = '0' });
+    try expectEscapeAction("Oq", .{ .remapped_byte = '1' });
+    try expectEscapeAction("Ox", .{ .remapped_byte = '8' });
+    try expectEscapeAction("Oy", .{ .remapped_byte = '9' });
+    try expectEscapeAction("Ol", .{ .remapped_byte = ',' });
+    try expectEscapeAction("On", .{ .remapped_byte = '.' });
+    try expectEscapeAction("Oj", .{ .remapped_byte = '*' });
+    try expectEscapeAction("Ok", .{ .remapped_byte = '+' });
+    try expectEscapeAction("Om", .{ .remapped_byte = '-' });
+    try expectEscapeAction("Oo", .{ .remapped_byte = '/' });
+    try expectEscapeAction("OM", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("OX", .{ .remapped_byte = '=' });
+    // Arrows, Home, and End keep their existing SS3 mapping.
+    try expectEscapeAction("OA", .cursor_up);
+    try expectEscapeAction("OB", .cursor_down);
+    try expectEscapeAction("OC", .cursor_right);
+    try expectEscapeAction("OD", .cursor_left);
+    try expectEscapeAction("OH", .home);
+    try expectEscapeAction("OF", .end);
+    // F1-F4 and the keypad bytes with no main-row equivalent stay unmapped.
+    try expectEscapeAction("OP", .ignore);
+    try expectEscapeAction("OQ", .ignore);
+    try expectEscapeAction("OR", .ignore);
+    try expectEscapeAction("OS", .ignore);
+    try expectEscapeAction("OE", .ignore);
+    try expectEscapeAction("OI", .ignore);
+}
+
 test "input escape parser preserves double escape meta behavior" {
     try expectEscapeAction("\x1b[A", moveEscape(.paragraph_up, false));
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
@@ -3220,6 +3138,14 @@ test "input escape parser admits raw ctrl+o control byte" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(3));
 }
 
+test "input escape parser admits raw ctrl+p control byte" {
+    try std.testing.expectEqual(
+        @as(?InputEscapeAction, .open_model_catalog),
+        controlByteFeatureAction(16),
+    );
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), controlByteFeatureAction(14));
+}
+
 test "input escape parser handles ctrl+o csi u sequence" {
     var stage: u8 = 1;
     var param: u16 = 0;
@@ -3330,7 +3256,7 @@ test "inline picker dismissal follows the active trigger kind" {
 
     runtime.inputResetState().clearCurrent(alloc);
     try runtime.insertionState().insertSlice(alloc, "/", .preserve);
-    try std.testing.expect(runtime.picker.dismissed_inline_picker == null);
+    try std.testing.expect(runtime.picker.inline_picker_suppression == null);
 }
 
 test "registered paste skill and image spans are atomic editor boundaries" {
@@ -4476,7 +4402,7 @@ test "line deletion no-op preserves input state and metadata" {
     try runtime.kill_ring.text.appendSlice(alloc, "existing kill");
     try appendPastedBlockForTest(&runtime, alloc, 7, "pasted");
     try appendImageBlockForTest(&runtime, &images, alloc, 8);
-    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .effort);
+    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .effort);
     runtime.picker.slash_completion_index = 4;
     runtime.picker.model_completion_index = 5;
     runtime.picker.file_completion_index = 6;
@@ -4533,7 +4459,7 @@ test "successful line deletion resets picker state and preserves history draft" 
     try primeComposerHistoryDraftForTest(&runtime, alloc, "draft");
     try runtime.textReplacementState().replace(alloc, "alpha\nleftMIDright\ngamma");
     runtime.edit_state.cursor = "alpha\nleftMID".len;
-    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .fast);
+    try runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .fast);
     runtime.picker.file_completion_index = 6;
     try std.testing.expect(try runtime.killRingState(null).delete(alloc, .line_start));
     try std.testing.expectEqual(picker_state.ModelPickerStage.model, runtime.picker.model_picker_stage);
@@ -4921,6 +4847,20 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '9'));
     try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.draft_end, false)), consumeInputEscapeByte(&stage, &param, &param2, 'B'));
+    try std.testing.expectEqual(@as(u8, 0), stage);
+}
+
+test "input escape parser treats ctrl+enter as ordinary submit" {
+    // ESC[13;5u is Kitty's Ctrl+Enter encoding.
+    var stage: u8 = 1;
+    var param: u16 = 0;
+    var param2: u16 = 0;
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '['));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '1'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '3'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '5'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .{ .remapped_byte = '\r' }), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 

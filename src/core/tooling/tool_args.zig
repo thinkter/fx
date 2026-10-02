@@ -8,6 +8,21 @@ pub fn parseToolArgsObject(alloc: std.mem.Allocator, args_json: []const u8) !std
     return parsed.value.object;
 }
 
+pub fn normalizeCompositeObjectValue(
+    alloc: std.mem.Allocator,
+    value: *std.json.Value,
+) !void {
+    if (value.* != .string) return;
+    const decoded = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        value.string,
+        .{ .allocate = .alloc_always },
+    );
+    if (decoded != .object) return error.InvalidCompositeArgument;
+    value.* = decoded;
+}
+
 pub fn requiredStringArg(args: std.json.ObjectMap, key: []const u8) ![]const u8 {
     const value = args.get(key) orelse return error.InvalidToolArguments;
     if (value != .string) return error.InvalidToolArguments;
@@ -114,4 +129,27 @@ test "null placeholder reads treat textual nulls as absent" {
     try std.testing.expectEqualStrings("echo null", nullablePlaceholderStringArg(args, "command").?);
     try std.testing.expectEqualStrings("nullify", nullablePlaceholderStringArg(args, "dir").?);
     try std.testing.expectEqualStrings("null", optionalStringArg(args, "cwd").?);
+}
+
+test "composite object normalization preserves objects and decodes JSON strings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var object = std.json.Value{ .object = try parseToolArgsObject(
+        arena,
+        "{\"kind\":\"executable\",\"path\":\"/bin/bash\"}",
+    ) };
+    try normalizeCompositeObjectValue(arena, &object);
+    try std.testing.expectEqualStrings("/bin/bash", object.object.get("path").?.string);
+
+    var encoded = std.json.Value{ .string = "{\"kind\":\"executable\",\"path\":\"/bin/zsh\"}" };
+    try normalizeCompositeObjectValue(arena, &encoded);
+    try std.testing.expectEqualStrings("/bin/zsh", encoded.object.get("path").?.string);
+
+    var invalid = std.json.Value{ .string = "[]" };
+    try std.testing.expectError(
+        error.InvalidCompositeArgument,
+        normalizeCompositeObjectValue(arena, &invalid),
+    );
 }

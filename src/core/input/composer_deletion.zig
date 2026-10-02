@@ -176,7 +176,7 @@ fn applyPickerPolicy(
 
 fn reconcilePicker(insertion: composer_insertion.State) void {
     insertion.picker.reconcileInlinePickerAfterEdit(insertion.edit);
-    insertion.picker.resetActiveModelPickerIndex();
+    insertion.picker.resetActiveCompletionIndex();
 }
 
 const Fixture = struct {
@@ -249,6 +249,7 @@ test "selection deletion wins and picker policy respects empty boundaries" {
         alloc,
         "provider/model",
         0,
+        false,
         false,
         .effort,
     );

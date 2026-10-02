@@ -1,5 +1,6 @@
 const std = @import("std");
 const text_utils = @import("text_utils.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -40,6 +41,21 @@ pub const SemanticNotice = struct {
     body: []const u8,
     visibility: NoticeVisibility = .compact_and_full,
 };
+
+/// Status glyph leading every semantic notice, keyed by tone. Tool activity
+/// owns "●"; notices deliberately use distinct git-style status glyphs so the
+/// two channels never read as the same raw marker. The neutral marker "*"
+/// avoids the middot, which the footer already uses as a separator.
+pub fn noticeGlyph(tone: NoticeTone) []const u8 {
+    return switch (tone) {
+        .information => "i",
+        .success => "✓",
+        .warning => "!",
+        .@"error" => "✗",
+        .cancelled => "⊘",
+        .neutral => "*",
+    };
+}
 
 /// Returns a duplicate with owned topic and body bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
@@ -94,17 +110,89 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    host_managed,
+    configured,
 };
 
+pub const DirectCredentialLease = struct {
+    secret_bytes: []const u8 = "",
+    source: ?CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    tenant_context: ?[]const u8 = null,
+};
+
+/// Borrowed authorization for one provider request. Host-managed requests
+/// cannot carry credential or account bytes into the embedded runtime.
+pub const CredentialLease = union(enum) {
+    direct: DirectCredentialLease,
+    host_managed,
+
+    pub fn secret(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| if (direct.secret_bytes.len > 0) direct.secret_bytes else null,
+            .host_managed => null,
+        };
+    }
+
+    pub fn credentialSource(self: CredentialLease) ?CredentialSource {
+        return switch (self) {
+            .direct => |direct| direct.source,
+            .host_managed => .host_managed,
+        };
+    }
+
+    pub fn accountId(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.account_id,
+            .host_managed => null,
+        };
+    }
+
+    pub fn tenant(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.tenant_context,
+            .host_managed => null,
+        };
+    }
+};
+
+test "host-managed credential lease carries no local authority bytes" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource().?);
+}
+
+test "empty direct credential lease preserves absent authority" {
+    const lease = CredentialLease{ .direct = .{} };
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.credentialSource() == null);
+}
+
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
+    const source = parseRuntimeCredentialSource(text) orelse return null;
+    return if (source == .host_managed or source == .configured) null else source;
+}
+
+pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
 }
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
+        if (source == .host_managed or source == .configured) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
+}
+
+test "host-managed authority is runtime-only and cannot be persisted" {
+    try std.testing.expect(parseCredentialSource("host_managed") == null);
+    try std.testing.expectEqual(
+        CredentialSource.host_managed,
+        parseRuntimeCredentialSource("host_managed").?,
+    );
 }
 
 pub const TurnPresentationOutcome = enum {
@@ -176,6 +264,7 @@ pub const TurnPhase = enum {
     thinking,
     generating,
     running,
+    waiting_for_subagent,
 };
 
 pub const TurnPhaseUpdate = struct {
@@ -220,12 +309,17 @@ pub const RouteRecoveryStatusTone = enum {
 
 pub const ModelRecoveryCause = enum {
     network_interrupted,
+    /// The network path is provably down; nothing was sent and the turn is
+    /// waiting for connectivity instead of spending retry budget.
+    connectivity_lost,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
     authentication,
     request_limit_reached,
+    compaction_prepared,
 };
 
 pub const ModelRecoveryAction = enum {
@@ -235,6 +329,8 @@ pub const ModelRecoveryAction = enum {
     continuing_after_tool,
     reconciling_tool,
     waiting_for_connectivity,
+    /// Silence detected; checking liveness before doing anything else.
+    checking_liveness,
     paused,
 };
 
@@ -243,6 +339,9 @@ pub const ModelRecoveryRequiredAction = enum {
     continue_later,
     inspect_uncertain_tool,
     change_request,
+    /// The same failure repeated at the same progress point; surfaced as a
+    /// broken response instead of an endless restart loop.
+    surface_stall,
 };
 
 pub const ModelFailureDiagnostic = struct {
@@ -254,12 +353,15 @@ pub const ModelFailureDiagnostic = struct {
     pub fn defaultTextForCause(cause: ModelRecoveryCause) []const u8 {
         return switch (cause) {
             .network_interrupted => "NetworkInterrupted",
+            .connectivity_lost => "ConnectionUnavailable",
             .response_interrupted => "StreamInterrupted",
+            .provider_stream_timeout => "gateway_stream_timeout",
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
             .system_resumed => "SystemResumed",
             .authentication => "AuthenticationExpired",
             .request_limit_reached => "ProviderRequestLimitReached",
+            .compaction_prepared => "CompactionPrepared",
         };
     }
 
@@ -285,6 +387,34 @@ pub const ModelFailureDiagnostic = struct {
 
     pub fn view(self: *const ModelFailureDiagnostic) []const u8 {
         return self.bytes[0..self.len];
+    }
+
+    /// User-facing phrasing for machine error names. Provider-supplied text
+    /// passes through unchanged; only known transport error identifiers are
+    /// translated. Raw names stay available in trace logs.
+    fn humanText(self: *const ModelFailureDiagnostic) []const u8 {
+        const raw = self.view();
+        const pairs = .{
+            .{ "ReadFailed", "connection dropped" },
+            .{ "WriteFailed", "connection dropped" },
+            .{ "HttpConnectionClosing", "connection closed" },
+            .{ "ConnectionResetByPeer", "connection reset" },
+            .{ "ConnectionRefused", "connection refused" },
+            .{ "ConnectionTimedOut", "connection timed out" },
+            .{ "Timeout", "timed out" },
+            .{ "StreamStalled", "stream stalled" },
+            .{ "UnknownHostName", "cannot resolve host" },
+            .{ "NameServerFailure", "DNS lookup failed" },
+            .{ "NetworkUnreachable", "network unreachable" },
+            .{ "NetworkDown", "network is down" },
+            .{ "HostUnreachable", "host unreachable" },
+            .{ "NetworkInterrupted", "network interrupted" },
+            .{ "StreamInterrupted", "stream interrupted" },
+        };
+        inline for (pairs) |pair| {
+            if (std.mem.eql(u8, raw, pair[0])) return pair[1];
+        }
+        return raw;
     }
 };
 
@@ -350,8 +480,8 @@ pub const RouteRecoveryStatus = struct {
             .auto_retry => self.recoveryLabel(buf),
             .auto_recovered => std.fmt.bufPrint(
                 buf,
-                "✓ recovered · succeeded on attempt {d}/{d}",
-                .{ self.succeeded_attempt, self.attempt_limit },
+                "✓ recovered · succeeded on attempt {d}",
+                .{self.succeeded_attempt},
             ) catch "✓ recovered",
             .manual_retry_without_fast => self.manualRetryLabel(buf),
             .manual_recovered_without_fast => "✓ recovered · Fast disabled",
@@ -400,79 +530,150 @@ pub const RouteRecoveryStatus = struct {
     fn recoveryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
         const cause = switch (self.cause orelse .provider_unavailable) {
             .network_interrupted => "Network interrupted",
+            .connectivity_lost => "Connection lost",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication refreshed",
             .request_limit_reached => "Provider request limit reached",
+            .compaction_prepared => "Resuming saved compaction",
         };
-        const action = switch (self.action orelse .retrying_request) {
+        const action_value = self.action orelse .retrying_request;
+        const action = switch (action_value) {
             .retrying_request => "retrying request",
-            .continuing_response => "continuing response",
+            .continuing_response => "restarting response",
             .regenerating_tool => "regenerating unstarted tool",
             .continuing_after_tool => "continuing after confirmed tool",
             .reconciling_tool => "checking uncertain tool state",
             .waiting_for_connectivity => "waiting for connection",
+            .checking_liveness => "checking the connection",
             .paused => "recovery paused",
         };
-        if (self.delay_seconds > 0) {
-            if (self.diagnostic) |diagnostic| {
+        // Connectivity waits and liveness probes are un-budgeted: no attempt
+        // counter and no raw error names, just the honest current state.
+        if (action_value == .waiting_for_connectivity or action_value == .checking_liveness) {
+            if (self.delay_seconds > 0) {
                 return std.fmt.bufPrint(
                     buf,
-                    "⚠ {s} · {s} · {s} in {d}s · attempt {d}/{d}",
-                    .{ cause, diagnostic.view(), action, self.delay_seconds, self.failed_attempt, self.attempt_limit },
+                    "⚠ {s} · {s} · {d}s",
+                    .{ cause, action, self.delay_seconds },
                 ) catch "⚠ Recovering model response";
             }
             return std.fmt.bufPrint(
                 buf,
-                "⚠ {s} · {s} in {d}s · attempt {d}/{d}",
-                .{ cause, action, self.delay_seconds, self.failed_attempt, self.attempt_limit },
+                "⚠ {s} · {s}",
+                .{ cause, action },
+            ) catch "⚠ Recovering model response";
+        }
+        if (self.delay_seconds > 0) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ {s} · {s} · {s} in {d}s",
+                    .{ cause, diagnostic.humanText(), action, self.delay_seconds },
+                ) catch "⚠ Recovering model response";
+            }
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ {s} · {s} in {d}s",
+                .{ cause, action, self.delay_seconds },
             ) catch "⚠ Recovering model response";
         }
         if (self.diagnostic) |diagnostic| {
             return std.fmt.bufPrint(
                 buf,
-                "⚠ {s} · {s} · {s} · attempt {d}/{d}",
-                .{ cause, diagnostic.view(), action, self.failed_attempt, self.attempt_limit },
+                "⚠ {s} · {s} · {s}",
+                .{ cause, diagnostic.humanText(), action },
             ) catch "⚠ Recovering model response";
         }
         return std.fmt.bufPrint(
             buf,
-            "⚠ {s} · {s} · attempt {d}/{d}",
-            .{ cause, action, self.failed_attempt, self.attempt_limit },
+            "⚠ {s} · {s}",
+            .{ cause, action },
         ) catch "⚠ Recovering model response";
     }
 
+    // Display names for paused and terminal recovery states; single source so
+    // the stall and generic branches cannot drift. In-progress resume copy
+    // stays in recoveryLabel, where the wording reads differently mid-flight.
+    fn pausedCauseDisplayName(cause: ModelRecoveryCause) []const u8 {
+        return switch (cause) {
+            .network_interrupted => "Network interrupted",
+            .connectivity_lost => "Connection lost",
+            .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
+            .provider_unavailable => "Provider unavailable",
+            .rate_limited => "Rate limited",
+            .system_resumed => "Mac woke from sleep",
+            .authentication => "Authentication expired",
+            .request_limit_reached => "Provider request limit reached",
+            .compaction_prepared => "Saved compaction",
+        };
+    }
+
     fn pausedLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
-        const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
-        if (cause == .rate_limited and self.failed_attempt < self.attempt_limit) {
+        if (self.required_action == .surface_stall) {
+            const cause_text: []const u8 = if (self.cause) |cause|
+                pausedCauseDisplayName(cause)
+            else
+                "Response failed";
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
                     buf,
-                    "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}/{d}",
-                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                    "⚠ {s} · {s} · kept failing at the same point · stopped",
+                    .{ cause_text, diagnostic.humanText() },
+                ) catch "⚠ Response kept failing at the same point";
+            }
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ {s} · kept failing at the same point · stopped",
+                .{cause_text},
+            ) catch "⚠ Response kept failing at the same point";
+        }
+        const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
+        if (cause == .rate_limited) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}",
+                    .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Rate limited · recovery paused";
             }
             return std.fmt.bufPrint(
                 buf,
-                "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}/{d}",
-                .{ self.failed_attempt, self.attempt_limit },
+                "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}",
+                .{self.failed_attempt},
             ) catch "⚠ Rate limited · recovery paused";
         }
-        if (cause == .system_resumed and self.failed_attempt < self.attempt_limit) {
+        if (cause == .system_resumed) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
                     buf,
-                    "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}/{d}",
-                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                    "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}",
+                    .{ diagnostic.view(), self.failed_attempt },
                 ) catch "⚠ Connection unavailable · recovery paused";
             }
             return std.fmt.bufPrint(
                 buf,
-                "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}/{d}",
-                .{ self.failed_attempt, self.attempt_limit },
+                "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}",
+                .{self.failed_attempt},
             ) catch "⚠ Connection unavailable · recovery paused";
+        }
+        if (cause == .provider_stream_timeout) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}",
+                    .{ diagnostic.view(), self.failed_attempt },
+                ) catch "⚠ Gateway stream timed out · automatic retry paused";
+            }
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}",
+                .{self.failed_attempt},
+            ) catch "⚠ Gateway stream timed out · automatic retry paused";
         }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
@@ -488,16 +689,7 @@ pub const RouteRecoveryStatus = struct {
                 .{ self.failed_attempt, self.attempt_limit },
             ) catch "⚠ Response paused · provider-request safety limit reached";
         }
-        const name = switch (cause) {
-            .network_interrupted => "Network interrupted",
-            .response_interrupted => "Response ended early",
-            .provider_unavailable => "Provider unavailable",
-            .rate_limited => "Rate limited",
-            .system_resumed => "Mac woke from sleep",
-            .authentication => "Authentication expired",
-            .request_limit_reached => unreachable,
-        };
-        return self.pausedCauseLabel(buf, name);
+        return self.pausedCauseLabel(buf, pausedCauseDisplayName(cause));
     }
 
     fn pausedCauseLabel(
@@ -505,18 +697,25 @@ pub const RouteRecoveryStatus = struct {
         buf: []u8,
         name: []const u8,
     ) []const u8 {
+        // A lifecycle/safety pause (.paused action) can resume; a terminal
+        // stop (no action) is honest about ending.
+        const state_text: []const u8 = if (self.action == .paused)
+            "recovery paused"
+        else
+            "stopped";
+        const plural: []const u8 = if (self.failed_attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
             return std.fmt.bufPrint(
                 buf,
-                "⚠ {s} · {s} · recovery paused after {d}/{d} attempts",
-                .{ name, diagnostic.view(), self.failed_attempt, self.attempt_limit },
-            ) catch "⚠ Model response recovery paused";
+                "⚠ {s} · {s} · {s} after {d} attempt{s}",
+                .{ name, diagnostic.humanText(), state_text, self.failed_attempt, plural },
+            ) catch "⚠ Model response recovery ended";
         }
         return std.fmt.bufPrint(
             buf,
-            "⚠ {s} · recovery paused after {d}/{d} attempts",
-            .{ name, self.failed_attempt, self.attempt_limit },
-        ) catch "⚠ Model response recovery paused";
+            "⚠ {s} · {s} after {d} attempt{s}",
+            .{ name, state_text, self.failed_attempt, plural },
+        ) catch "⚠ Model response recovery ended";
     }
 };
 
@@ -551,8 +750,52 @@ test "route recovery label includes a value-owned diagnostic" {
 
     var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · retrying request in 4s · attempt 4/10",
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · retrying request in 4s",
         copied.label(&label_buf),
+    );
+}
+
+test "route recovery labels drop counters and raw error names for connectivity waits" {
+    var status = RouteRecoveryStatus{
+        .kind = .auto_retry,
+        .failed_attempt = 6,
+        .attempt_limit = 10,
+        .cause = .connectivity_lost,
+        .action = .waiting_for_connectivity,
+        .delay_seconds = 32,
+        .diagnostic = ModelFailureDiagnostic.init("ConnectionRefused"),
+    };
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "⚠ Connection lost · waiting for connection · 32s",
+        status.label(&label_buf),
+    );
+}
+
+test "model failure diagnostic translates known transport names only" {
+    try std.testing.expectEqualStrings(
+        "connection dropped",
+        ModelFailureDiagnostic.init("ReadFailed").humanText(),
+    );
+    try std.testing.expectEqualStrings(
+        "HTTP 503 · no_available_providers: No providers are currently available",
+        ModelFailureDiagnostic.init("HTTP 503 · no_available_providers: No providers are currently available").humanText(),
+    );
+}
+
+test "stalled recovery surfaces as a terminal stop with plain wording" {
+    var status = RouteRecoveryStatus{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 4,
+        .attempt_limit = 10,
+        .cause = .response_interrupted,
+        .required_action = .surface_stall,
+        .diagnostic = ModelFailureDiagnostic.init("StreamInterrupted"),
+    };
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
+        status.label(&label_buf),
     );
 }
 
@@ -603,6 +846,7 @@ pub const ProviderResultIdentityFailure = enum {
 pub const ToolArgumentIntegrity = enum {
     valid,
     malformed_json,
+    non_object_json,
 
     pub fn classifySerialized(
         alloc: std.mem.Allocator,
@@ -615,6 +859,83 @@ pub const ToolArgumentIntegrity = enum {
         defer parsed.deinit();
         return .valid;
     }
+
+    pub fn classifyFunctionInput(
+        alloc: std.mem.Allocator,
+        serialized: []const u8,
+    ) std.mem.Allocator.Error!ToolArgumentIntegrity {
+        const integrity = try classifySerialized(alloc, serialized);
+        if (integrity != .valid) return integrity;
+        // A complete JSON root is nonempty; only an object can start with '{'.
+        return if (std.mem.trimStart(u8, serialized, " \t\r\n")[0] == '{') .valid else .non_object_json;
+    }
+};
+
+/// Explains why raw function arguments were `malformed_json`, captured before
+/// fx replaces them with `{}`. It carries positions only: rejected argument
+/// bytes never leave the parse step.
+pub const ToolArgumentDiagnostic = struct {
+    pub const Failure = enum {
+        /// The input ended before the JSON value was complete.
+        truncated,
+        /// The scanner rejected the input at `error_offset`.
+        syntax_error,
+        /// The syntax was complete, but the parsed value was refused, such as
+        /// an object that repeats a key.
+        rejected_value,
+    };
+
+    failure: Failure,
+    input_bytes: usize,
+    /// Byte offset where scanning stopped; null when no single byte is at fault.
+    error_offset: ?usize,
+
+    /// Diagnoses raw input that failed `ToolArgumentIntegrity` classification.
+    /// `scratch` backs only the scanner's nesting stack, released before return.
+    pub fn diagnose(scratch: std.mem.Allocator, raw: []const u8) std.mem.Allocator.Error!ToolArgumentDiagnostic {
+        var scanner = std.json.Scanner.initCompleteInput(scratch, raw);
+        defer scanner.deinit();
+        var position: std.json.Diagnostics = .{};
+        scanner.enableDiagnostics(&position);
+        while (true) {
+            const token = scanner.next() catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                // Complete input cannot underrun; treat it as the same missing tail.
+                error.UnexpectedEndOfInput, error.BufferUnderrun => .{
+                    .failure = .truncated,
+                    .input_bytes = raw.len,
+                    .error_offset = raw.len,
+                },
+                error.SyntaxError => .{
+                    .failure = .syntax_error,
+                    .input_bytes = raw.len,
+                    .error_offset = @min(raw.len, std.math.cast(usize, position.getByteOffset()) orelse raw.len),
+                },
+            };
+            if (token == .end_of_document) return .{
+                .failure = .rejected_value,
+                .input_bytes = raw.len,
+                .error_offset = null,
+            };
+        }
+    }
+};
+
+/// Identifies the server and catalog offered to one model step.
+pub const McpToolBinding = struct {
+    runtime_generation: u64,
+    connection_generation: u64,
+    catalog_generation: u64,
+    auth_generation: u64,
+    authority_id: u64 = 0,
+    definition_digest: [32]u8 = .{0} ** 32,
+
+    /// Transport renewal may change epochs without changing the advertised action.
+    pub fn sameDefinition(self: McpToolBinding, other: McpToolBinding) bool {
+        return self.runtime_generation == other.runtime_generation and
+            self.authority_id == other.authority_id and
+            std.mem.eql(u8, &self.definition_digest, &other.definition_digest);
+    }
 };
 
 pub const ToolCall = struct {
@@ -622,10 +943,15 @@ pub const ToolCall = struct {
     name: []const u8,
     arguments_json: []const u8,
     argument_integrity: ToolArgumentIntegrity = .valid,
+    /// Set when fx rejected the raw arguments as `malformed_json`. Copies keep
+    /// it; durable and provider encodings omit it.
+    argument_diagnostic: ?ToolArgumentDiagnostic = null,
     provisional_id: ?[]const u8 = null,
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
+    /// Borrowed only for this action. Copies and durable/provider encodings omit it.
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -671,6 +997,23 @@ pub const WebFetchCompletion = struct {
 
     pub fn url(self: *const WebFetchCompletion) []const u8 {
         return self.url_buf[0..self.url_len];
+    }
+};
+
+pub const SubagentStatus = struct {
+    session_title: ?[]const u8 = null,
+    model: []const u8,
+    effort: ReasoningEffort,
+    input_tokens: u64,
+    context_window: ?u32,
+};
+
+pub const SubagentStatusRenderer = struct {
+    ctx: *anyopaque,
+    render_fn: *const fn (*anyopaque, buf: []u8, SubagentStatus) []const u8,
+
+    pub fn render(self: SubagentStatusRenderer, buf: []u8, status: SubagentStatus) []const u8 {
+        return self.render_fn(self.ctx, buf, status);
     }
 };
 
@@ -721,9 +1064,29 @@ pub const CommittedFilePresentation = struct {
     previous_content: ?[]const u8 = null,
     after_content: ?[]const u8 = null,
     lifecycle_id: ?ToolLifecycleId = null,
+    /// Content-addressed artifact handle holding the previous/after content
+    /// pack in the session result store. When present, the durable record
+    /// omits the inline contents and readers load them through the handle.
+    /// In-memory live-turn presentations keep contents inline and leave this
+    /// null; only the persistence projection sets it.
+    content_handle: ?[]const u8 = null,
 };
 
+/// Rejects competing or wrongly typed durable content authorities. A
+/// preview-only presentation may have neither inline snapshots nor a handle.
+pub fn committedFilePresentationContentSourceValid(
+    presentation: CommittedFilePresentation,
+) bool {
+    const handle = presentation.content_handle orelse return true;
+    return presentation.previous_content == null and
+        presentation.after_content == null and
+        std.mem.startsWith(u8, handle, "diff-") and
+        std.mem.endsWith(u8, handle, ".json");
+}
+
 pub const PersistedToolResult = struct {
+    tool_images: []ToolImage = &.{},
+    tool_image_handle: ?[]u8 = null,
     tool_call_id: []u8,
     tool_name: []u8,
     status: PersistedToolStatus,
@@ -734,6 +1097,7 @@ pub const PersistedToolResult = struct {
     stored_output_bytes: usize,
     truncated: bool = false,
     provider_native: bool = false,
+    review_feedback: bool = false,
     created_at_ms: i64 = 0,
     permission_feedback: [][]u8 = &.{},
     committed_file_presentation: ?CommittedFilePresentation = null,
@@ -789,7 +1153,6 @@ pub const TerminalFailurePresentation = enum {
     lease_conflict,
     cursor_gap,
     screen_unavailable,
-    monitor_unavailable,
     protocol_incompatible,
     capacity_exceeded,
     cancelled,
@@ -811,7 +1174,6 @@ pub const TerminalFailurePresentation = enum {
             .lease_conflict => "terminal control lease conflict",
             .cursor_gap => "terminal output cursor gap",
             .screen_unavailable => "terminal screen is unavailable",
-            .monitor_unavailable => "terminal monitor is unavailable",
             .protocol_incompatible => "terminal protocol is incompatible",
             .capacity_exceeded => "terminal capacity exceeded",
             .cancelled => "terminal action was cancelled",
@@ -841,7 +1203,7 @@ pub const TerminalActionPresentation = union(enum) {
 
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
-pub const context_deferred_tool_status_label = "Context updated";
+pub const context_deferred_tool_status_label = "Reading project instructions before continuing:";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -887,6 +1249,10 @@ test "persisted deferred tool result classifier is exact" {
 }
 
 pub const ToolResultMemory = struct {
+    /// Host review feedback is retained for the agent, not security evidence.
+    review_feedback: bool = false,
+    tool_images: []const ToolImage = &.{},
+    tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
     output_bytes: usize = 0,
@@ -903,7 +1269,16 @@ pub const ToolExecutionStep = struct {
     assistant: ?[]u8 = null,
     tool_calls: []ToolCall = &.{},
     tool_results: []PersistedToolResult = &.{},
+    provider_replay: ?ProviderReplay = null,
 };
+
+pub const PersistedSteering = struct {
+    text: []u8,
+    assistant_prefix: ?[]u8 = null,
+    after_tool_step_count: usize,
+};
+
+pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
     path: []u8,
@@ -919,10 +1294,190 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
+    /// User guidance consumed between model steps, with its chronological tool boundary.
+    steering: []PersistedSteering = &.{},
+    turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0;
+        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
+};
+
+/// Image bytes returned by a tool; never a grant to read a user file.
+pub const ToolImage = struct {
+    /// Owned encoded bytes; empty only when a valid source_ref is present.
+    data: []u8,
+    mime_type: []u8,
+    /// Owned opaque host reference, never filesystem or network authority.
+    source_ref: ?[]u8 = null,
+};
+
+pub fn freeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) void {
+    for (images) |image| {
+        alloc.free(image.data);
+        alloc.free(image.mime_type);
+        if (image.source_ref) |source_ref| alloc.free(source_ref);
+    }
+    alloc.free(images);
+}
+
+pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]ToolImage {
+    const copies = try alloc.alloc(ToolImage, images.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copies[0..initialized]) |image| {
+            alloc.free(image.data);
+            alloc.free(image.mime_type);
+            if (image.source_ref) |source_ref| alloc.free(source_ref);
+        }
+        alloc.free(copies);
+    }
+    for (images, 0..) |image, index| {
+        const data = try alloc.dupe(u8, image.data);
+        errdefer alloc.free(data);
+        const mime_type = try alloc.dupe(u8, image.mime_type);
+        errdefer alloc.free(mime_type);
+        copies[index] = .{
+            .data = data,
+            .mime_type = mime_type,
+            .source_ref = if (image.source_ref) |source_ref| try alloc.dupe(u8, source_ref) else null,
+        };
+        initialized += 1;
+    }
+    return copies;
+}
+
+/// Deep-copies every slice-bearing field of a ToolResultMemory so the caller's
+/// copy is independent of the source's backing allocations. Use when the
+/// source memory is owned by a shorter-lived scope (for example a parallel
+/// tool attempt whose run result is deinitialized after assembly).
+pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) !ToolResultMemory {
+    const tool_images = try dupeToolImages(alloc, memory.tool_images);
+    errdefer freeToolImages(alloc, tool_images);
+    const tool_image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const output_handle = if (memory.output_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (output_handle) |handle| alloc.free(handle);
+    const preview = if (memory.preview) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (preview) |value| alloc.free(value);
+    const committed_file_presentation = if (memory.committed_file_presentation) |presentation|
+        try dupeCommittedFilePresentation(alloc, presentation)
+    else
+        null;
+    errdefer if (committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
+    const command_output_replay = if (memory.command_output_replay) |replay|
+        try dupeCommandOutputReplay(alloc, replay)
+    else
+        null;
+    errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    return .{
+        .review_feedback = memory.review_feedback,
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
+        .output_handle = output_handle,
+        .preview = preview,
+        .output_bytes = memory.output_bytes,
+        .stored_output_bytes = memory.stored_output_bytes,
+        .truncated = memory.truncated,
+        .model_view_covers_full_file = memory.model_view_covers_full_file,
+        .committed_file_presentation = committed_file_presentation,
+        .command_output_replay = command_output_replay,
+        .command_process_presentation = memory.command_process_presentation,
+        .terminal_action_presentation = memory.terminal_action_presentation,
+    };
+}
+
+/// Frees the slice-bearing fields of a ToolResultMemory owned by the caller,
+/// as produced by dupeToolResultMemory.
+pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) void {
+    freeToolImages(alloc, memory.tool_images);
+    if (memory.tool_image_handle) |handle| alloc.free(handle);
+    if (memory.output_handle) |handle| alloc.free(handle);
+    if (memory.preview) |value| alloc.free(value);
+    if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
+    if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+}
+
+test "dupeToolResultMemory copies survive teardown of every source allocation" {
+    const alloc = std.testing.allocator;
+    const source_images = try alloc.alloc(ToolImage, 1);
+    source_images[0] = .{
+        .data = try alloc.dupe(u8, "aW1hZ2UtZGF0YQ=="),
+        .mime_type = try alloc.dupe(u8, "image/png"),
+        .source_ref = try alloc.dupe(u8, "host:original"),
+    };
+    const source: ToolResultMemory = .{
+        .review_feedback = true,
+        .tool_images = source_images,
+        .tool_image_handle = try alloc.dupe(u8, "image-result-1"),
+        .output_handle = try alloc.dupe(u8, "result-1"),
+        .preview = try alloc.dupe(u8, "preview text"),
+        .output_bytes = 128,
+        .stored_output_bytes = 64,
+        .truncated = true,
+        .model_view_covers_full_file = false,
+        .command_output_replay = .{ .available = .{ .handle = try alloc.dupe(u8, "cmd-replay-1"), .framed_bytes = 42 } },
+        .command_process_presentation = .{ .exit_code = 3 },
+    };
+    const copy = try dupeToolResultMemory(alloc, source);
+    // Tear down every source allocation; the testing allocator scribbles
+    // freed memory, so an aliased copy reads garbage below.
+    freeToolImages(alloc, source_images);
+    alloc.free(source.tool_image_handle.?);
+    alloc.free(source.output_handle.?);
+    alloc.free(source.preview.?);
+    freeCommandOutputReplay(alloc, source.command_output_replay.?);
+
+    try std.testing.expect(copy.review_feedback);
+    try std.testing.expectEqual(@as(usize, 1), copy.tool_images.len);
+    try std.testing.expectEqualStrings("aW1hZ2UtZGF0YQ==", copy.tool_images[0].data);
+    try std.testing.expectEqualStrings("image/png", copy.tool_images[0].mime_type);
+    try std.testing.expectEqualStrings("host:original", copy.tool_images[0].source_ref.?);
+    try std.testing.expectEqualStrings("image-result-1", copy.tool_image_handle.?);
+    try std.testing.expectEqualStrings("result-1", copy.output_handle.?);
+    try std.testing.expectEqualStrings("preview text", copy.preview.?);
+    try std.testing.expectEqual(@as(usize, 128), copy.output_bytes);
+    try std.testing.expectEqual(@as(usize, 64), copy.stored_output_bytes);
+    try std.testing.expect(copy.truncated);
+    try std.testing.expectEqual(@as(?bool, false), copy.model_view_covers_full_file);
+    switch (copy.command_output_replay.?) {
+        .available => |descriptor| {
+            try std.testing.expectEqualStrings("cmd-replay-1", descriptor.handle);
+            try std.testing.expectEqual(@as(usize, 42), descriptor.framed_bytes);
+        },
+        .unavailable => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(copy.command_process_presentation.? == .exit_code);
+
+    freeToolResultMemory(alloc, copy);
+}
+
+test "dupeToolResultMemory frees only its own copies on allocation failure" {
+    const source: ToolResultMemory = .{
+        .tool_images = &.{
+            .{ .data = @constCast("aW1hZ2U="), .mime_type = @constCast("image/png"), .source_ref = @constCast("host:original") },
+            .{ .data = @constCast(""), .mime_type = @constCast("image/jpeg"), .source_ref = @constCast("host:large") },
+        },
+        .tool_image_handle = "image-result-1",
+        .output_handle = "result-1",
+        .preview = "preview",
+        .command_output_replay = .{ .available = .{ .handle = "cmd-replay-1", .framed_bytes = 7 } },
+    };
+    // Every allocation failure point must leave the source's slices untouched
+    // and release exactly what the partial copy allocated.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(alloc: std.mem.Allocator) !void {
+            const copy = try dupeToolResultMemory(alloc, source);
+            freeToolResultMemory(alloc, copy);
+        }
+    }.check, .{});
+}
+
+/// A cut in the active context, not a second persisted history.
+pub const ContextHistoryCut = struct {
+    turns: usize = 0,
+    tool_steps: usize = 0,
+    steering: usize = 0,
 };
 
 pub const ImageAttachment = struct {
@@ -931,6 +1486,13 @@ pub const ImageAttachment = struct {
     media_type: []u8,
     snapshot_path: ?[]u8 = null,
     snapshot_sha256: ?[]u8 = null,
+    /// Owned decoded image bytes for sessions without a filesystem snapshot
+    /// backend (libfx kernel sessions on native and wasm). When set, the
+    /// attachment loads from memory instead of `snapshot_path`, and durable
+    /// serializers embed the bytes so checkpoint/restore round-trips them.
+    inline_data: ?[]u8 = null,
+    /// Owned opaque host reference, never filesystem or network authority.
+    source_ref: ?[]u8 = null,
 };
 
 pub const UserTurn = struct {
@@ -941,10 +1503,28 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
-pub const ChatCachePolicy = enum {
-    default,
-    no_cache,
+/// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
+pub const ProviderReplay = struct {
+    pub const max_bytes: usize = 4 * 1024 * 1024;
+    source: @import("../config/model_provider.zig").ProviderSelection,
+    parts_json: []const u8,
+
+    pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
+        return self.source.provider.same_authority(source.provider) and std.mem.eql(u8, self.source.model, source.model);
+    }
 };
+
+pub fn dupeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) !ProviderReplay {
+    const model = try alloc.dupe(u8, value.source.model);
+    errdefer alloc.free(model);
+    const parts = try alloc.dupe(u8, value.parts_json);
+    return .{ .source = .{ .provider = value.source.provider, .model = model }, .parts_json = parts };
+}
+
+pub fn freeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) void {
+    alloc.free(value.source.model);
+    alloc.free(value.parts_json);
+}
 
 pub const ChatMessage = struct {
     role: ChatRole,
@@ -953,14 +1533,61 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
-    /// Provider-owned opaque response items needed only for stateless within-turn continuation.
-    /// The value is a validated JSON array and is never sent across provider routes.
-    provider_state_json: ?[]const u8 = null,
+    provider_replay: ?ProviderReplay = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
-    cache_policy: ChatCachePolicy = .default,
+    /// Checkpoint steering text has already had its envelope removed.
+    restored_steering: bool = false,
+    // Source provenance for compaction, never permission authority.
+    context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
+    standalone_response: bool = false,
 };
+
+/// Returns a caller-owned shallow projection only when incompatible replay exists.
+pub fn projectProviderReplay(
+    alloc: std.mem.Allocator,
+    messages: []const ChatMessage,
+    source: @import("../config/model_provider.zig").ProviderSelection,
+) !?[]ChatMessage {
+    var projected: ?[]ChatMessage = null;
+    errdefer if (projected) |owned| alloc.free(owned);
+    for (messages, 0..) |message, index| {
+        const replay = message.provider_replay orelse continue;
+        if (replay.matches(source)) continue;
+        if (projected == null) projected = try alloc.dupe(ChatMessage, messages);
+        projected.?[index].provider_replay = null;
+    }
+    return projected;
+}
+
+test "provider replay projection preserves matching origin and excludes other routes" {
+    const alloc = std.testing.allocator;
+    const source = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "model" };
+    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "answer", .provider_replay = .{ .source = source, .parts_json = "[]" } }};
+    try std.testing.expect(try projectProviderReplay(alloc, &messages, source) == null);
+    for ([_]@import("../config/model_provider.zig").ProviderSelection{
+        .{ .provider = .codex, .model = "model" },
+        .{ .provider = .grok, .model = "model" },
+        .{ .provider = .gateway, .model = "different" },
+    }) |other| {
+        const projected = (try projectProviderReplay(alloc, &messages, other)).?;
+        defer alloc.free(projected);
+        try std.testing.expect(projected[0].provider_replay == null);
+        try std.testing.expectEqualStrings("answer", projected[0].content.?);
+        try std.testing.expect(messages[0].provider_replay != null);
+        try std.testing.expect(try projectProviderReplay(alloc, projected, other) == null);
+    }
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: std.mem.Allocator) !void {
+            const input = [_]ChatMessage{.{ .role = .assistant, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "model" }, .parts_json = "[]" } }};
+            const projected = (try projectProviderReplay(a, &input, .{ .provider = .codex, .model = "model" })).?;
+            defer a.free(projected);
+            const copy = try dupeProviderReplay(a, input[0].provider_replay.?);
+            defer freeProviderReplay(a, copy);
+        }
+    }.check, .{});
+}
 
 pub const Usage = struct {
     input_tokens: ?u64 = null,
@@ -1000,6 +1627,8 @@ pub const ToolUsage = struct {
 };
 
 pub const TurnSummary = struct {
+    started_at_ms: i64 = 0,
+    completed_at_ms: i64 = 0,
     thinking_duration_ms: u64 = 0,
     turn_duration_ms: u64 = 0,
     token_progress: TurnTokenProgress = .{},
@@ -1041,16 +1670,62 @@ pub const ProviderFinishReason = enum {
     }
 };
 
+pub const ProviderFailureCause = enum {
+    gateway_stream_timeout,
+    non_retryable,
+    rate_limited,
+};
+
+pub const ProviderServiceTier = enum {
+    standard,
+    flex,
+    priority,
+    ultrafast,
+
+    pub fn parse(raw: []const u8) ?ProviderServiceTier {
+        if (std.mem.eql(u8, raw, "default") or std.mem.eql(u8, raw, "standard")) return .standard;
+        if (std.mem.eql(u8, raw, "priority") or std.mem.eql(u8, raw, "fast")) return .priority;
+        if (std.mem.eql(u8, raw, "flex")) return .flex;
+        if (std.mem.eql(u8, raw, "ultrafast")) return .ultrafast;
+        return null;
+    }
+};
+
+test "Provider service tier parser recognizes Gateway tiers" {
+    const cases = [_]struct {
+        raw: []const u8,
+        expected: ?ProviderServiceTier,
+    }{
+        .{ .raw = "default", .expected = .standard },
+        .{ .raw = "standard", .expected = .standard },
+        .{ .raw = "priority", .expected = .priority },
+        .{ .raw = "fast", .expected = .priority },
+        .{ .raw = "flex", .expected = .flex },
+        .{ .raw = "ultrafast", .expected = .ultrafast },
+        .{ .raw = "unknown", .expected = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, ProviderServiceTier.parse(case.raw));
+    }
+}
+
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     generation_id: ?[]const u8 = null,
+    /// Owned gateway provider slug that actually served the request (the
+    /// gateway's routing finalProvider/resolvedProvider). Null when the
+    /// provider did not report routing metadata.
+    resolved_provider: ?[]const u8 = null,
     billing: ?ProviderBilling = null,
+    /// Gateway-applied service tier. Null when the provider did not confirm it.
+    service_tier: ?ProviderServiceTier = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.
     generation_metadata_invalid: bool = false,
     /// An earlier delivery may have billed outside this generation identity.
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
+    provider_failure_cause: ?ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     /// Provider-owned opaque response items for the next stateless request in this turn.
     provider_state_json: ?[]const u8 = null,
@@ -1215,6 +1890,14 @@ pub fn validGatewayTeam(team: []const u8) bool {
     return true;
 }
 
+pub fn validCredentialAccountId(account_id: []const u8) bool {
+    if (account_id.len == 0 or account_id.len > 1024) return false;
+    for (account_id) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
+    return true;
+}
+
 pub const ProviderCompletionDisposition = enum {
     completed,
     length_limited,
@@ -1348,9 +2031,25 @@ test "ProviderFinishReason accepts only the canonical provider domain" {
     try std.testing.expectEqual(ProviderFinishReason.content_filter, ProviderFinishReason.parse_legacy("content_filter").?);
 }
 
+pub const ConversationIdentity = struct {
+    pub const max_bytes: usize = 256;
+    pub const Failure = enum { empty, too_long, invalid_utf8 };
+
+    pub fn invalidReason(value: []const u8) ?Failure {
+        if (value.len == 0) return .empty;
+        if (value.len > max_bytes) return .too_long;
+        if (!std.unicode.utf8ValidateSlice(value)) return .invalid_utf8;
+        return null;
+    }
+};
+
 pub const AuthoritativeToolAdmission = union(enum) {
     admitted,
     reject_malformed_identity: FinalToolIdentity,
+    reject_unstorable_identity: struct {
+        field: enum { id, name, provisional_id },
+        reason: ConversationIdentity.Failure,
+    },
     reject_malformed_provider_result: ProviderResultIdentityFailure,
     reject_malformed_provider_arguments,
     reject_duplicate_identity,
@@ -1362,7 +2061,7 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
-        const final_identity = if (call.final_identity == .valid and call.id.len == 0)
+        const final_identity = if (call.final_identity == .valid and std.mem.trim(u8, call.id, " \t\r\n").len == 0)
             FinalToolIdentity.empty
         else
             call.final_identity;
@@ -1386,6 +2085,20 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
+        if (ConversationIdentity.invalidReason(call.id)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .id, .reason = reason } };
+        }
+        if (ConversationIdentity.invalidReason(call.name)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .name, .reason = reason } };
+        }
+        if (call.provisional_id) |id| {
+            if (ConversationIdentity.invalidReason(id)) |reason| {
+                return .{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = reason } };
+            }
+        }
+    }
+
+    for (completion.tool_calls) |call| {
         if (call.provenance == .provider_executed and
             call.argument_integrity == .malformed_json)
         {
@@ -1400,6 +2113,72 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     return .admitted;
+}
+
+test "authoritative tool admission rejects blank current call ids" {
+    for ([_][]const u8{ "", " ", "\t\r\n" }) |id| {
+        const calls = [_]ToolCall{.{ .id = id, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_malformed_identity = .empty },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+    }
+}
+
+test "authoritative tool admission rejects unstorable names" {
+    const oversized = [_]u8{'n'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = "", .reason = .empty },
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+        for (cases) |case| {
+            const calls = [_]ToolCall{.{ .id = "call", .name = case.value, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqualDeep(
+                AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .name, .reason = case.reason } },
+                authoritativeToolAdmission(.{ .tool_calls = &calls }),
+            );
+        }
+    }
+}
+
+test "authoritative tool admission rejects unstorable correlation identities" {
+    const oversized = [_]u8{'i'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for (cases) |case| {
+        const calls = [_]ToolCall{.{ .id = case.value, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+        const provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = case.value }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &provisional }),
+        );
+    }
+    const empty_provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = "" }};
+    try std.testing.expectEqualDeep(
+        AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = .empty } },
+        authoritativeToolAdmission(.{ .tool_calls = &empty_provisional }),
+    );
+}
+
+test "authoritative tool admission preserves bounded canonical identity formats" {
+    const boundary = [_]u8{'i'} ** 256;
+    const unicode_boundary = "é" ** 128;
+    for ([_][]const u8{ &boundary, unicode_boundary, "functions.read_file:0", "unknown/tool" }) |identity| {
+        for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+            const calls = [_]ToolCall{.{ .id = identity, .name = identity, .provisional_id = identity, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqual(AuthoritativeToolAdmission.admitted, authoritativeToolAdmission(.{ .tool_calls = &calls }));
+            try std.testing.expectEqualStrings(identity, calls[0].id);
+            try std.testing.expectEqualStrings(identity, calls[0].name);
+        }
+    }
 }
 
 test "authoritative tool admission rejects duplicate final ids across provenance" {
@@ -1511,23 +2290,17 @@ pub const AssistantHistoryTurn = struct {
     user: UserTurn,
     assistant: []u8,
     execution: ExecutionMemory = .{},
-};
-
-pub const StableBackgroundRecordId = [16]u8;
-
-pub const BackgroundCommandHistoryTurn = struct {
-    user: UserTurn,
-    assistant: ?[]u8 = null,
-    execution: ExecutionMemory = .{},
-    log_path: []u8,
-    expect_url: bool,
-    url: ?[]u8 = null,
-    background_record_id: ?StableBackgroundRecordId = null,
+    provider_replay: ?ProviderReplay = null,
 };
 
 pub const InterruptedTerminalReason = enum {
     cancelled,
     failed,
+};
+
+pub const CancellationOrigin = enum {
+    turn,
+    compaction,
 };
 
 pub const InterruptedHistoryTurn = struct {
@@ -1538,6 +2311,7 @@ pub const InterruptedHistoryTurn = struct {
     execution: ExecutionMemory = .{},
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
+    cancellation_origin: CancellationOrigin = .turn,
 };
 
 pub const CompactedSummaryHistoryTurn = struct {
@@ -1559,9 +2333,24 @@ pub const CompactedSummaryHistoryTurn = struct {
 pub const HistoryTurn = union(enum) {
     compacted_summary: CompactedSummaryHistoryTurn,
     assistant: AssistantHistoryTurn,
-    background_command: BackgroundCommandHistoryTurn,
     interrupted: InterruptedHistoryTurn,
 };
+
+pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
+    switch (turn.*) {
+        .assistant => |*entry| entry.execution.turn_summary = summary,
+        .interrupted => |*entry| entry.execution.turn_summary = summary,
+        .compacted_summary => {},
+    }
+}
+
+pub fn historyTurnSummary(turn: HistoryTurn) ?TurnSummary {
+    return switch (turn) {
+        .assistant => |entry| entry.execution.turn_summary,
+        .interrupted => |entry| entry.execution.turn_summary,
+        .compacted_summary => null,
+    };
+}
 
 pub const FinishedPromptProjection = enum {
     history_default,
@@ -1591,6 +2380,8 @@ pub const SnapshotFileOwnership = struct {
 
 pub const FinishedPrompt = struct {
     turn: HistoryTurn,
+    /// Owned display-only text; never serialized as conversation history.
+    presentation_text: ?[]const u8 = null,
     summary: ?TurnSummary = null,
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
@@ -1601,6 +2392,15 @@ pub const PermissionMode = enum {
     ask,
     auto,
     yolo,
+
+    pub fn parse(raw: []const u8) ?PermissionMode {
+        if (std.ascii.eqlIgnoreCase(raw, "ask")) return .ask;
+        if (std.ascii.eqlIgnoreCase(raw, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(raw, "full-access") or
+            std.ascii.eqlIgnoreCase(raw, "full access") or
+            std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
+        return null;
+    }
 };
 
 pub const RuleDecision = enum {
@@ -1719,6 +2519,7 @@ pub const ToolPermissionDenialReason = enum {
     user_denied,
     auto_denied,
     review_caution,
+    review_evidence_incomplete,
     review_unavailable,
     policy_denied,
     permission_required,
@@ -1793,6 +2594,9 @@ pub const QuestionOption = struct {
 pub const QuestionBatchEntry = struct {
     question: []const u8,
     options: []const QuestionOption,
+    /// Submission prompts return JSON {"value": string} or {"option": index},
+    /// keeping typed text distinct from action labels such as Decline.
+    submission: enum { none, input, choice } = .none,
 };
 
 /// One persisted answer from an interactive question batch. The strings are
@@ -1817,14 +2621,8 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
         .assistant => |entry| {
             freeUserTurn(alloc, entry.user);
             alloc.free(entry.assistant);
+            if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
             freeExecutionMemory(alloc, entry.execution);
-        },
-        .background_command => |entry| {
-            freeUserTurn(alloc, entry.user);
-            if (entry.assistant) |assistant| alloc.free(assistant);
-            freeExecutionMemory(alloc, entry.execution);
-            alloc.free(entry.log_path);
-            if (entry.url) |url| alloc.free(url);
         },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -1848,6 +2646,7 @@ pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void
 
 pub fn freeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) void {
     freeHistoryTurn(alloc, finished.turn);
+    if (finished.presentation_text) |text| alloc.free(text);
     if (finished.snapshot_file_ownership) |ownership| ownership.release();
 }
 
@@ -1883,36 +2682,13 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer alloc.free(assistant);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+            const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
-            } };
-        },
-        .background_command => |entry| blk: {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-
-            const execution = try dupeExecutionMemory(alloc, entry.execution);
-            errdefer freeExecutionMemory(alloc, execution);
-
-            const log_path = try alloc.dupe(u8, entry.log_path);
-            errdefer alloc.free(log_path);
-
-            const url = if (entry.url) |src| try alloc.dupe(u8, src) else null;
-            errdefer if (url) |owned| alloc.free(owned);
-
-            break :blk .{ .background_command = .{
-                .user = user,
-                .assistant = assistant,
-                .execution = execution,
-                .log_path = log_path,
-                .expect_url = entry.expect_url,
-                .url = url,
-                .background_record_id = entry.background_record_id,
+                .provider_replay = replay,
             } };
         },
         .interrupted => |entry| blk: {
@@ -1946,6 +2722,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .execution = execution,
                 .cancelled_command = cancelled_command,
                 .terminal_reason = entry.terminal_reason,
+                .cancellation_origin = entry.cancellation_origin,
             } };
         },
     };
@@ -1979,9 +2756,12 @@ pub fn freeCancelledCommandPresentation(
 
 pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !FinishedPrompt {
     const turn = try dupeHistoryTurn(alloc, finished.turn);
+    errdefer freeHistoryTurn(alloc, turn);
+    const presentation_text = if (finished.presentation_text) |text| try alloc.dupe(u8, text) else null;
     if (finished.snapshot_file_ownership) |ownership| ownership.retain();
     return .{
         .turn = turn,
+        .presentation_text = presentation_text,
         .summary = finished.summary,
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
@@ -2019,15 +2799,58 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const tool_steps = try dupeToolExecutionSteps(alloc, memory.tool_steps);
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
+    errdefer freeFileEvidenceSlice(alloc, files);
+    const steering = try dupePersistedSteering(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
+        .steering = steering,
+        .turn_summary = memory.turn_summary,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
+    freePersistedSteering(alloc, memory.steering);
+}
+
+pub fn dupePersistedSteering(
+    alloc: std.mem.Allocator,
+    steering: []const PersistedSteering,
+) ![]PersistedSteering {
+    if (steering.len == 0) return &.{};
+    const copy = try alloc.alloc(PersistedSteering, steering.len);
+    errdefer alloc.free(copy);
+    var copied: usize = 0;
+    errdefer for (copy[0..copied]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    for (steering, copy) |item, *dest| {
+        const text = try alloc.dupe(u8, item.text);
+        errdefer alloc.free(text);
+        const assistant_prefix = if (item.assistant_prefix) |prefix|
+            try alloc.dupe(u8, prefix)
+        else
+            null;
+        errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
+        dest.* = .{
+            .text = text,
+            .assistant_prefix = assistant_prefix,
+            .after_tool_step_count = item.after_tool_step_count,
+        };
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedSteering) void {
+    for (steering) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    }
+    if (steering.len > 0) alloc.free(steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
@@ -2061,9 +2884,11 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
     errdefer freeToolCallSlice(alloc, tool_calls);
     const tool_results = try dupePersistedToolResults(alloc, step.tool_results);
     errdefer freePersistedToolResults(alloc, tool_results);
+    const replay = if (step.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
 
     return .{
         .assistant = assistant,
+        .provider_replay = replay,
         .tool_calls = tool_calls,
         .tool_results = tool_results,
     };
@@ -2071,6 +2896,7 @@ fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !Too
 
 fn freeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) void {
     if (step.assistant) |assistant| alloc.free(assistant);
+    if (step.provider_replay) |replay| freeProviderReplay(alloc, replay);
     freeToolCallSlice(alloc, step.tool_calls);
     freePersistedToolResults(alloc, step.tool_results);
 }
@@ -2159,6 +2985,11 @@ pub fn dupeCommittedFilePresentation(
         .call_id = try alloc.dupe(u8, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    const content_handle = if (presentation.content_handle) |handle|
+        try alloc.dupe(u8, handle)
+    else
+        null;
+    errdefer if (content_handle) |handle| alloc.free(handle);
     return .{
         .path = path,
         .kind = presentation.kind,
@@ -2169,6 +3000,7 @@ pub fn dupeCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
 }
 
@@ -2182,6 +3014,7 @@ pub fn freeCommittedFilePresentation(
     if (presentation.previous_content) |content| alloc.free(@constCast(content));
     if (presentation.after_content) |content| alloc.free(@constCast(content));
     if (presentation.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    if (presentation.content_handle) |handle| alloc.free(@constCast(handle));
 }
 
 fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult) !PersistedToolResult {
@@ -2207,7 +3040,12 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const tool_image_handle = if (result.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = try dupeToolImages(alloc, result.tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = result.status,
@@ -2218,6 +3056,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .stored_output_bytes = result.stored_output_bytes,
         .truncated = result.truncated,
         .provider_native = result.provider_native,
+        .review_feedback = result.review_feedback,
         .created_at_ms = result.created_at_ms,
         .permission_feedback = permission_feedback,
         .committed_file_presentation = committed_file_presentation,
@@ -2231,6 +3070,8 @@ fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     alloc.free(result.tool_call_id);
     alloc.free(result.tool_name);
     alloc.free(result.output);
+    freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.output_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     freePermissionFeedback(alloc, result.permission_feedback);
@@ -2332,7 +3173,8 @@ fn dupeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) !FileEvidence 
     };
 }
 
-fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
+/// Frees one entry's owned strings, not its containing slice.
+pub fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
     alloc.free(file.path);
     if (file.new_path) |new_path| alloc.free(new_path);
     alloc.free(file.tool_call_id);
@@ -2355,6 +3197,7 @@ pub fn dupeToolCall(alloc: std.mem.Allocator, call: ToolCall) !ToolCall {
         .name = name,
         .arguments_json = arguments_json,
         .argument_integrity = call.argument_integrity,
+        .argument_diagnostic = call.argument_diagnostic,
         .provisional_id = provisional_id,
         .provider_result = provider_result,
         .final_identity = call.final_identity,
@@ -2382,6 +3225,39 @@ test "dupeToolCall preserves argument integrity" {
     defer freeToolCall(std.testing.allocator, copy);
 
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
+}
+
+test "dupeToolCall drops action scoped skill bindings" {
+    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
+    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const copy = try dupeToolCall(std.testing.allocator, source);
+    defer freeToolCall(std.testing.allocator, copy);
+    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
+}
+
+test "function input classification distinguishes syntax from object shape" {
+    const cases = [_]struct { input: []const u8, expected: ToolArgumentIntegrity }{
+        .{ .input = "{}", .expected = .valid },
+        .{ .input = " \n{\"nested\":[1,null,{}]}\t", .expected = .valid },
+        .{ .input = "[]", .expected = .non_object_json },
+        .{ .input = "42", .expected = .non_object_json },
+        .{ .input = "null", .expected = .non_object_json },
+        .{ .input = "true", .expected = .non_object_json },
+        .{ .input = "\"text\"", .expected = .non_object_json },
+        .{ .input = "", .expected = .malformed_json },
+        .{ .input = "{} trailing", .expected = .malformed_json },
+        .{ .input = "{\"a\":1,\"a\":2}", .expected = .malformed_json },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
+        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
+        if (case.expected == .non_object_json) {
+            try std.testing.expectEqual(ToolArgumentIntegrity.valid, try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, case.input));
+        }
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ToolArgumentIntegrity.classifyFunctionInput(failing.allocator(), "{\"path\":\"file\"}"));
 }
 
 test "ToolArgumentIntegrity accepts complete serialized JSON roots" {
@@ -2423,6 +3299,78 @@ test "ToolArgumentIntegrity preserves parser allocation failure" {
         error.OutOfMemory,
         ToolArgumentIntegrity.classifySerialized(failing.allocator(), "{\"path\":\"src/main.zig\"}"),
     );
+}
+
+test "tool argument diagnostic locates truncated, syntax, and rejected input" {
+    const alloc = std.testing.allocator;
+    const cut = "{\"request\":{\"action\":\"run\",\"task\":\"Investigate the \\\"slow exit\\\" path and report";
+    try std.testing.expectEqual(
+        ToolArgumentDiagnostic{ .failure = .truncated, .input_bytes = cut.len, .error_offset = cut.len },
+        try ToolArgumentDiagnostic.diagnose(alloc, cut),
+    );
+
+    const unescaped = "{\"task\":\"say \"hi\" now\"}";
+    try std.testing.expectEqual(
+        ToolArgumentDiagnostic{ .failure = .syntax_error, .input_bytes = unescaped.len, .error_offset = std.mem.find(u8, unescaped, "hi").? },
+        try ToolArgumentDiagnostic.diagnose(alloc, unescaped),
+    );
+
+    const trailing = "{\"path\":\"a\",}";
+    try std.testing.expectEqual(
+        ToolArgumentDiagnostic{ .failure = .syntax_error, .input_bytes = trailing.len, .error_offset = trailing.len - 1 },
+        try ToolArgumentDiagnostic.diagnose(alloc, trailing),
+    );
+
+    const repeated = "{\"path\":\"a\",\"path\":\"b\"}";
+    try std.testing.expectEqual(
+        ToolArgumentDiagnostic{ .failure = .rejected_value, .input_bytes = repeated.len, .error_offset = null },
+        try ToolArgumentDiagnostic.diagnose(alloc, repeated),
+    );
+
+    try std.testing.expectEqual(
+        ToolArgumentDiagnostic{ .failure = .truncated, .input_bytes = 0, .error_offset = 0 },
+        try ToolArgumentDiagnostic.diagnose(alloc, ""),
+    );
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ToolArgumentDiagnostic.diagnose(failing.allocator(), "[" ** 4096));
+}
+
+test "dupeToolCall keeps the argument diagnostic" {
+    const diagnostic = try ToolArgumentDiagnostic.diagnose(std.testing.allocator, "{\"path\":");
+    const source: ToolCall = .{
+        .id = "bad",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+        .argument_diagnostic = diagnostic,
+    };
+    const copy = try dupeToolCall(std.testing.allocator, source);
+    defer freeToolCall(std.testing.allocator, copy);
+    try std.testing.expectEqual(diagnostic, copy.argument_diagnostic.?);
+}
+
+fn fuzzToolArgumentDiagnostic(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [1024]u8 = undefined;
+    const input_len: usize = @intCast(smith.slice(&input_buffer));
+    const input = input_buffer[0..input_len];
+    if (try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, input) != .malformed_json) return;
+    const diagnostic = try ToolArgumentDiagnostic.diagnose(std.testing.allocator, input);
+    try std.testing.expectEqual(input.len, diagnostic.input_bytes);
+    if (diagnostic.error_offset) |offset| try std.testing.expect(offset <= input.len);
+    try std.testing.expectEqual(diagnostic.failure == .rejected_value, diagnostic.error_offset == null);
+}
+
+test "fuzz tool argument diagnostic" {
+    try std.testing.fuzz({}, fuzzToolArgumentDiagnostic, .{
+        .corpus = &.{
+            "{\"request\":{\"task\":\"cut",
+            "{\"a\":1,}",
+            "{\"a\":1,\"a\":2}",
+            "{\"t\":\"\xc3\xa9\xe2\x82",
+            "\xff\x00{",
+        },
+    });
 }
 
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
@@ -2478,12 +3426,25 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
             try alloc.dupe(u8, value)
         else
             null;
+        errdefer if (snapshot_sha256) |value| alloc.free(value);
+
+        const inline_data = if (attachment.inline_data) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (inline_data) |value| alloc.free(value);
+        const source_ref = if (attachment.source_ref) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
         copy[i] = .{
             .id = attachment.id,
             .path = path,
             .media_type = media_type,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
+            .inline_data = inline_data,
+            .source_ref = source_ref,
         };
         copied += 1;
     }
@@ -2496,6 +3457,8 @@ pub fn freeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment
     alloc.free(attachment.media_type);
     if (attachment.snapshot_path) |path| alloc.free(path);
     if (attachment.snapshot_sha256) |sha256| alloc.free(sha256);
+    if (attachment.inline_data) |data| alloc.free(data);
+    if (attachment.source_ref) |source_ref| alloc.free(source_ref);
 }
 
 pub fn freeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []ImageAttachment) void {
@@ -2669,37 +3632,6 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     freeHistoryTurn(alloc, summary_copy);
     freeHistoryTurn(alloc, summary_original);
 
-    const background_original: HistoryTurn = .{ .background_command = .{
-        .user = .{ .text = try alloc.dupe(u8, "run dev") },
-        .assistant = try alloc.dupe(u8, "Starting the server."),
-        .execution = .{ .files = blk: {
-            const files = try alloc.alloc(FileEvidence, 1);
-            files[0] = .{
-                .path = try alloc.dupe(u8, "src/main.zig"),
-                .tool_call_id = try alloc.dupe(u8, "call_1"),
-                .tool_name = try alloc.dupe(u8, "read_file"),
-                .action = .read,
-                .status = .success,
-                .model_view_covers_full_file = true,
-            };
-            break :blk files;
-        } },
-        .log_path = try alloc.dupe(u8, "/tmp/fx.log"),
-        .expect_url = true,
-        .url = try alloc.dupe(u8, "http://localhost:3000"),
-    } };
-    const background_copy = try dupeHistoryTurn(alloc, background_original);
-    try std.testing.expectEqualStrings("run dev", background_copy.background_command.user.text);
-    try std.testing.expectEqualStrings("/tmp/fx.log", background_copy.background_command.log_path);
-    try std.testing.expectEqualStrings("http://localhost:3000", background_copy.background_command.url.?);
-    try std.testing.expectEqualStrings("Starting the server.", background_copy.background_command.assistant.?);
-    try std.testing.expectEqualStrings("src/main.zig", background_copy.background_command.execution.files[0].path);
-    try std.testing.expect(background_copy.background_command.log_path.ptr != background_original.background_command.log_path.ptr);
-    try std.testing.expect(background_copy.background_command.assistant.?.ptr != background_original.background_command.assistant.?.ptr);
-    try std.testing.expect(background_copy.background_command.execution.files[0].path.ptr != background_original.background_command.execution.files[0].path.ptr);
-    freeHistoryTurn(alloc, background_copy);
-    freeHistoryTurn(alloc, background_original);
-
     const interrupted_original: HistoryTurn = .{ .interrupted = .{
         .user = .{ .text = try alloc.dupe(u8, "stop") },
         .execution = .{ .files = blk: {
@@ -2753,12 +3685,34 @@ test "HistoryTurn helpers duplicate and free owned turns" {
         } },
         .terminal_projection = .assistant_text,
         .terminal_outcome = .completed,
+        .presentation_text = try alloc.dupe(u8, "Earlier reply.\nI stopped here."),
     };
     const finished_copy = try dupeFinishedPrompt(alloc, finished_original);
     try std.testing.expectEqual(FinishedPromptProjection.assistant_text, finished_copy.terminal_projection);
     try std.testing.expectEqual(@as(?TurnPresentationOutcome, .completed), finished_copy.terminal_outcome);
+    try std.testing.expectEqualStrings(finished_original.presentation_text.?, finished_copy.presentation_text.?);
+    try std.testing.expect(finished_original.presentation_text.?.ptr != finished_copy.presentation_text.?.ptr);
     freeFinishedPrompt(alloc, finished_copy);
     freeFinishedPrompt(alloc, finished_original);
+}
+
+test "finished prompt presentation allocation failures preserve ownership" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const original: FinishedPrompt = .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("request") },
+                    .assistant = @constCast("current"),
+                } },
+                .presentation_text = "earlier\ncurrent",
+            };
+            const copy = try dupeFinishedPrompt(alloc, original);
+            defer freeFinishedPrompt(alloc, copy);
+            try std.testing.expectEqualStrings("current", copy.turn.assistant.assistant);
+            try std.testing.expectEqualStrings("earlier\ncurrent", copy.presentation_text.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "TurnSummary carries shared turn token progress" {
@@ -2796,6 +3750,47 @@ test "ImageAttachment helpers duplicate empty and populated slices" {
 
     freeImageAttachmentSlice(alloc, copy);
     freeImageAttachmentSlice(alloc, originals);
+}
+
+test "ImageAttachment source references clone independently and clean up allocation failures" {
+    const originals = [_]ImageAttachment{
+        .{
+            .id = 1,
+            .path = @constCast("inline://image-1"),
+            .media_type = @constCast("image/png"),
+            .inline_data = @constCast("pixels"),
+            .snapshot_sha256 = @constCast("digest"),
+            .source_ref = @constCast("host:original"),
+        },
+        .{
+            .id = 2,
+            .path = @constCast("inline://image-2"),
+            .media_type = @constCast("image/jpeg"),
+            .source_ref = @constCast("host:large"),
+        },
+    };
+    const alloc = std.testing.allocator;
+    const source = try dupeImageAttachmentSlice(alloc, &originals);
+    defer freeImageAttachmentSlice(alloc, source);
+    const copy = try dupeImageAttachmentSlice(alloc, source);
+    defer freeImageAttachmentSlice(alloc, copy);
+    for (copy, source) |cloned, original| {
+        try std.testing.expect(cloned.source_ref.?.ptr != original.source_ref.?.ptr);
+        original.source_ref.?[0] = 'X';
+    }
+    source[0].inline_data.?[0] = 'X';
+    try std.testing.expectEqualStrings("host:original", copy[0].source_ref.?);
+    try std.testing.expectEqualStrings("host:large", copy[1].source_ref.?);
+    try std.testing.expectEqualStrings("pixels", copy[0].inline_data.?);
+    try std.testing.expect(copy[1].inline_data == null);
+    try std.testing.expect(copy[1].snapshot_path == null);
+    try std.testing.expect(copy[1].snapshot_sha256 == null);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: std.mem.Allocator, images: []const ImageAttachment) !void {
+            const cloned = try dupeImageAttachmentSlice(a, images);
+            defer freeImageAttachmentSlice(a, cloned);
+        }
+    }.check, .{&originals});
 }
 
 test "Permission helpers duplicate and free grants rules and rule sets" {

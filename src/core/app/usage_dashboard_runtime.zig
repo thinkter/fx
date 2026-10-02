@@ -75,6 +75,25 @@ pub const Runtime = struct {
         return .{ .alloc = alloc };
     }
 
+    /// Fieldwise initialization avoids retaining undefined cache payloads in
+    /// a static release-binary template.
+    pub fn initInto(storage: *Self, alloc: Allocator) void {
+        comptime {
+            if (std.meta.fields(Self).len != 8) {
+                @compileError("update Runtime.initInto for the changed field set");
+            }
+        }
+        storage.* = undefined;
+        storage.alloc = alloc;
+        storage.mutex = .init;
+        storage.thread = null;
+        storage.state = .idle;
+        storage.completion_pending = false;
+        storage.cache = null;
+        storage.last_error = null;
+        storage.cancel_requested = .init(false);
+    }
+
     pub fn deinit(self: *Self) void {
         self.cancel_requested.store(true, .seq_cst);
         if (self.thread) |thread| {
@@ -205,6 +224,19 @@ pub const Runtime = struct {
         self.mutex.unlock(io_mod.getIo());
     }
 };
+
+test "usage dashboard in-place initialization preserves idle state" {
+    var runtime: Runtime = undefined;
+    Runtime.initInto(&runtime, std.testing.allocator);
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.state == .idle);
+    try std.testing.expect(!runtime.completion_pending);
+    try std.testing.expect(runtime.cache == null);
+    try std.testing.expect(runtime.last_error == null);
+    try std.testing.expect(!runtime.cancel_requested.load(.seq_cst));
+}
 
 fn loadProfileSnapshots(
     context: *anyopaque,

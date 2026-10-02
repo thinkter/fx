@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-const max_darwin_process_fds: usize = std.c.OPEN_MAX;
 
 const DarwinPipeIdentity = struct {
     handle: u64,
@@ -19,6 +19,7 @@ const DarwinPipeIdentity = struct {
 pub const DarwinProcessWitness = struct {
     supervisor_fd: ?std.posix.fd_t,
     child_fd: ?std.posix.fd_t,
+    descendant_fd: std.posix.fd_t,
     identity: DarwinPipeIdentity,
 
     pub fn init() !DarwinProcessWitness {
@@ -35,6 +36,7 @@ pub const DarwinProcessWitness = struct {
         return .{
             .supervisor_fd = pipe[0],
             .child_fd = pipe[1],
+            .descendant_fd = darwin_process_spawn.inherited_fd_target(pipe[1]),
             .identity = try captureDarwinPipeIdentity(std.c.getpid(), pipe[1]),
         };
     }
@@ -84,11 +86,19 @@ const ProcessSnapshot = struct {
     parent_pid: std.posix.pid_t,
     parent_unique_id: ?u64 = null,
     started_at_us: ?u64 = null,
+    zombie: bool = false,
 };
 
 pub const DeliverySummary = struct {
     delivered: usize = 0,
     incomplete: bool = false,
+};
+
+/// Signal delivery after a command completed naturally. `kept_detached`
+/// counts the daemons the latest pass left running.
+pub const CompletionDelivery = struct {
+    delivery: DeliverySummary = .{},
+    kept_detached: usize = 0,
 };
 
 const ProcessGroupState = union(enum) {
@@ -97,6 +107,36 @@ const ProcessGroupState = union(enum) {
     unavailable,
 };
 
+const SessionState = union(enum) {
+    found: std.posix.pid_t,
+    vanished,
+    unavailable,
+};
+
+/// How natural completion treats one live tracked process.
+const CompletionStanding = enum {
+    /// Still in the command's session, so natural completion stops it.
+    attached,
+    /// Moved to its own session, the POSIX way a program becomes a daemon, so
+    /// natural completion leaves it running.
+    detached,
+    /// Exited or replaced, so nothing remains to stop.
+    gone,
+};
+
+/// A process whose session cannot be read stays attached, preserving
+/// containment when evidence is missing.
+fn completionStanding(
+    command_session: std.posix.pid_t,
+    session: SessionState,
+) CompletionStanding {
+    return switch (session) {
+        .found => |value| if (value == command_session) .attached else .detached,
+        .vanished => .gone,
+        .unavailable => .attached,
+    };
+}
+
 const SystemSignalEffects = struct {
     fn capture(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
         return captureSnapshot(alloc, pid);
@@ -104,6 +144,10 @@ const SystemSignalEffects = struct {
 
     fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
         return inspectProcessGroup(pid);
+    }
+
+    fn session(pid: std.posix.pid_t) SessionState {
+        return inspectSession(pid);
     }
 
     fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
@@ -120,8 +164,8 @@ pub const Tracker = struct {
     processes: std.ArrayList(TrackedProcess) = .empty,
     macos_child_buffer: []std.posix.pid_t = &.{},
     macos_pid_buffer: []std.posix.pid_t = &.{},
-    macos_fd_buffer: []Darwin.ProcFdInfo = &.{},
     darwin_process_witness: ?DarwinPipeIdentity = null,
+    darwin_process_witness_fd: ?std.posix.fd_t = null,
     macos_root_started_at_us: ?u64 = null,
 
     pub fn init(alloc: Allocator) !Tracker {
@@ -158,7 +202,6 @@ pub const Tracker = struct {
         if (self.macos_pid_buffer.len > 0) {
             self.alloc.free(self.macos_pid_buffer);
         }
-        if (self.macos_fd_buffer.len > 0) self.alloc.free(self.macos_fd_buffer);
         self.* = undefined;
     }
 
@@ -168,6 +211,7 @@ pub const Tracker = struct {
     ) void {
         if (comptime builtin.os.tag != .macos) return;
         self.darwin_process_witness = witness.identity;
+        self.darwin_process_witness_fd = witness.descendant_fd;
     }
 
     pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) !void {
@@ -322,6 +366,7 @@ pub const Tracker = struct {
             return;
         };
         if (!process.identity.eql(actual.identity)) return;
+        if (actual.zombie) return;
         const process_group = switch (Effects.processGroup(process.pid)) {
             .found => |value| value,
             .vanished => return,
@@ -345,14 +390,109 @@ pub const Tracker = struct {
         if (self.root) |root| {
             const actual: ?ProcessSnapshot = captureSnapshot(self.alloc, root.pid) catch null;
             if (actual) |snapshot| {
-                if (root.identity.eql(snapshot.identity)) return true;
+                if (root.identity.eql(snapshot.identity) and snapshotIsAlive(snapshot)) return true;
             }
         }
         for (self.processes.items) |process| {
             const actual = captureSnapshot(self.alloc, process.pid) catch continue;
-            if (process.identity.eql(actual.identity)) return true;
+            if (process.identity.eql(actual.identity) and snapshotIsAlive(actual)) return true;
         }
         return false;
+    }
+
+    /// Signals the tracked processes still in `command_session` and leaves
+    /// processes that moved to their own session running.
+    pub fn signalAttached(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        command_session: std.posix.pid_t,
+    ) CompletionDelivery {
+        return self.signalAttachedWith(signal, command_session, SystemSignalEffects);
+    }
+
+    /// Reports whether any tracked process still in `command_session` is alive.
+    pub fn anyAttachedAlive(
+        self: *Tracker,
+        command_session: std.posix.pid_t,
+    ) bool {
+        return self.anyAttachedAliveWith(command_session, SystemSignalEffects);
+    }
+
+    fn signalAttachedWith(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        command_session: std.posix.pid_t,
+        comptime Effects: type,
+    ) CompletionDelivery {
+        var result: CompletionDelivery = .{};
+        var index = self.processes.items.len;
+        while (index > 0) {
+            index -= 1;
+            self.signalIfAttachedWith(
+                self.processes.items[index],
+                signal,
+                command_session,
+                &result,
+                Effects,
+            );
+        }
+        if (self.root) |root| {
+            self.signalIfAttachedWith(root, signal, command_session, &result, Effects);
+        }
+        return result;
+    }
+
+    fn signalIfAttachedWith(
+        self: *Tracker,
+        process: TrackedProcess,
+        signal: std.posix.SIG,
+        command_session: std.posix.pid_t,
+        result: *CompletionDelivery,
+        comptime Effects: type,
+    ) void {
+        switch (self.completionStandingWith(process, command_session, Effects)) {
+            .attached => self.signalTrackedProcessWith(
+                process,
+                signal,
+                null,
+                &result.delivery,
+                Effects,
+            ),
+            .detached => result.kept_detached += 1,
+            .gone => {},
+        }
+    }
+
+    fn anyAttachedAliveWith(
+        self: *Tracker,
+        command_session: std.posix.pid_t,
+        comptime Effects: type,
+    ) bool {
+        if (self.root) |root| {
+            if (self.completionStandingWith(root, command_session, Effects) == .attached) return true;
+        }
+        for (self.processes.items) |process| {
+            if (self.completionStandingWith(process, command_session, Effects) == .attached) return true;
+        }
+        return false;
+    }
+
+    fn completionStandingWith(
+        self: *Tracker,
+        process: TrackedProcess,
+        command_session: std.posix.pid_t,
+        comptime Effects: type,
+    ) CompletionStanding {
+        const actual = Effects.capture(self.alloc, process.pid) catch |err| switch (err) {
+            error.ProcessNotFound => return .gone,
+            // An unreadable process stays attached, so cleanup still tries
+            // to stop it and reports the failed attempt.
+            else => return .attached,
+        };
+        if (!process.identity.eql(actual.identity) or !snapshotIsAlive(actual)) {
+            return .gone;
+        }
+        return completionStanding(command_session, Effects.session(process.pid));
     }
 
     fn appendDirectChildren(
@@ -503,30 +643,9 @@ pub const Tracker = struct {
     fn processHasBoundWitness(self: *Tracker, pid: std.posix.pid_t) !bool {
         if (comptime builtin.os.tag != .macos) return false;
         const expected = self.darwin_process_witness orelse return false;
-        if (self.macos_fd_buffer.len == 0) {
-            self.macos_fd_buffer = try self.alloc.alloc(
-                Darwin.ProcFdInfo,
-                max_darwin_process_fds,
-            );
-        }
-        const read_len = Darwin.proc_pidinfo(
-            pid,
-            Darwin.proc_pid_list_fds,
-            0,
-            self.macos_fd_buffer.ptr,
-            @intCast(self.macos_fd_buffer.len * @sizeOf(Darwin.ProcFdInfo)),
-        );
-        if (read_len <= 0) return false;
-        const fd_count = @min(
-            @as(usize, @intCast(read_len)) / @sizeOf(Darwin.ProcFdInfo),
-            self.macos_fd_buffer.len,
-        );
-        for (self.macos_fd_buffer[0..fd_count]) |fd| {
-            if (fd.proc_fd < 0 or fd.proc_fdtype != Darwin.prox_fd_type_pipe) continue;
-            const actual = captureDarwinPipeIdentity(pid, fd.proc_fd) catch continue;
-            if (expected.eql(actual)) return true;
-        }
-        return false;
+        const fd = self.darwin_process_witness_fd orelse return false;
+        const actual = captureDarwinPipeIdentity(pid, fd) catch return false;
+        return expected.eql(actual);
     }
 
     fn containsMacOSUniqueId(self: *Tracker, unique_id: u64) bool {
@@ -635,6 +754,20 @@ fn inspectProcessGroup(pid: std.posix.pid_t) ProcessGroupState {
 }
 
 extern "c" fn getpgid(pid: std.posix.pid_t) std.posix.pid_t;
+
+fn inspectSession(pid: std.posix.pid_t) SessionState {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .unavailable;
+    }
+    const session = getsid(pid);
+    if (session >= 0) return .{ .found = session };
+    return switch (std.c.errno(session)) {
+        .SRCH => .vanished,
+        else => .unavailable,
+    };
+}
+
+extern "c" fn getsid(pid: std.posix.pid_t) std.posix.pid_t;
 
 fn readLinuxChildrenFile(file: std.Io.File, buffer: []u8) !usize {
     if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
@@ -831,6 +964,170 @@ test "checked signal delivery keeps vanished stale and excluded targets complete
     try std.testing.expect(!summary.incomplete);
 }
 
+test "natural completion detaches only processes that left the command session" {
+    const command_session: std.posix.pid_t = 500;
+    try std.testing.expectEqual(
+        CompletionStanding.attached,
+        completionStanding(command_session, .{ .found = command_session }),
+    );
+    try std.testing.expectEqual(
+        CompletionStanding.detached,
+        completionStanding(command_session, .{ .found = 700 }),
+    );
+    try std.testing.expectEqual(
+        CompletionStanding.attached,
+        completionStanding(command_session, .unavailable),
+    );
+    try std.testing.expectEqual(
+        CompletionStanding.gone,
+        completionStanding(command_session, .vanished),
+    );
+}
+
+test "natural completion stops attached processes and keeps detached daemons" {
+    const FakeEffects = struct {
+        var sent: [16]std.posix.pid_t = undefined;
+        var sent_count: usize = 0;
+
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return switch (pid) {
+                35 => .{ .identity = .{ .linux_start_ticks = 999 }, .parent_pid = 1 },
+                36 => .{
+                    .identity = .{ .linux_start_ticks = 36 },
+                    .parent_pid = 1,
+                    .zombie = true,
+                },
+                else => .{
+                    .identity = .{ .linux_start_ticks = @intCast(pid) },
+                    .parent_pid = 1,
+                },
+            };
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return .{ .found = pid };
+        }
+
+        fn session(pid: std.posix.pid_t) SessionState {
+            return switch (pid) {
+                30, 32 => .{ .found = 500 },
+                34 => .vanished,
+                37 => .unavailable,
+                else => .{ .found = pid },
+            };
+        }
+
+        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            sent[sent_count] = pid;
+            sent_count += 1;
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    for (30..38) |pid| {
+        try tracker.processes.append(std.testing.allocator, .{
+            .pid = @intCast(pid),
+            .identity = .{ .linux_start_ticks = pid },
+        });
+    }
+
+    FakeEffects.sent_count = 0;
+    const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
+    try std.testing.expectEqualSlices(
+        std.posix.pid_t,
+        &.{ 37, 32, 30 },
+        FakeEffects.sent[0..FakeEffects.sent_count],
+    );
+    try std.testing.expectEqual(@as(usize, 3), completed.delivery.delivered);
+    try std.testing.expectEqual(@as(usize, 2), completed.kept_detached);
+    try std.testing.expect(tracker.anyAttachedAliveWith(500, FakeEffects));
+
+    var daemons_only = Tracker{ .alloc = std.testing.allocator };
+    defer daemons_only.deinit();
+    for ([_]std.posix.pid_t{ 31, 33 }) |pid| {
+        try daemons_only.processes.append(std.testing.allocator, .{
+            .pid = pid,
+            .identity = .{ .linux_start_ticks = @intCast(pid) },
+        });
+    }
+    try std.testing.expect(!daemons_only.anyAttachedAliveWith(500, FakeEffects));
+}
+
+test "natural completion keeps an unreadable process attached and reports it" {
+    const FakeEffects = struct {
+        var sent_count: usize = 0;
+
+        fn capture(
+            _: Allocator,
+            _: std.posix.pid_t,
+        ) error{ ProcessNotFound, ProcessIdentityUnavailable }!ProcessSnapshot {
+            return error.ProcessIdentityUnavailable;
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return .{ .found = pid };
+        }
+
+        fn session(pid: std.posix.pid_t) SessionState {
+            return .{ .found = pid };
+        }
+
+        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            sent_count += 1;
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    try tracker.processes.append(std.testing.allocator, .{
+        .pid = 40,
+        .identity = .{ .linux_start_ticks = 40 },
+    });
+
+    FakeEffects.sent_count = 0;
+    const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
+    // Without a snapshot the process cannot be signaled safely, but it is
+    // neither kept as a daemon nor treated as gone.
+    try std.testing.expectEqual(@as(usize, 0), FakeEffects.sent_count);
+    try std.testing.expectEqual(@as(usize, 0), completed.delivery.delivered);
+    try std.testing.expectEqual(@as(usize, 0), completed.kept_detached);
+    try std.testing.expect(completed.delivery.incomplete);
+    try std.testing.expect(tracker.anyAttachedAliveWith(500, FakeEffects));
+}
+
+test "session inspection separates the caller's session from a new one" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const own_session = switch (inspectSession(0)) {
+        .found => |session| session,
+        .vanished, .unavailable => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(
+        SessionState{ .found = own_session },
+        inspectSession(std.c.getpid()),
+    );
+
+    var detached = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "-c", "import os,sys,time; os.setsid(); sys.stdout.write('R'); sys.stdout.flush(); time.sleep(5)" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer detached.kill(io);
+    var ready: [1]u8 = undefined;
+    const ready_len = try detached.stdout.?.readStreaming(io, &.{&ready});
+    try std.testing.expectEqual(@as(usize, 1), ready_len);
+
+    const pid = detached.id.?;
+    try std.testing.expectEqual(SessionState{ .found = pid }, inspectSession(pid));
+    try std.testing.expectEqual(
+        CompletionStanding.detached,
+        completionStanding(own_session, inspectSession(pid)),
+    );
+}
+
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     return switch (builtin.os.tag) {
         .linux => try captureLinuxSnapshot(alloc, pid),
@@ -853,7 +1150,9 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
     var fields = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
     var field_number: usize = 3;
     var parent_pid: ?std.posix.pid_t = null;
+    var zombie = false;
     while (fields.next()) |field| : (field_number += 1) {
+        if (field_number == 3) zombie = field.len == 1 and field[0] == 'Z';
         if (field_number == 4) {
             parent_pid = std.fmt.parseInt(std.posix.pid_t, field, 10) catch
                 return error.ProcessIdentityUnavailable;
@@ -865,6 +1164,7 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
                 .identity = .{ .linux_start_ticks = start_ticks },
                 .parent_pid = parent_pid orelse
                     return error.ProcessIdentityUnavailable,
+                .zombie = zombie,
             };
         }
     }
@@ -922,21 +1222,28 @@ fn captureMacOSSnapshot(pid: std.posix.pid_t) !ProcessSnapshot {
             info.pbi_start_tvsec,
             info.pbi_start_tvusec,
         ),
+        .zombie = info.pbi_status == Darwin.process_status_zombie,
     };
+}
+
+pub fn processIsAlive(alloc: Allocator, pid: std.posix.pid_t) !bool {
+    const snapshot = captureSnapshot(alloc, pid) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return err,
+    };
+    return snapshotIsAlive(snapshot);
+}
+
+fn snapshotIsAlive(snapshot: ProcessSnapshot) bool {
+    return !snapshot.zombie;
 }
 
 const Darwin = struct {
     // Stable libproc process-identity flavor; the SDK omits this constant from
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
-    const proc_pid_list_fds: c_int = 1;
     const proc_pid_fd_pipe_info: c_int = 6;
-    const prox_fd_type_pipe: u32 = 6;
-
-    const ProcFdInfo = extern struct {
-        proc_fd: i32,
-        proc_fdtype: u32,
-    };
+    const process_status_zombie: u32 = 5;
 
     const ProcFileInfo = extern struct {
         fi_openflags: u32,
@@ -1051,6 +1358,17 @@ test "tracked identity distinguishes process instances" {
     try std.testing.expect(linux.eql(.{ .linux_start_ticks = 42 }));
     try std.testing.expect(!linux.eql(.{ .linux_start_ticks = 43 }));
     try std.testing.expect(!linux.eql(.{ .macos_unique_id = 42 }));
+}
+
+test "zombie snapshots are terminal process state" {
+    const live = ProcessSnapshot{
+        .identity = .{ .linux_start_ticks = 1 },
+        .parent_pid = 1,
+    };
+    var zombie = live;
+    zombie.zombie = true;
+    try std.testing.expect(snapshotIsAlive(live));
+    try std.testing.expect(!snapshotIsAlive(zombie));
 }
 
 test "Darwin witness scan excludes processes older than command root" {

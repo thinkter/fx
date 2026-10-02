@@ -1,8 +1,11 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const image_data = @import("../images/image_data.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const session = @import("session.zig");
+const session_codec = @import("session_codec.zig");
 
 const Allocator = std.mem.Allocator;
 const legacy_schema_v1: i64 = 1;
@@ -89,34 +92,9 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeUserTurnJson(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
             try std.json.Stringify.value(entry.assistant, .{}, writer);
-            if (entry.execution.tool_steps.len > 0 or entry.execution.files.len > 0) {
-                try writer.writeAll(",\"execution\":");
-                try writeExecutionMemoryJson(writer, entry.execution);
-            }
-            try writer.writeByte('}');
-        },
-        .background_command => |entry| {
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeUserTurnJson(writer, entry.user);
-            if (entry.assistant) |assistant| {
-                try writer.writeAll(",\"assistant\":");
-                try std.json.Stringify.value(assistant, .{}, writer);
-            }
             if (!entry.execution.isEmpty()) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemoryJson(writer, entry.execution);
-            }
-            try writer.writeAll(",\"log_path\":");
-            try std.json.Stringify.value(entry.log_path, .{}, writer);
-            try writer.print(",\"expect_url\":{s},\"url\":", .{if (entry.expect_url) "true" else "false"});
-            if (entry.url) |url| {
-                try std.json.Stringify.value(url, .{}, writer);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (entry.background_record_id) |record_id| {
-                try writer.writeAll(",\"background_record_id\":");
-                try writeHexString(writer, &record_id);
             }
             try writer.writeByte('}');
         },
@@ -139,6 +117,9 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeStringArrayJson(writer, entry.completed_tool_names);
             try writer.writeAll(",\"terminal_reason\":");
             try std.json.Stringify.value(@tagName(entry.terminal_reason), .{}, writer);
+            if (entry.cancellation_origin == .compaction) {
+                try writer.writeAll(",\"cancellation_origin\":\"compaction\"");
+            }
             if (!entry.execution.isEmpty()) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemoryJson(writer, entry.execution);
@@ -165,150 +146,7 @@ fn writeToolCallJson(writer: *std.Io.Writer, tool_call: session.ToolCall) !void 
 }
 
 pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":2,\"tool_steps\":[");
-    for (execution.tool_steps, 0..) |step, i| {
-        if (i > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"assistant\":");
-        if (step.assistant) |assistant| {
-            try std.json.Stringify.value(assistant, .{}, writer);
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.writeAll(",\"tool_calls\":[");
-        for (step.tool_calls, 0..) |tool_call, call_index| {
-            if (call_index > 0) try writer.writeByte(',');
-            try writeToolCallJson(writer, tool_call);
-        }
-        try writer.writeAll("],\"tool_results\":[");
-        for (step.tool_results, 0..) |result, result_index| {
-            if (result_index > 0) try writer.writeByte(',');
-            try writePersistedToolResultJson(writer, result);
-        }
-        try writer.writeAll("]}");
-    }
-    try writer.writeAll("],\"files\":[");
-    for (execution.files, 0..) |file, i| {
-        if (i > 0) try writer.writeByte(',');
-        try writeFileEvidenceJson(writer, file);
-    }
-    try writer.writeAll("]}");
-}
-
-fn writePersistedToolResultJson(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
-    try writer.writeAll("{\"tool_call_id\":");
-    try std.json.Stringify.value(result.tool_call_id, .{}, writer);
-    try writer.writeAll(",\"tool_name\":");
-    try std.json.Stringify.value(result.tool_name, .{}, writer);
-    try writer.writeAll(",\"status\":");
-    try std.json.Stringify.value(@tagName(result.status), .{}, writer);
-    try writer.writeAll(",\"output\":");
-    try std.json.Stringify.value(result.output, .{}, writer);
-    if (result.output_handle) |handle| {
-        try writer.writeAll(",\"output_handle\":");
-        try std.json.Stringify.value(handle, .{}, writer);
-    }
-    if (result.preview) |preview| {
-        try writer.writeAll(",\"preview\":");
-        try std.json.Stringify.value(preview, .{}, writer);
-    }
-    try writer.print(",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s},\"created_at_ms\":{d}", .{
-        result.output_bytes,
-        result.stored_output_bytes,
-        if (result.truncated) "true" else "false",
-        if (result.provider_native) "true" else "false",
-        result.created_at_ms,
-    });
-    try writer.writeAll(",\"permission_feedback\":[");
-    for (result.permission_feedback, 0..) |feedback, i| {
-        if (i > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(feedback, .{}, writer);
-    }
-    try writer.writeByte(']');
-    if (result.committed_file_presentation) |presentation| {
-        try writer.writeAll(",\"committed_file_presentation\":");
-        try writeCommittedFilePresentationJson(writer, presentation);
-    }
-    try writer.writeByte('}');
-}
-
-fn writeCommittedFilePresentationJson(
-    writer: *std.Io.Writer,
-    presentation: types.CommittedFilePresentation,
-) !void {
-    try writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(presentation.path, .{}, writer);
-    try writer.writeAll(",\"kind\":");
-    try std.json.Stringify.value(@tagName(presentation.kind), .{}, writer);
-    try writer.writeAll(",\"lines\":[");
-    for (presentation.lines, 0..) |line, index| {
-        if (index > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"kind\":");
-        try std.json.Stringify.value(@tagName(line.kind), .{}, writer);
-        try writer.writeAll(",\"old_line\":");
-        try writeOptionalU32Json(writer, line.old_line);
-        try writer.writeAll(",\"new_line\":");
-        try writeOptionalU32Json(writer, line.new_line);
-        try writer.writeAll(",\"text\":");
-        try std.json.Stringify.value(line.text, .{}, writer);
-        try writer.writeByte('}');
-    }
-    try writer.print("],\"additions\":{d},\"deletions\":{d},\"truncated\":{s},\"previous_content\":", .{
-        presentation.additions,
-        presentation.deletions,
-        if (presentation.truncated) "true" else "false",
-    });
-    try writeOptionalStringJson(writer, presentation.previous_content);
-    try writer.writeAll(",\"after_content\":");
-    try writeOptionalStringJson(writer, presentation.after_content);
-    try writer.writeAll(",\"lifecycle_id\":");
-    if (presentation.lifecycle_id) |id| {
-        try writer.print("{{\"turn_id\":{d},\"call_id\":", .{id.turn_id});
-        try std.json.Stringify.value(id.call_id, .{}, writer);
-        try writer.writeByte('}');
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeByte('}');
-}
-
-fn writeOptionalU32Json(writer: *std.Io.Writer, value: ?u32) !void {
-    if (value) |number| {
-        try writer.print("{d}", .{number});
-    } else {
-        try writer.writeAll("null");
-    }
-}
-
-fn writeOptionalStringJson(writer: *std.Io.Writer, value: ?[]const u8) !void {
-    if (value) |text| {
-        try std.json.Stringify.value(text, .{}, writer);
-    } else {
-        try writer.writeAll("null");
-    }
-}
-
-fn writeFileEvidenceJson(writer: *std.Io.Writer, file: session.FileEvidence) !void {
-    try writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(file.path, .{}, writer);
-    try writer.writeAll(",\"new_path\":");
-    if (file.new_path) |new_path| {
-        try std.json.Stringify.value(new_path, .{}, writer);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"tool_call_id\":");
-    try std.json.Stringify.value(file.tool_call_id, .{}, writer);
-    try writer.writeAll(",\"tool_name\":");
-    try std.json.Stringify.value(file.tool_name, .{}, writer);
-    try writer.writeAll(",\"action\":");
-    try std.json.Stringify.value(@tagName(file.action), .{}, writer);
-    try writer.writeAll(",\"status\":");
-    try std.json.Stringify.value(@tagName(file.status), .{}, writer);
-    try writer.print(",\"model_view_covers_full_file\":{s},\"stale\":{s}", .{
-        if (file.model_view_covers_full_file) "true" else "false",
-        if (file.stale) "true" else "false",
-    });
-    try writer.writeByte('}');
+    try session_codec.writeExecutionMemoryJson(writer, execution, .presentation);
 }
 
 fn writeUserTurnJson(writer: *std.Io.Writer, user: session.UserTurn) !void {
@@ -325,6 +163,11 @@ fn writeUserTurnJson(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try writeImageSnapshotLocatorJson(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
         try std.json.Stringify.value(image.snapshot_sha256, .{}, writer);
+        if (image.source_ref) |source_ref| {
+            if (!image_data.validSourceRef(source_ref)) return error.InvalidSessionFormat;
+            try writer.writeAll(",\"source_ref\":");
+            try std.json.Stringify.value(source_ref, .{}, writer);
+        }
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
@@ -408,9 +251,9 @@ fn parseLegacySummaryStreamingImpl(
 
     var schema_version: ?i64 = null;
     var id: ?[]u8 = null;
-    errdefer if (id) |owned| alloc.free(owned);
+    errdefer if (id) |owned| mem_utils.free(alloc, owned);
     var workspace_root: ?[]u8 = null;
-    errdefer if (workspace_root) |owned| alloc.free(owned);
+    errdefer if (workspace_root) |owned| mem_utils.free(alloc, owned);
     var workspace_root_seen = false;
     var created_at_ms: ?i64 = null;
     var updated_at_ms: ?i64 = null;
@@ -542,7 +385,7 @@ pub fn parseLegacyExact(
         try alloc.alloc(session.HistoryTurn, history_value.array.items.len)
     else
         &.{};
-    errdefer if (history.len > 0) alloc.free(history);
+    errdefer if (history.len > 0) mem_utils.free(alloc, history);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -556,9 +399,9 @@ pub fn parseLegacyExact(
 
     if (try requireUsize(root, "history_len") != history.len) return error.InvalidSessionFormat;
     const id = try alloc.dupe(u8, try requireString(root, "id"));
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const workspace_root = try optionalStringDup(alloc, root.get("workspace_root"));
-    errdefer if (workspace_root) |wr| alloc.free(wr);
+    errdefer if (workspace_root) |wr| mem_utils.free(alloc, wr);
     const language = try parseConversationLanguage(try requireString(root, "conversation_language"));
 
     const total_input_tokens: u64 = if (root.get("total_input_tokens")) |v| blk: {
@@ -602,6 +445,29 @@ pub fn parseLegacySchemaVersion(
     return legacySchemaVersion(try requireI64(root, "schema_version"));
 }
 
+fn formatLegacyBackgroundAssistant(
+    alloc: Allocator,
+    assistant: ?[]const u8,
+    log_path: []const u8,
+    url: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (assistant) |text| {
+        if (text.len != 0) {
+            try out.writer.writeAll(text);
+            if (!std.mem.endsWith(u8, text, "\n")) try out.writer.writeByte('\n');
+        }
+    }
+    try out.writer.writeAll(
+        "[Historical command record: fx no longer owns or controls this process",
+    );
+    if (log_path.len != 0) try out.writer.print("; former log={s}", .{log_path});
+    if (url) |value| try out.writer.print("; recorded url={s}", .{value});
+    try out.writer.writeByte(']');
+    return out.toOwnedSlice();
+}
+
 fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
     const object = try requireObject(value);
     const kind = try requireString(object, "kind");
@@ -610,9 +476,9 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
         const root_user_messages: [][]u8 = if (object.get("root_user_messages")) |messages_value| blk: {
             if (messages_value != .array) return error.InvalidSessionFormat;
             const messages = try alloc.alloc([]u8, messages_value.array.items.len);
-            errdefer alloc.free(messages);
+            errdefer mem_utils.free(alloc, messages);
             var copied: usize = 0;
-            errdefer for (messages[0..copied]) |message| alloc.free(message);
+            errdefer for (messages[0..copied]) |message| mem_utils.free(alloc, message);
             for (messages_value.array.items, 0..) |item, index| {
                 if (item != .string) return error.InvalidSessionFormat;
                 messages[index] = try alloc.dupe(u8, item.string);
@@ -647,7 +513,7 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try alloc.dupe(u8, try requireString(object, "assistant"));
-        errdefer alloc.free(assistant);
+        errdefer mem_utils.free(alloc, assistant);
         const execution = try parseOptionalExecutionMemory(alloc, object.get("execution"));
         errdefer session.freeExecutionMemory(alloc, execution);
         return .{ .assistant = .{
@@ -659,36 +525,45 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
     if (std.mem.eql(u8, kind, "background_command")) {
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
-        const assistant = try optionalStringDup(alloc, object.get("assistant"));
-        errdefer if (assistant) |text| alloc.free(text);
+        const legacy_assistant = try optionalStringDup(alloc, object.get("assistant"));
+        defer if (legacy_assistant) |text| alloc.free(text);
         const execution = try parseOptionalExecutionMemory(alloc, object.get("execution"));
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try alloc.dupe(u8, try requireString(object, "log_path"));
-        errdefer alloc.free(log_path);
+        defer alloc.free(log_path);
         const url = try optionalStringDup(alloc, object.get("url"));
-        errdefer if (url) |value_copy| alloc.free(value_copy);
-        return .{ .background_command = .{
+        defer if (url) |value_copy| alloc.free(value_copy);
+        _ = try requireBool(object, "expect_url");
+        _ = try parseOptionalBackgroundRecordId(
+            object.get("background_record_id"),
+        );
+        const assistant = try formatLegacyBackgroundAssistant(
+            alloc,
+            legacy_assistant,
+            log_path,
+            url,
+        );
+        return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
-            .log_path = log_path,
-            .expect_url = try requireBool(object, "expect_url"),
-            .url = url,
-            .background_record_id = try parseOptionalBackgroundRecordId(
-                object.get("background_record_id"),
-            ),
         } };
     }
     if (std.mem.eql(u8, kind, "interrupted")) {
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try optionalStringDup(alloc, object.get("assistant"));
-        errdefer if (assistant) |text| alloc.free(text);
+        errdefer if (assistant) |text| mem_utils.free(alloc, text);
         const tool_call = try parseOptionalToolCall(alloc, object.get("tool_call"));
         errdefer if (tool_call) |call| session.freeToolCall(alloc, call);
         const completed_tool_names = try parseOptionalStringArray(alloc, object.get("completed_tool_names"));
         errdefer session.freeCompletedToolNames(alloc, completed_tool_names);
         const terminal_reason = try parseLegacyInterruptedTerminalReason(object.get("terminal_reason"));
+        const cancellation_origin: types.CancellationOrigin = if (object.get("cancellation_origin")) |origin| blk: {
+            if (origin != .string) return error.InvalidSessionFormat;
+            break :blk std.meta.stringToEnum(types.CancellationOrigin, origin.string) orelse
+                return error.InvalidSessionFormat;
+        } else .turn;
         const execution = try parseOptionalExecutionMemory(alloc, object.get("execution"));
         return .{ .interrupted = .{
             .user = user,
@@ -697,6 +572,7 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
             .completed_tool_names = completed_tool_names,
             .execution = execution,
             .terminal_reason = terminal_reason,
+            .cancellation_origin = cancellation_origin,
         } };
     }
 
@@ -720,8 +596,9 @@ fn parseOptionalToolCall(alloc: Allocator, maybe_value: ?std.json.Value) !?sessi
         .object => try parseToolCall(alloc, value),
         else => return error.InvalidSessionFormat,
     };
+    errdefer if (call) |owned| session.freeToolCall(alloc, owned);
     if (call) |*parsed| {
-        session.repairPersistedInterruptedToolArguments(parsed, .legacy);
+        try session.repairPersistedInterruptedToolArguments(alloc, parsed, .legacy);
     }
     return call;
 }
@@ -729,15 +606,15 @@ fn parseOptionalToolCall(alloc: Allocator, maybe_value: ?std.json.Value) !?sessi
 fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     const object = try requireObject(value);
     const id = try alloc.dupe(u8, try requireString(object, "id"));
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const name = try alloc.dupe(u8, try requireString(object, "name"));
-    errdefer alloc.free(name);
+    errdefer mem_utils.free(alloc, name);
     const raw_arguments_json = try requireString(object, "arguments_json");
-    const argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, raw_arguments_json);
-    const arguments_json = try alloc.dupe(u8, if (argument_integrity == .valid) raw_arguments_json else "{}");
-    errdefer alloc.free(arguments_json);
+    const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, raw_arguments_json);
+    const arguments_json = try alloc.dupe(u8, if (argument_integrity == .malformed_json) "{}" else raw_arguments_json);
+    errdefer mem_utils.free(alloc, arguments_json);
     const provider_result = try optionalStringDup(alloc, object.get("provider_result"));
-    errdefer if (provider_result) |result| alloc.free(result);
+    errdefer if (provider_result) |result| mem_utils.free(alloc, result);
     return .{
         .id = id,
         .name = name,
@@ -752,7 +629,7 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
     if (value == .null) return .{};
     const object = try requireObject(value);
     const schema_version: i64 = if (object.get("schema_version")) |version| blk: {
-        if (version != .integer or (version.integer != 1 and version.integer != 2)) {
+        if (version != .integer or version.integer < 1 or version.integer > 3) {
             return error.InvalidSessionFormat;
         }
         break :blk version.integer;
@@ -763,8 +640,67 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
         schema_version,
     );
     errdefer session.freeExecutionMemory(alloc, .{ .tool_steps = tool_steps });
+    const steering = try parseOptionalSteering(
+        alloc,
+        object.get("steering"),
+        schema_version,
+        tool_steps.len,
+    );
+    errdefer types.freePersistedSteering(alloc, steering);
     const files = try parseFileEvidenceSlice(alloc, object.get("files"));
-    return .{ .tool_steps = tool_steps, .files = files };
+    return .{ .tool_steps = tool_steps, .files = files, .steering = steering };
+}
+
+fn parseOptionalSteering(
+    alloc: Allocator,
+    maybe_value: ?std.json.Value,
+    schema_version: i64,
+    tool_step_count: usize,
+) ![]types.PersistedSteering {
+    const value = maybe_value orelse return &.{};
+    if (value != .array) return error.InvalidSessionFormat;
+    if (value.array.items.len == 0) return &.{};
+    const steering = try alloc.alloc(types.PersistedSteering, value.array.items.len);
+    errdefer mem_utils.free(alloc, steering);
+    var parsed_count: usize = 0;
+    errdefer for (steering[0..parsed_count]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    var prior_tool_step_count: usize = 0;
+    for (value.array.items, 0..) |item, index| {
+        const parsed = if (schema_version <= 2)
+            types.PersistedSteering{
+                .text = try alloc.dupe(u8, if (item == .string) item.string else return error.InvalidSessionFormat),
+                .after_tool_step_count = tool_step_count,
+            }
+        else blk: {
+            const object = try requireObject(item);
+            const after_tool_step_count = try requireUsize(object, "after_tool_step_count");
+            if (after_tool_step_count > tool_step_count or
+                (index > 0 and after_tool_step_count < prior_tool_step_count))
+            {
+                return error.InvalidSessionFormat;
+            }
+            const text = try alloc.dupe(u8, try requireString(object, "text"));
+            const assistant_prefix = optionalStringDup(
+                alloc,
+                object.get("assistant_prefix"),
+            ) catch |err| {
+                alloc.free(text);
+                return err;
+            };
+            break :blk types.PersistedSteering{
+                .text = text,
+                .assistant_prefix = assistant_prefix,
+                .after_tool_step_count = after_tool_step_count,
+            };
+        };
+        steering[index] = parsed;
+        parsed_count += 1;
+        prior_tool_step_count = parsed.after_tool_step_count;
+    }
+    return steering;
 }
 
 fn parseToolExecutionSteps(
@@ -777,7 +713,7 @@ fn parseToolExecutionSteps(
     if (value.array.items.len == 0) return &.{};
 
     const steps = try alloc.alloc(session.ToolExecutionStep, value.array.items.len);
-    errdefer alloc.free(steps);
+    errdefer mem_utils.free(alloc, steps);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -788,7 +724,7 @@ fn parseToolExecutionSteps(
     for (value.array.items, 0..) |item, i| {
         const object = try requireObject(item);
         const assistant = try optionalStringDup(alloc, object.get("assistant"));
-        errdefer if (assistant) |text| alloc.free(text);
+        errdefer if (assistant) |text| mem_utils.free(alloc, text);
         const tool_calls = try parseToolCallArray(alloc, object.get("tool_calls"));
         errdefer session.freeToolCallSlice(alloc, tool_calls);
         const tool_results = try parsePersistedToolResultArray(
@@ -814,7 +750,7 @@ fn parseToolCallArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]session
     if (value.array.items.len == 0) return &.{};
 
     const calls = try alloc.alloc(session.ToolCall, value.array.items.len);
-    errdefer alloc.free(calls);
+    errdefer mem_utils.free(alloc, calls);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -839,7 +775,7 @@ fn parsePersistedToolResultArray(
     if (value.array.items.len == 0) return &.{};
 
     const results = try alloc.alloc(session.PersistedToolResult, value.array.items.len);
-    errdefer alloc.free(results);
+    errdefer mem_utils.free(alloc, results);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -861,15 +797,15 @@ fn parsePersistedToolResult(
 ) !session.PersistedToolResult {
     const object = try requireObject(value);
     const tool_call_id = try alloc.dupe(u8, try requireString(object, "tool_call_id"));
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try alloc.dupe(u8, try requireString(object, "tool_name"));
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     const output = try alloc.dupe(u8, try requireString(object, "output"));
-    errdefer alloc.free(output);
+    errdefer mem_utils.free(alloc, output);
     const output_handle = try optionalStringDup(alloc, object.get("output_handle"));
-    errdefer if (output_handle) |handle| alloc.free(handle);
+    errdefer if (output_handle) |handle| mem_utils.free(alloc, handle);
     const preview = try optionalStringDup(alloc, object.get("preview"));
-    errdefer if (preview) |text| alloc.free(text);
+    errdefer if (preview) |text| mem_utils.free(alloc, text);
     const permission_feedback: [][]u8 = if (schema_version == 1)
         &.{}
     else blk: {
@@ -908,19 +844,21 @@ fn parseCommittedFilePresentation(
 ) !types.CommittedFilePresentation {
     const object = try requireObject(value);
     const path = try alloc.dupe(u8, try requireString(object, "path"));
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const lines = try parseCommittedFilePresentationLines(alloc, object.get("lines"));
     errdefer {
         for (lines) |line| alloc.free(@constCast(line.text));
         if (lines.len > 0) alloc.free(@constCast(lines));
     }
     const previous_content = try optionalStringDup(alloc, object.get("previous_content"));
-    errdefer if (previous_content) |content| alloc.free(content);
+    errdefer if (previous_content) |content| mem_utils.free(alloc, content);
     const after_content = try optionalStringDup(alloc, object.get("after_content"));
-    errdefer if (after_content) |content| alloc.free(content);
+    errdefer if (after_content) |content| mem_utils.free(alloc, content);
     const lifecycle_id = try parseOptionalLifecycleId(alloc, object.get("lifecycle_id"));
-    errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
-    return .{
+    errdefer if (lifecycle_id) |id| mem_utils.free(alloc, @constCast(id.call_id));
+    const content_handle = try optionalStringDup(alloc, object.get("content_handle"));
+    errdefer if (content_handle) |handle| mem_utils.free(alloc, handle);
+    const presentation = types.CommittedFilePresentation{
         .path = path,
         .kind = try parseCommittedFilePresentationKind(try requireString(object, "kind")),
         .lines = lines,
@@ -930,7 +868,12 @@ fn parseCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
+    return presentation;
 }
 
 fn parseCommittedFilePresentationLines(
@@ -941,9 +884,9 @@ fn parseCommittedFilePresentationLines(
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const lines = try alloc.alloc(types.CommittedFilePresentationLine, value.array.items.len);
-    errdefer alloc.free(lines);
+    errdefer mem_utils.free(alloc, lines);
     var parsed_count: usize = 0;
-    errdefer for (lines[0..parsed_count]) |line| alloc.free(@constCast(line.text));
+    errdefer for (lines[0..parsed_count]) |line| mem_utils.free(alloc, @constCast(line.text));
     for (value.array.items, 0..) |item, index| {
         const object = try requireObject(item);
         lines[index] = .{
@@ -965,7 +908,7 @@ fn parseOptionalLifecycleId(
     if (value == .null) return null;
     const object = try requireObject(value);
     const call_id = try alloc.dupe(u8, try requireString(object, "call_id"));
-    errdefer alloc.free(call_id);
+    errdefer mem_utils.free(alloc, call_id);
     return .{
         .turn_id = @intCast(try requireUsize(object, "turn_id")),
         .call_id = call_id,
@@ -1020,7 +963,7 @@ fn parseFileEvidenceSlice(alloc: Allocator, maybe_value: ?std.json.Value) ![]ses
     if (value.array.items.len == 0) return &.{};
 
     const files = try alloc.alloc(session.FileEvidence, value.array.items.len);
-    errdefer alloc.free(files);
+    errdefer mem_utils.free(alloc, files);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -1038,13 +981,13 @@ fn parseFileEvidenceSlice(alloc: Allocator, maybe_value: ?std.json.Value) ![]ses
 fn parseFileEvidence(alloc: Allocator, value: std.json.Value) !session.FileEvidence {
     const object = try requireObject(value);
     const path = try alloc.dupe(u8, try requireString(object, "path"));
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const new_path = try optionalStringDup(alloc, object.get("new_path"));
-    errdefer if (new_path) |path_copy| alloc.free(path_copy);
+    errdefer if (new_path) |path_copy| mem_utils.free(alloc, path_copy);
     const tool_call_id = try alloc.dupe(u8, try requireString(object, "tool_call_id"));
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try alloc.dupe(u8, try requireString(object, "tool_name"));
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     return .{
         .path = path,
         .new_path = new_path,
@@ -1104,7 +1047,7 @@ fn freeParsedFileEvidence(alloc: Allocator, file: session.FileEvidence) void {
 fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     const object = try requireObject(value);
     const text = try alloc.dupe(u8, try requireString(object, "text"));
-    errdefer alloc.free(text);
+    errdefer mem_utils.free(alloc, text);
     const images = try validateImagesArray(alloc, object.get("images"));
     errdefer session.freeImageAttachmentSlice(alloc, images);
     return .{ .text = text, .images = images };
@@ -1128,7 +1071,7 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
     if (value.array.items.len == 0) return &.{};
 
     const images = try alloc.alloc(session.ImageAttachment, value.array.items.len);
-    errdefer alloc.free(images);
+    errdefer mem_utils.free(alloc, images);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -1140,6 +1083,12 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
 
     for (value.array.items, 0..) |entry, i| {
         const object = try requireObject(entry);
+        const source_ref = if (object.get("source_ref")) |_| source: {
+            const value_bytes = try requireString(object, "source_ref");
+            if (!image_data.validSourceRef(value_bytes)) return error.InvalidSessionFormat;
+            break :source try alloc.dupe(u8, value_bytes);
+        } else null;
+        errdefer if (source_ref) |value_bytes| alloc.free(value_bytes);
         const snapshot_path = try optionalStringDup(alloc, object.get("snapshot_path"));
         var owns_snapshot_path = true;
         errdefer if (owns_snapshot_path) {
@@ -1159,6 +1108,7 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
             snapshot_path,
             snapshot_sha256,
         );
+        images[i].source_ref = source_ref;
         owns_snapshot_path = false;
         owns_snapshot_sha256 = false;
         parsed_count += 1;
@@ -1175,9 +1125,9 @@ fn dupeParsedImageAttachment(
     snapshot_sha256_src: ?[]u8,
 ) !session.ImageAttachment {
     const path = try alloc.dupe(u8, path_src);
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const media_type = try alloc.dupe(u8, media_type_src);
-    errdefer alloc.free(media_type);
+    errdefer mem_utils.free(alloc, media_type);
     return .{
         .id = id,
         .path = path,
@@ -1284,25 +1234,15 @@ fn freeToken(alloc: Allocator, token: std.json.Token) void {
 
 fn parseOptionalBackgroundRecordId(
     maybe_value: ?std.json.Value,
-) !?session.StableBackgroundRecordId {
+) !?[16]u8 {
     const value = maybe_value orelse return null;
     if (value == .null) return null;
     if (value != .string or value.string.len != 32) return error.InvalidSessionFormat;
-    var id: session.StableBackgroundRecordId = undefined;
+    var id: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&id, value.string) catch return error.InvalidSessionFormat;
     const canonical = std.fmt.bytesToHex(id, .lower);
     if (!std.mem.eql(u8, &canonical, value.string)) return error.InvalidSessionFormat;
     return id;
-}
-
-fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try writer.writeByte('"');
-    const alphabet = "0123456789abcdef";
-    for (bytes) |byte| {
-        try writer.writeByte(alphabet[byte >> 4]);
-        try writer.writeByte(alphabet[byte & 0x0f]);
-    }
-    try writer.writeByte('"');
 }
 
 noinline fn requireObject(value: std.json.Value) !std.json.ObjectMap {
@@ -1353,7 +1293,7 @@ fn parseOptionalStringArray(alloc: Allocator, maybe_value: ?std.json.Value) ![][
     if (value.array.items.len == 0) return &.{};
 
     const items = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(items);
+    errdefer mem_utils.free(alloc, items);
 
     var parsed_count: usize = 0;
     errdefer {
@@ -1410,137 +1350,6 @@ test "parseWorkspaceRoot probes workspace without requiring supported schema" {
 test "parseWorkspaceRoot rejects non-object and non-string workspace root" {
     try std.testing.expectError(error.InvalidSessionFormat, parseWorkspaceRoot(std.testing.allocator, "[]"));
     try std.testing.expectError(error.InvalidSessionFormat, parseWorkspaceRoot(std.testing.allocator, "{\"workspace_root\":123}"));
-}
-
-test "session JSON round-trips images summaries and background commands" {
-    const alloc = std.testing.allocator;
-
-    var images = [_]session.ImageAttachment{.{
-        .path = @constCast("/tmp/core.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast("/tmp/fx-session/images/image-1.bin"),
-        .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-    }};
-    var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
-    var root_user_messages = [_][]u8{ @constCast("first exact request"), @constCast("second exact request") };
-    const history = [_]session.HistoryTurn{
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("hello"), .images = &images },
-            .assistant = @constCast("world"),
-        } },
-        .{ .compacted_summary = .{
-            .summary = @constCast("summary text"),
-            .removed_turn_count = 5,
-            .compaction_count = 2,
-            .root_user_messages = &root_user_messages,
-        } },
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("run dev") },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .url = @constCast("http://localhost:3000"),
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("browse") },
-            .assistant = @constCast("Opening the browser."),
-            .tool_call = .{
-                .id = "call_browser",
-                .name = "browser_click",
-                .arguments_json = "{\"selector\":\"button\"}",
-            },
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("create test.md") },
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("test tools") },
-            .completed_tool_names = completed_tool_names[0..],
-        } },
-    };
-
-    const json = try renderSessionJson(
-        alloc,
-        "core-json",
-        123,
-        456,
-        session.ConversationLanguage.literal("und-Latn"),
-        "/tmp/workspace",
-        &history,
-        .{},
-    );
-    defer alloc.free(json);
-
-    var loaded = try parseStoredSession(TestStoredSession, alloc, json);
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqualStrings("core-json", loaded.id);
-    try std.testing.expectEqualStrings("/tmp/workspace", loaded.workspace_root.?);
-    try std.testing.expectEqual(@as(i64, 123), loaded.created_at_ms);
-    try std.testing.expectEqual(@as(i64, 456), loaded.updated_at_ms);
-    try std.testing.expectEqualStrings("und-Latn", loaded.conversation_language.view());
-    try std.testing.expectEqual(@as(usize, 6), loaded.history.len);
-    try std.testing.expectEqualStrings("hello", loaded.history[0].assistant.user.text);
-    try std.testing.expectEqualStrings("/tmp/core.png", loaded.history[0].assistant.user.images[0].path);
-    try std.testing.expectEqualStrings("image/png", loaded.history[0].assistant.user.images[0].media_type);
-    try std.testing.expectEqualStrings(
-        "images/image-1.bin",
-        loaded.history[0].assistant.user.images[0].snapshot_path.?,
-    );
-    try std.testing.expectEqualStrings(
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        loaded.history[0].assistant.user.images[0].snapshot_sha256.?,
-    );
-    try std.testing.expectEqualStrings("world", loaded.history[0].assistant.assistant);
-    try std.testing.expectEqualStrings("summary text", loaded.history[1].compacted_summary.summary);
-    try std.testing.expectEqual(@as(usize, 5), loaded.history[1].compacted_summary.removed_turn_count);
-    try std.testing.expectEqual(@as(usize, 2), loaded.history[1].compacted_summary.compaction_count);
-    try std.testing.expect(!loaded.history[1].compacted_summary.root_user_messages_complete);
-    try std.testing.expectEqual(@as(usize, 0), loaded.history[1].compacted_summary.root_user_messages.len);
-    try std.testing.expectEqualStrings("run dev", loaded.history[2].background_command.user.text);
-    try std.testing.expectEqualStrings("/tmp/server.log", loaded.history[2].background_command.log_path);
-    try std.testing.expect(loaded.history[2].background_command.expect_url);
-    try std.testing.expectEqualStrings("http://localhost:3000", loaded.history[2].background_command.url.?);
-    try std.testing.expectEqualStrings("browse", loaded.history[3].interrupted.user.text);
-    try std.testing.expectEqualStrings("Opening the browser.", loaded.history[3].interrupted.assistant.?);
-    try std.testing.expectEqualStrings("call_browser", loaded.history[3].interrupted.tool_call.?.id);
-    try std.testing.expectEqualStrings("browser_click", loaded.history[3].interrupted.tool_call.?.name);
-    try std.testing.expectEqualStrings("{\"selector\":\"button\"}", loaded.history[3].interrupted.tool_call.?.arguments_json);
-    try std.testing.expectEqualStrings("create test.md", loaded.history[4].interrupted.user.text);
-    try std.testing.expect(loaded.history[4].interrupted.assistant == null);
-    try std.testing.expect(loaded.history[4].interrupted.tool_call == null);
-    try std.testing.expectEqualStrings("test tools", loaded.history[5].interrupted.user.text);
-    try std.testing.expectEqual(@as(usize, 2), loaded.history[5].interrupted.completed_tool_names.len);
-    try std.testing.expectEqualStrings("list_files", loaded.history[5].interrupted.completed_tool_names[0]);
-    try std.testing.expectEqualStrings("glob_files", loaded.history[5].interrupted.completed_tool_names[1]);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var projected: std.ArrayList(types.ChatMessage) = .empty;
-    defer projected.deinit(arena);
-    try session.appendHistoryChatMessages(arena, &projected, loaded.history[0..4]);
-
-    var summary_count: usize = 0;
-    var background_count: usize = 0;
-    var interruption_count: usize = 0;
-    for (projected.items) |entry| {
-        try std.testing.expect(entry.role != .system);
-        const content = entry.content orelse continue;
-        if (std.mem.find(u8, content, "summary text") != null) {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            summary_count += 1;
-        }
-        if (std.mem.find(u8, content, "/tmp/server.log") != null) {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            background_count += 1;
-        }
-        if (std.mem.find(u8, content, "<turn_aborted>") != null) {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            interruption_count += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), summary_count);
-    try std.testing.expectEqual(@as(usize, 1), background_count);
-    try std.testing.expectEqual(@as(usize, 1), interruption_count);
 }
 
 test "legacy session migration keeps missing compacted authority incomplete" {
@@ -1601,6 +1410,11 @@ test "session JSON round-trips assistant execution memory" {
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast("focus on rendering"),
+        .assistant_prefix = @constCast("partial assistant"),
+        .after_tool_step_count = 1,
+    }};
     var files = [_]session.FileEvidence{.{
         .path = @constCast("src/main.zig"),
         .tool_call_id = @constCast("call_read"),
@@ -1613,7 +1427,7 @@ test "session JSON round-trips assistant execution memory" {
     const history = [_]session.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("what is main") },
         .assistant = @constCast("main wires the app"),
-        .execution = .{ .tool_steps = steps[0..], .files = files[0..] },
+        .execution = .{ .tool_steps = steps[0..], .files = files[0..], .steering = steering[0..] },
     } }};
 
     const json = try renderSessionJson(alloc, "exec-json", 1, 2, session.ConversationLanguage.literal("en"), "/tmp/workspace", &history, .{});
@@ -1621,8 +1435,11 @@ test "session JSON round-trips assistant execution memory" {
     try std.testing.expect(std.mem.find(u8, json, "\"execution\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"tool_steps\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"files\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"schema_version\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":3") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"permission_feedback\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"text\":\"focus on rendering\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"assistant_prefix\":\"partial assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"after_tool_step_count\":1") != null);
 
     var loaded = try parseStoredSession(TestStoredSession, alloc, json);
     defer loaded.deinit(alloc);
@@ -1643,6 +1460,29 @@ test "session JSON round-trips assistant execution memory" {
     try std.testing.expectEqual(@as(usize, 1), execution.files.len);
     try std.testing.expectEqual(.read, execution.files[0].action);
     try std.testing.expect(execution.files[0].model_view_covers_full_file);
+    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0].text);
+    try std.testing.expectEqualStrings("partial assistant", execution.steering[0].assistant_prefix.?);
+    try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+}
+
+fn checkV3SteeringAllocationFailures(alloc: Allocator) !void {
+    const json =
+        "[{\"text\":\"first\",\"assistant_prefix\":\"prefix one\",\"after_tool_step_count\":0}," ++
+        "{\"text\":\"second\",\"assistant_prefix\":\"prefix two\",\"after_tool_step_count\":1}]";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const steering = try parseOptionalSteering(alloc, parsed.value, 3, 1);
+    defer types.freePersistedSteering(alloc, steering);
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+}
+
+test "session JSON steering cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkV3SteeringAllocationFailures,
+        .{},
+    );
 }
 
 const legacy_execution_memory_fixture =
@@ -1652,7 +1492,8 @@ const legacy_execution_memory_fixture =
     "\"execution\":{\"schema_version\":2,\"tool_steps\":[" ++
     "{\"assistant\":\"checking\",\"tool_calls\":[{\"id\":\"call_write\",\"name\":\"write_file\",\"arguments_json\":\"{}\",\"provider_result\":null}],\"tool_results\":[{\"tool_call_id\":\"call_write\",\"tool_name\":\"write_file\",\"status\":\"success\",\"output\":\"wrote\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5,\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1,\"permission_feedback\":[\"read it\"]}]}],\"files\":[" ++
     "{\"path\":\"src/main.zig\",\"new_path\":null,\"tool_call_id\":\"call_read\",\"tool_name\":\"read_file\"," ++
-    "\"action\":\"read\",\"status\":\"success\",\"model_view_covers_full_file\":true,\"stale\":false}]}}]}";
+    "\"action\":\"read\",\"status\":\"success\",\"model_view_covers_full_file\":true,\"stale\":false}]," ++
+    "\"steering\":[\"legacy steer\"]}}]}";
 
 fn checkLegacyExecutionMemoryAllocationFailures(alloc: Allocator) !void {
     var loaded = try parseStoredSession(
@@ -1668,6 +1509,14 @@ fn checkLegacyExecutionMemoryAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(
         @as(usize, 1),
         loaded.history[0].assistant.execution.files.len,
+    );
+    try std.testing.expectEqualStrings(
+        "legacy steer",
+        loaded.history[0].assistant.execution.steering[0].text,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        loaded.history[0].assistant.execution.steering[0].after_tool_step_count,
     );
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -1756,67 +1605,101 @@ test "session JSON persists malformed argument recovery as a safe failed pair" {
     try std.testing.expectEqualStrings(failure_output, execution.tool_steps[0].tool_results[0].output);
 }
 
-test "session JSON round-trips extended background and interrupted history" {
+test "non-object legacy function inputs are repaired without changing recorded outcomes" {
     const alloc = std.testing.allocator;
-    var files = [_]session.FileEvidence{.{
-        .path = @constCast("src/main.zig"),
-        .tool_call_id = @constCast("call_read"),
-        .tool_name = @constCast("read_file"),
-        .action = .read,
-        .status = .success,
-        .model_view_covers_full_file = true,
-    }};
-    const record_id = session.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    const history = [_]session.HistoryTurn{
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("run dev") },
-            .assistant = @constCast("The server is starting."),
-            .execution = .{ .files = files[0..] },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .background_record_id = record_id,
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("inspect") },
-            .assistant = @constCast("I inspected the entry point."),
-            .execution = .{ .files = files[0..] },
-        } },
-    };
+    for ([_]session.PersistedToolStatus{ .success, .failure }) |status| {
+        for (0..3) |native_kind| {
+            var calls = [_]session.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "[]" }};
+            calls[0].provider_result = if (native_kind == 1) "provider result" else null;
+            var results = [_]session.PersistedToolResult{.{
+                .tool_call_id = @constCast("call"),
+                .tool_name = @constCast("read_file"),
+                .status = status,
+                .output = @constCast("recorded"),
+                .output_bytes = 8,
+                .stored_output_bytes = 8,
+                .truncated = false,
+                .provider_native = native_kind == 2,
+                .created_at_ms = 1,
+            }};
+            var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            try writeExecutionMemoryJson(&encoded.writer, .{ .tool_steps = &steps });
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+            defer parsed.deinit();
+            const decoded = try parseOptionalExecutionMemory(alloc, parsed.value);
+            defer session.freeExecutionMemory(alloc, decoded);
+            const step = decoded.tool_steps[0];
+            try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else "[]", step.tool_calls[0].arguments_json);
+            try std.testing.expectEqual(if (native_kind == 0) types.ToolExecutionProvenance.fx_local else .provider_executed, step.tool_calls[0].provenance);
+            try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+            try std.testing.expectEqual(status, step.tool_results[0].status);
+            try std.testing.expectEqualStrings("recorded", step.tool_results[0].output);
+            try std.testing.expectEqual(@as(usize, 8), step.tool_results[0].stored_output_bytes);
+        }
+    }
+}
 
-    const json = try renderSessionJson(
-        alloc,
-        "extended-history",
-        1,
-        2,
-        session.ConversationLanguage.literal("en"),
-        "/tmp/workspace",
-        &history,
-        .{},
-    );
-    defer alloc.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"assistant\":\"The server is starting.\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"background_record_id\":\"00112233445566778899aabbccddeeff\"") != null);
+fn checkNonObjectLegacyInterruptedAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const call = (try parseOptionalToolCall(alloc, value)).?;
+    defer session.freeToolCall(alloc, call);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
+}
 
-    var loaded = try parseStoredSession(TestStoredSession, alloc, json);
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "The server is starting.",
-        loaded.history[0].background_command.assistant.?,
-    );
-    try std.testing.expectEqual(@as(usize, 1), loaded.history[0].background_command.execution.files.len);
-    try std.testing.expectEqualSlices(
-        u8,
-        &record_id,
-        &loaded.history[0].background_command.background_record_id.?,
-    );
-    try std.testing.expectEqualStrings(
-        "I inspected the entry point.",
-        loaded.history[1].interrupted.assistant.?,
-    );
-    try std.testing.expectEqual(@as(usize, 1), loaded.history[1].interrupted.execution.files.len);
+test "non-object legacy interrupted repair cleans every allocation failure" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"pending","name":"read_file","arguments_json":"[]","provider_result":null}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectLegacyInterruptedAllocationFailures, .{parsed.value});
+}
+
+test "legacy cancellation provenance reads old sessions and roundtrips optional origin" {
+    const Case = struct {
+        fn run(alloc: Allocator, origin_field: []const u8, expected: types.CancellationOrigin) !void {
+            const json = try std.fmt.allocPrint(
+                alloc,
+                "{{\"schema_version\":1,\"id\":\"old\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
+                    "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
+                    "{{\"kind\":\"interrupted\",\"user\":{{\"text\":\"request\",\"images\":[]}},\"assistant\":\"partial\"{s}}}]}}",
+                .{origin_field},
+            );
+            defer alloc.free(json);
+            var loaded = try parseStoredSession(TestStoredSession, alloc, json);
+            defer loaded.deinit(alloc);
+            try std.testing.expectEqual(expected, loaded.history[0].interrupted.cancellation_origin);
+            try std.testing.expectEqual(types.InterruptedTerminalReason.cancelled, loaded.history[0].interrupted.terminal_reason);
+            // This in-memory writer reports injected allocation failure as WriteFailed.
+            const encoded = renderSessionJson(alloc, loaded.id, loaded.created_at_ms, loaded.updated_at_ms, loaded.conversation_language, loaded.workspace_root.?, loaded.history, .{}) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else err;
+            defer alloc.free(encoded);
+            try std.testing.expectEqual(expected == .compaction, std.mem.find(u8, encoded, "\"cancellation_origin\"") != null);
+            var reloaded = try parseStoredSession(TestStoredSession, alloc, encoded);
+            defer reloaded.deinit(alloc);
+            try std.testing.expectEqual(expected, reloaded.history[0].interrupted.cancellation_origin);
+            try std.testing.expectEqualStrings("partial", reloaded.history[0].interrupted.assistant.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ "", types.CancellationOrigin.turn });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ ",\"cancellation_origin\":\"turn\"", types.CancellationOrigin.turn });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{ ",\"cancellation_origin\":\"compaction\"", types.CancellationOrigin.compaction });
+}
+
+test "legacy cancellation provenance rejects invalid values after owned fields" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"unknown\"", "null", "1", "false", "[]", "{}" }) |origin| {
+        const json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"kind\":\"interrupted\",\"user\":{{\"text\":\"request\",\"images\":[]}},\"assistant\":\"partial\",\"completed_tool_names\":[\"read_file\"],\"cancellation_origin\":{s}}}",
+            .{origin},
+        );
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidSessionFormat, parseLegacyHistoryTurn(alloc, parsed.value));
+    }
 }
 
 test "old assistant session JSON without execution parses as empty memory" {
@@ -1908,7 +1791,7 @@ test "legacy interrupted session sanitizes duplicate-key tool arguments" {
         "{\"schema_version\":1,\"id\":\"legacy-interrupted\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
         "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
         "{\"kind\":\"interrupted\",\"user\":{\"text\":\"inspect\",\"images\":[]},\"assistant\":\"working\"," ++
-        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"list_files\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
+        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"glob_files\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
         "\"completed_tool_names\":[]}]}";
 
     var loaded = try parseStoredSession(TestStoredSession, std.testing.allocator, json);
@@ -1924,7 +1807,7 @@ test "legacy session JSON rejects ambiguous malformed tool result pairings" {
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const list_result =
-        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"list_files\",\"status\":\"success\"," ++
+        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"glob_files\",\"status\":\"success\"," ++
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const cases = [_]struct {
@@ -2150,7 +2033,37 @@ test "legacy summary streaming structurally skips externally reordered history" 
     try std.testing.expectEqual(@as(usize, 1), summary.history_len);
 }
 
-test "schema v2 legacy exact reader preserves stable background and image identifiers" {
+test "session JSON image source refs round trip and reject malformed metadata" {
+    const alloc = std.testing.allocator;
+    var images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("inline://image-1"),
+        .media_type = @constCast("image/png"),
+        .source_ref = @constCast("host:original"),
+    }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("inspect"), .images = &images },
+        .assistant = @constCast("reply"),
+    } }};
+    const bytes = try renderSessionJson(alloc, "refs", 1, 2, .literal("en"), "/workspace", &history, .{});
+    defer alloc.free(bytes);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, encoded: []const u8) !void {
+            var loaded = try parseLegacyExact(TestStoredSession, a, encoded);
+            defer loaded.deinit(a);
+            const image = loaded.history[0].assistant.user.images[0];
+            try std.testing.expectEqualStrings("host:original", image.source_ref.?);
+            try std.testing.expect(image.inline_data == null);
+            try std.testing.expect(image.snapshot_path == null);
+            try std.testing.expect(image.snapshot_sha256 == null);
+        }
+    }.check, .{bytes});
+    const invalid = try std.mem.replaceOwned(u8, alloc, bytes, "\"host:original\"", "\"\"");
+    defer alloc.free(invalid);
+    try std.testing.expectError(error.InvalidSessionFormat, parseLegacyExact(TestStoredSession, alloc, invalid));
+}
+
+test "schema v2 legacy exact reader migrates background ownership to inert history" {
     const alloc = std.testing.allocator;
     const json =
         "{\"schema_version\":2,\"id\":\"legacy-v2\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
@@ -2163,15 +2076,17 @@ test "schema v2 legacy exact reader preserves stable background and image identi
     var loaded = try parseLegacyExact(TestStoredSession, alloc, json);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 7), loaded.history[0].assistant.user.images[0].id);
-    const expected = [_]u8{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    try std.testing.expectEqualSlices(
+    try std.testing.expect(loaded.history[1] == .assistant);
+    try std.testing.expect(std.mem.find(
         u8,
-        &expected,
-        &loaded.history[1].background_command.background_record_id.?,
-    );
+        loaded.history[1].assistant.assistant,
+        "fx no longer owns or controls this process",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        loaded.history[1].assistant.assistant,
+        "former log=/tmp/log",
+    ) != null);
 }
 
 test "legacy exact reader rejects durable byte objects in string fields" {

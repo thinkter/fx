@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const generation_fact_codec = @import("generation_fact_codec.zig");
 const usage_report = @import("usage_report.zig");
@@ -13,6 +14,7 @@ const max_record_bytes: usize = 16 * 1024;
 const max_records: usize = 200_000;
 const compaction_threshold_bytes: u64 = 8 * 1024 * 1024;
 const retention_ms: i64 = std.time.ms_per_day * 35;
+const compaction_slack_ms: i64 = std.time.ms_per_day;
 const private_dir_permissions = std.Io.Dir.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
@@ -65,6 +67,182 @@ const VariantIndexes = struct {
     second: ?usize = null,
 };
 
+/// Hard bound on incident records kept in the ledger file. Incidents mark
+/// coverage gaps; an unbounded flood of them adds parse cost to every append
+/// without adding signal.
+const max_file_incidents: usize = 4096;
+
+/// Suffix bytes ending at the indexed boundary, used to detect a foreign
+/// replace (compaction or tail repair from another process) that kept or grew
+/// the file length.
+const tail_sample_bytes: usize = 32;
+
+/// One durable parse of the usage ledger, kept across appends so steady-state
+/// publication reads only the bytes appended since the last boundary instead
+/// of re-parsing the whole file.
+const RecordIndex = struct {
+    coverage_started_at_ms: ?i64 = null,
+    facts: std.ArrayList(usage_report.GenerationFact) = .empty,
+    pending: std.ArrayList(usage_report.PendingMarker) = .empty,
+    incidents: std.ArrayList(usage_report.Incident) = .empty,
+    fact_indexes: std.StringHashMapUnmanaged(VariantIndexes) = .empty,
+    pending_indexes: std.StringHashMapUnmanaged(VariantIndexes) = .empty,
+    record_count: usize = 0,
+    /// Offset just past the last absorbed byte. Appends are whole lines, so
+    /// this always points at the start of a line.
+    boundary: u64 = 0,
+    tail_sample: [tail_sample_bytes]u8 = undefined,
+    tail_sample_len: usize = 0,
+    /// Times a tail absorb extended the index; tests use it to prove the
+    /// incremental path ran instead of a full re-parse.
+    incremental_absorbs: usize = 0,
+
+    fn deinit(self: *RecordIndex, alloc: Allocator) void {
+        for (self.facts.items) |*fact| fact.deinit(alloc);
+        self.facts.deinit(alloc);
+        for (self.pending.items) |*marker| marker.deinit(alloc);
+        self.pending.deinit(alloc);
+        self.incidents.deinit(alloc);
+        self.fact_indexes.deinit(alloc);
+        self.pending_indexes.deinit(alloc);
+        self.* = undefined;
+    }
+
+    /// Moves the record lists into a caller-owned Loaded for one-shot reads.
+    fn toLoaded(self: *RecordIndex, alloc: Allocator) !Loaded {
+        var built: Loaded = .{
+            .coverage_started_at_ms = null,
+            .facts = &.{},
+            .pending = &.{},
+            .incidents = &.{},
+            .record_count = 0,
+        };
+        errdefer built.deinit(alloc);
+        built.coverage_started_at_ms = self.coverage_started_at_ms;
+        built.facts = try self.facts.toOwnedSlice(alloc);
+        built.pending = try self.pending.toOwnedSlice(alloc);
+        built.incidents = try self.incidents.toOwnedSlice(alloc);
+        built.record_count = self.record_count;
+        return built;
+    }
+
+    fn captureTailSample(self: *RecordIndex, bytes: []const u8) void {
+        const n = @min(tail_sample_bytes, bytes.len);
+        @memcpy(self.tail_sample[0..n], bytes[bytes.len - n ..]);
+        self.tail_sample_len = n;
+    }
+};
+
+fn absorbRecord(index: *RecordIndex, alloc: Allocator, record: ParsedRecord) !void {
+    switch (record) {
+        .coverage => |started_at_ms| {
+            if (index.coverage_started_at_ms) |existing| {
+                if (existing != started_at_ms) return error.InvalidUsageStore;
+            } else {
+                index.coverage_started_at_ms = started_at_ms;
+            }
+        },
+        .generation => |fact| {
+            if (index.coverage_started_at_ms == null) return error.InvalidUsageStore;
+            if (index.fact_indexes.getPtr(fact.id)) |indexes| {
+                if (usage_report.GenerationFact.eql(
+                    index.facts.items[indexes.first],
+                    fact,
+                ) or (indexes.second != null and
+                    usage_report.GenerationFact.eql(
+                        index.facts.items[indexes.second.?],
+                        fact,
+                    )))
+                {
+                    return;
+                }
+                if (indexes.second == null) {
+                    var owned = try fact.dupe(alloc);
+                    index.facts.append(alloc, owned) catch |err| {
+                        owned.deinit(alloc);
+                        return err;
+                    };
+                    indexes.second = index.facts.items.len - 1;
+                }
+            } else {
+                var owned = try fact.dupe(alloc);
+                index.facts.append(alloc, owned) catch |err| {
+                    owned.deinit(alloc);
+                    return err;
+                };
+                try index.fact_indexes.put(
+                    alloc,
+                    index.facts.items[index.facts.items.len - 1].id,
+                    .{ .first = index.facts.items.len - 1 },
+                );
+            }
+        },
+        .pending => |marker| {
+            if (index.coverage_started_at_ms == null) return error.InvalidUsageStore;
+            if (index.pending_indexes.getPtr(marker.id)) |indexes| {
+                if (usage_report.PendingMarker.eql(
+                    index.pending.items[indexes.first],
+                    marker,
+                ) or (indexes.second != null and
+                    usage_report.PendingMarker.eql(
+                        index.pending.items[indexes.second.?],
+                        marker,
+                    )))
+                {
+                    return;
+                }
+                if (indexes.second == null) {
+                    var owned = try marker.dupe(alloc);
+                    index.pending.append(alloc, owned) catch |err| {
+                        owned.deinit(alloc);
+                        return err;
+                    };
+                    indexes.second = index.pending.items.len - 1;
+                    try index.incidents.append(alloc, .{
+                        .occurred_at_ms = marker.observed_at_ms,
+                        .completeness = .incomplete,
+                    });
+                }
+            } else {
+                var owned = try marker.dupe(alloc);
+                index.pending.append(alloc, owned) catch |err| {
+                    owned.deinit(alloc);
+                    return err;
+                };
+                try index.pending_indexes.put(
+                    alloc,
+                    index.pending.items[index.pending.items.len - 1].id,
+                    .{ .first = index.pending.items.len - 1 },
+                );
+            }
+        },
+        .incident => |incident| try index.incidents.append(alloc, incident),
+    }
+}
+
+fn absorbBytes(index: *RecordIndex, alloc: Allocator, bytes: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        index.record_count += 1;
+        if (index.record_count > max_records or line.len > max_record_bytes) {
+            return error.UsageCapacityExceeded;
+        }
+        var record = try parseRecord(alloc, line);
+        defer record.deinit(alloc);
+        try absorbRecord(index, alloc, record);
+    }
+}
+
+fn verifyTailSample(index: *const RecordIndex, file: std.Io.File) bool {
+    if (index.tail_sample_len == 0) return false;
+    var buf: [tail_sample_bytes]u8 = undefined;
+    const start = index.boundary - index.tail_sample_len;
+    const count = file.readPositionalAll(io_mod.getIo(), buf[0..index.tail_sample_len], start) catch return false;
+    if (count != index.tail_sample_len) return false;
+    return std.mem.eql(u8, buf[0..index.tail_sample_len], index.tail_sample[0..index.tail_sample_len]);
+}
+
 const TailBoundary = struct {
     length: u64,
     incomplete: bool,
@@ -74,6 +252,12 @@ pub const Store = struct {
     home_path: []u8,
     durable_home: ?io_mod.VerifiedDir = null,
     lock_ops: io_mod.LockOps = .{},
+    index: ?RecordIndex = null,
+    /// Owns every allocation in `index`. Per-call allocators only back
+    /// temporaries: allocator identity cannot be compared across calls
+    /// because `std.heap.c_allocator.ptr` is undefined.
+    index_alloc: Allocator,
+    lock_abandoned: std.atomic.Value(bool) = .init(false),
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
         const owned_home = try alloc.dupe(u8, home_path);
@@ -81,10 +265,12 @@ pub const Store = struct {
         return .{
             .home_path = owned_home,
             .durable_home = try openExistingDurableHome(home_path),
+            .index_alloc = alloc,
         };
     }
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
+        self.invalidateIndex();
         if (self.durable_home) |*dir| dir.close();
         alloc.free(self.home_path);
         self.* = undefined;
@@ -112,6 +298,7 @@ pub const Store = struct {
         var lock = self.acquireLock() catch |err| switch (err) {
             error.LockBusy => return error.UsageLockBusy,
             error.LockUnsupported => return error.UsageLockUnsupported,
+            error.Cancelled => return error.UsageLockAbandoned,
             else => return err,
         };
         defer lock.release();
@@ -121,16 +308,15 @@ pub const Store = struct {
         const tail = try inspectTail(file.?);
         const has_incomplete_tail = tail.incomplete;
         var boundary = tail.length;
-        var loaded = try self.loadFromFile(alloc, file.?, boundary);
-        defer loaded.deinit(alloc);
+        const index = try self.ensureIndex(alloc, file.?, boundary);
 
-        const decision = classifyEvent(loaded, event);
+        const decision = classifyEvent(index, event);
 
         const now_ms = @max(io_mod.milliTimestamp(), 0);
         var append_bytes: std.Io.Writer.Allocating = .init(alloc);
         defer append_bytes.deinit();
         var append_record_count: usize = 0;
-        if (loaded.coverage_started_at_ms == null) {
+        if (index.coverage_started_at_ms == null) {
             try writeCoverage(&append_bytes.writer, now_ms);
             append_record_count += 1;
         }
@@ -155,20 +341,20 @@ pub const Store = struct {
         ) catch return error.UsageCapacityExceeded;
         var compacted_before_append = false;
         var append_committed = false;
-        var base_record_count = loaded.record_count;
+        var base_record_count = index.record_count;
         if (shouldCompactBeforeAppend(
             next_length,
             base_record_count,
             append_record_count,
-            loaded,
+            index,
             now_ms,
         )) {
             compacted_before_append = true;
-            base_record_count = retainedRecordCount(loaded, now_ms);
+            base_record_count = retainedRecordCount(index, now_ms);
             if (has_incomplete_tail) {
                 var replacement: std.Io.Writer.Allocating = .init(alloc);
                 defer replacement.deinit();
-                try writeRetainedRecords(&replacement.writer, loaded, now_ms);
+                try writeRetainedRecords(&replacement.writer, index, now_ms);
                 try replacement.writer.writeAll(append_bytes.written());
                 next_length = std.math.cast(u64, replacement.written().len) orelse
                     return error.UsageCapacityExceeded;
@@ -214,20 +400,107 @@ pub const Store = struct {
             }
         }
 
-        if (shouldCompactAfterAppend(
+        const compact_after = shouldCompactAfterAppend(
             next_length,
-            loaded,
+            index,
             eventTimestamp(event),
             now_ms,
             compacted_before_append,
-        )) {
+        );
+        self.noteAppendedRecords(append_bytes.written(), next_length, compacted_before_append);
+        if (compact_after) {
             if (file) |open_file| {
                 open_file.close(io_mod.getIo());
                 file = null;
             }
             try self.compactLocked(alloc, now_ms);
+            self.invalidateIndex();
         }
         return decision.outcome;
+    }
+
+    /// Rebuilds or incrementally extends the resident parse of the ledger so an
+    /// append pays for new bytes only. The store lock is already held by the
+    /// caller; other processes may have appended since our last boundary.
+    fn ensureIndex(
+        self: *Store,
+        alloc: Allocator,
+        file: std.Io.File,
+        boundary: u64,
+    ) !*RecordIndex {
+        if (self.index) |*index| {
+            if (boundary == index.boundary and verifyTailSample(index, file)) return index;
+            if (boundary > index.boundary and self.tryAbsorbTail(alloc, index, file, boundary)) {
+                return index;
+            }
+            self.invalidateIndex();
+        }
+        if (boundary > max_file_bytes) return error.UsageCapacityExceeded;
+        var fresh: RecordIndex = .{};
+        errdefer fresh.deinit(self.index_alloc);
+        if (boundary > 0) {
+            const byte_len = std.math.cast(usize, boundary) orelse
+                return error.UsageCapacityExceeded;
+            const bytes = try alloc.alloc(u8, byte_len);
+            defer alloc.free(bytes);
+            const read_count = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
+            if (read_count != byte_len) return error.UsageReadFailed;
+            if (bytes[bytes.len - 1] != '\n') return error.UsageStoreIncomplete;
+            try absorbBytes(&fresh, self.index_alloc, bytes);
+            fresh.boundary = boundary;
+            fresh.captureTailSample(bytes);
+        }
+        self.index = fresh;
+        return &self.index.?;
+    }
+
+    fn tryAbsorbTail(
+        self: *Store,
+        alloc: Allocator,
+        index: *RecordIndex,
+        file: std.Io.File,
+        boundary: u64,
+    ) bool {
+        if (boundary - index.boundary > max_file_bytes) return false;
+        if (!verifyTailSample(index, file)) return false;
+        const start = index.boundary;
+        const tail_len: usize = @intCast(boundary - start);
+        const bytes = alloc.alloc(u8, tail_len) catch return false;
+        defer alloc.free(bytes);
+        const read_count = file.readPositionalAll(io_mod.getIo(), bytes, start) catch return false;
+        if (read_count != tail_len) return false;
+        if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') return false;
+        absorbBytes(index, self.index_alloc, bytes) catch return false;
+        index.boundary = boundary;
+        index.captureTailSample(bytes);
+        index.incremental_absorbs += 1;
+        return true;
+    }
+
+    /// After a committed append the index tracks the file by absorbing the
+    /// lines we wrote; a compaction replaced the content instead.
+    fn noteAppendedRecords(
+        self: *Store,
+        written: []const u8,
+        final_length: u64,
+        content_replaced: bool,
+    ) void {
+        if (content_replaced) {
+            self.invalidateIndex();
+            return;
+        }
+        const index = &(self.index orelse return);
+        absorbBytes(index, self.index_alloc, written) catch {
+            self.invalidateIndex();
+            return;
+        };
+        index.boundary = final_length;
+        index.captureTailSample(written);
+    }
+
+    fn invalidateIndex(self: *Store) void {
+        if (self.index) |*index| index.deinit(self.index_alloc);
+        self.index = null;
     }
 
     /// Loads one stable read-only boundary without creating profile state.
@@ -305,12 +578,20 @@ pub const Store = struct {
     }
 
     fn acquireLock(self: *Store) !io_mod.TimedAdvisoryLock {
-        return io_mod.acquireTimedAdvisoryLockWithOps(
+        return io_mod.acquireTimedAdvisoryLockCancellableWithOps(
             &self.durable_home.?,
             usage_lock_file,
             lock_deadline_ms,
+            &self.lock_abandoned,
             self.lock_ops,
         );
+    }
+
+    /// Stops acquiring the profile-wide ledger lock and ends a wait that is
+    /// already in progress. Unpublished usage stays in the session state and
+    /// the usage recovery registry.
+    pub fn abandonLock(self: *Store) void {
+        self.lock_abandoned.store(true, .release);
     }
 
     fn acquireExistingLock(self: *Store) !?io_mod.TimedAdvisoryLock {
@@ -451,138 +732,21 @@ pub const Store = struct {
         if (read_count != byte_len) return error.UsageReadFailed;
         if (bytes[bytes.len - 1] != '\n') return error.UsageStoreIncomplete;
 
-        var facts: std.ArrayList(usage_report.GenerationFact) = .empty;
-        errdefer {
-            for (facts.items) |*fact| fact.deinit(alloc);
-            facts.deinit(alloc);
-        }
-        var pending: std.ArrayList(usage_report.PendingMarker) = .empty;
-        errdefer {
-            for (pending.items) |*marker| marker.deinit(alloc);
-            pending.deinit(alloc);
-        }
-        var incidents: std.ArrayList(usage_report.Incident) = .empty;
-        errdefer incidents.deinit(alloc);
-        var fact_indexes: std.StringHashMapUnmanaged(VariantIndexes) = .empty;
-        defer fact_indexes.deinit(alloc);
-        var pending_indexes: std.StringHashMapUnmanaged(VariantIndexes) = .empty;
-        defer pending_indexes.deinit(alloc);
-        var coverage_started_at_ms: ?i64 = null;
-        var record_count: usize = 0;
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            record_count += 1;
-            if (record_count > max_records or line.len > max_record_bytes) {
-                return error.UsageCapacityExceeded;
-            }
-            var record = try parseRecord(alloc, line);
-            defer record.deinit(alloc);
-            switch (record) {
-                .coverage => |started_at_ms| {
-                    if (coverage_started_at_ms) |existing| {
-                        if (existing != started_at_ms) return error.InvalidUsageStore;
-                    } else {
-                        coverage_started_at_ms = started_at_ms;
-                    }
-                },
-                .generation => |fact| {
-                    if (coverage_started_at_ms == null) return error.InvalidUsageStore;
-                    if (fact_indexes.getPtr(fact.id)) |indexes| {
-                        if (usage_report.GenerationFact.eql(
-                            facts.items[indexes.first],
-                            fact,
-                        ) or (indexes.second != null and
-                            usage_report.GenerationFact.eql(
-                                facts.items[indexes.second.?],
-                                fact,
-                            )))
-                        {
-                            continue;
-                        }
-                        if (indexes.second == null) {
-                            var owned = try fact.dupe(alloc);
-                            facts.append(alloc, owned) catch |err| {
-                                owned.deinit(alloc);
-                                return err;
-                            };
-                            indexes.second = facts.items.len - 1;
-                        }
-                    } else {
-                        var owned = try fact.dupe(alloc);
-                        facts.append(alloc, owned) catch |err| {
-                            owned.deinit(alloc);
-                            return err;
-                        };
-                        try fact_indexes.put(
-                            alloc,
-                            facts.items[facts.items.len - 1].id,
-                            .{ .first = facts.items.len - 1 },
-                        );
-                    }
-                },
-                .pending => |marker| {
-                    if (coverage_started_at_ms == null) return error.InvalidUsageStore;
-                    if (pending_indexes.getPtr(marker.id)) |indexes| {
-                        if (usage_report.PendingMarker.eql(
-                            pending.items[indexes.first],
-                            marker,
-                        ) or (indexes.second != null and
-                            usage_report.PendingMarker.eql(
-                                pending.items[indexes.second.?],
-                                marker,
-                            )))
-                        {
-                            continue;
-                        }
-                        if (indexes.second == null) {
-                            var owned = try marker.dupe(alloc);
-                            pending.append(alloc, owned) catch |err| {
-                                owned.deinit(alloc);
-                                return err;
-                            };
-                            indexes.second = pending.items.len - 1;
-                            try incidents.append(alloc, .{
-                                .occurred_at_ms = marker.observed_at_ms,
-                                .completeness = .incomplete,
-                            });
-                        }
-                    } else {
-                        var owned = try marker.dupe(alloc);
-                        pending.append(alloc, owned) catch |err| {
-                            owned.deinit(alloc);
-                            return err;
-                        };
-                        try pending_indexes.put(
-                            alloc,
-                            pending.items[pending.items.len - 1].id,
-                            .{ .first = pending.items.len - 1 },
-                        );
-                    }
-                },
-                .incident => |incident| try incidents.append(alloc, incident),
-            }
-        }
-
-        return .{
-            .coverage_started_at_ms = coverage_started_at_ms,
-            .facts = try facts.toOwnedSlice(alloc),
-            .pending = try pending.toOwnedSlice(alloc),
-            .incidents = try incidents.toOwnedSlice(alloc),
-            .record_count = record_count,
-        };
+        var index: RecordIndex = .{};
+        defer index.deinit(alloc);
+        try absorbBytes(&index, alloc, bytes);
+        return index.toLoaded(alloc);
     }
 
     fn compactLocked(self: *Store, alloc: Allocator, now_ms: i64) !void {
         var file = (try self.openUsage(false, false)) orelse return;
         defer file.close(io_mod.getIo());
         const boundary = try file.length(io_mod.getIo());
-        var loaded = try self.loadFromFile(alloc, file, boundary);
-        defer loaded.deinit(alloc);
+        const index = try self.ensureIndex(alloc, file, boundary);
 
         var replacement: std.Io.Writer.Allocating = .init(alloc);
         defer replacement.deinit();
-        try writeRetainedRecords(&replacement.writer, loaded, now_ms);
+        try writeRetainedRecords(&replacement.writer, index, now_ms);
         try self.replaceUsageLocked(alloc, replacement.written());
     }
 
@@ -638,27 +802,44 @@ fn retentionCutoff(now_ms: i64) i64 {
     return std.math.sub(i64, now_ms, retention_ms) catch 0;
 }
 
-fn hasExpiredRecords(loaded: Loaded, now_ms: i64) bool {
+fn hasExpiredRecords(index: *const RecordIndex, now_ms: i64) bool {
     const cutoff_ms = retentionCutoff(now_ms);
-    for (loaded.facts) |fact| {
+    for (index.facts.items) |fact| {
         if (fact.created_at_ms < cutoff_ms) return true;
     }
-    for (loaded.pending) |marker| {
-        if (marker.observed_at_ms < cutoff_ms or pendingResolved(loaded, marker.id)) {
+    for (index.pending.items) |marker| {
+        if (marker.observed_at_ms < cutoff_ms or pendingResolved(index, marker.id)) {
             return true;
         }
     }
-    for (loaded.incidents) |incident| {
+    for (index.incidents.items) |incident| {
         if (incident.occurred_at_ms < cutoff_ms) return true;
     }
     return false;
 }
 
-fn pendingResolved(loaded: Loaded, id: []const u8) bool {
-    for (loaded.facts) |fact| {
-        if (std.mem.eql(u8, fact.id, id)) return true;
+/// Age-only expiry for the after-append check. A resolved pending marker is
+/// redundant, but it is a ~100 byte line; rewriting the whole ledger to drop it
+/// right after every turn would cost far more than keeping it until genuinely
+/// aged records accumulate. Records age past retention continuously, so the
+/// check waits for `compaction_slack_ms` of aged records; otherwise every
+/// append would rewrite the ledger.
+fn hasAgedRecords(index: *const RecordIndex, now_ms: i64) bool {
+    const cutoff_ms = std.math.sub(i64, retentionCutoff(now_ms), compaction_slack_ms) catch 0;
+    for (index.facts.items) |fact| {
+        if (fact.created_at_ms < cutoff_ms) return true;
+    }
+    for (index.pending.items) |marker| {
+        if (marker.observed_at_ms < cutoff_ms) return true;
+    }
+    for (index.incidents.items) |incident| {
+        if (incident.occurred_at_ms < cutoff_ms) return true;
     }
     return false;
+}
+
+fn pendingResolved(index: *const RecordIndex, id: []const u8) bool {
+    return index.fact_indexes.contains(id);
 }
 
 fn checkedRecordCount(current: usize, additional: usize) !usize {
@@ -673,20 +854,20 @@ fn exceedsRecordCapacity(current: usize, additional: usize) bool {
     return false;
 }
 
-fn retainedRecordCount(loaded: Loaded, now_ms: i64) usize {
+fn retainedRecordCount(index: *const RecordIndex, now_ms: i64) usize {
     const cutoff_ms = retentionCutoff(now_ms);
-    var count: usize = @intFromBool(loaded.coverage_started_at_ms != null);
-    for (loaded.facts) |fact| {
+    var count: usize = @intFromBool(index.coverage_started_at_ms != null);
+    for (index.facts.items) |fact| {
         if (fact.created_at_ms >= cutoff_ms) count += 1;
     }
-    for (loaded.pending) |marker| {
+    for (index.pending.items) |marker| {
         if (marker.observed_at_ms >= cutoff_ms and
-            !pendingResolved(loaded, marker.id))
+            !pendingResolved(index, marker.id))
         {
             count += 1;
         }
     }
-    for (loaded.incidents) |incident| {
+    for (index.incidents.items) |incident| {
         if (incident.occurred_at_ms >= cutoff_ms) count += 1;
     }
     return count;
@@ -696,24 +877,24 @@ fn shouldCompactBeforeAppend(
     next_length: u64,
     record_count: usize,
     append_record_count: usize,
-    loaded: Loaded,
+    index: *const RecordIndex,
     now_ms: i64,
 ) bool {
     return (next_length > max_file_bytes or
         exceedsRecordCapacity(record_count, append_record_count)) and
-        hasExpiredRecords(loaded, now_ms);
+        hasExpiredRecords(index, now_ms);
 }
 
 fn shouldCompactAfterAppend(
     next_length: u64,
-    loaded: Loaded,
+    index: *const RecordIndex,
     appended_at_ms: i64,
     now_ms: i64,
     compacted_before_append: bool,
 ) bool {
     return !compacted_before_append and
         next_length > compaction_threshold_bytes and
-        (hasExpiredRecords(loaded, now_ms) or
+        (hasAgedRecords(index, now_ms) or
             appended_at_ms < retentionCutoff(now_ms));
 }
 
@@ -771,26 +952,26 @@ fn copyFilePrefix(
 
 fn writeRetainedRecords(
     writer: *std.Io.Writer,
-    loaded: Loaded,
+    index: *const RecordIndex,
     now_ms: i64,
 ) !void {
     const cutoff_ms = retentionCutoff(now_ms);
-    if (loaded.coverage_started_at_ms) |started_at_ms| {
+    if (index.coverage_started_at_ms) |started_at_ms| {
         try writeCoverage(writer, started_at_ms);
     }
-    for (loaded.facts) |fact| {
+    for (index.facts.items) |fact| {
         if (fact.created_at_ms < cutoff_ms) continue;
         try writeGeneration(writer, fact);
     }
-    for (loaded.pending) |marker| {
+    for (index.pending.items) |marker| {
         if (marker.observed_at_ms < cutoff_ms or
-            pendingResolved(loaded, marker.id))
+            pendingResolved(index, marker.id))
         {
             continue;
         }
         try writePending(writer, marker);
     }
-    for (loaded.incidents) |incident| {
+    for (index.incidents.items) |incident| {
         if (incident.occurred_at_ms < cutoff_ms) continue;
         try writeIncident(writer, incident);
     }
@@ -805,56 +986,67 @@ fn validateEvent(event: usage_report.ProfileEvent) !void {
 }
 
 fn classifyEvent(
-    loaded: Loaded,
+    index: *const RecordIndex,
     event: usage_report.ProfileEvent,
 ) AppendDecision {
     return switch (event) {
-        .generation => |fact| classifyGeneration(loaded.facts, fact),
-        .pending => |marker| classifyPending(loaded.pending, marker),
-        .incident => |incident| for (loaded.incidents) |existing| {
-            if (existing.occurred_at_ms == incident.occurred_at_ms and
-                existing.completeness == incident.completeness)
-            {
-                break .{ .outcome = .duplicate, .write = false };
+        .generation => |fact| classifyGeneration(index, fact),
+        .pending => |marker| classifyPending(index, marker),
+        .incident => |incident| blk: {
+            if (index.incidents.items.len >= max_file_incidents) {
+                debug_trace.logf(
+                    "session",
+                    "usage profile incident dropped reason=cap limit={d}",
+                    .{max_file_incidents},
+                );
+                break :blk .{ .outcome = .duplicate, .write = false };
             }
-        } else .{ .outcome = .appended, .write = true },
+            for (index.incidents.items) |existing| {
+                if (existing.occurred_at_ms == incident.occurred_at_ms and
+                    existing.completeness == incident.completeness)
+                {
+                    break :blk .{ .outcome = .duplicate, .write = false };
+                }
+            }
+            break :blk .{ .outcome = .appended, .write = true };
+        },
     };
 }
 
 fn classifyGeneration(
-    facts: []const usage_report.GenerationFact,
+    index: *const RecordIndex,
     fact: usage_report.GenerationFact,
 ) AppendDecision {
-    var variants: usize = 0;
-    for (facts) |existing| {
-        if (!std.mem.eql(u8, existing.id, fact.id)) continue;
-        if (usage_report.GenerationFact.eql(existing, fact)) {
+    const indexes = index.fact_indexes.get(fact.id) orelse
+        return .{ .outcome = .appended, .write = true };
+    if (usage_report.GenerationFact.eql(index.facts.items[indexes.first], fact)) {
+        return .{ .outcome = .duplicate, .write = false };
+    }
+    if (indexes.second) |second| {
+        if (usage_report.GenerationFact.eql(index.facts.items[second], fact)) {
             return .{ .outcome = .duplicate, .write = false };
         }
-        variants += 1;
+        return .{ .outcome = .conflict, .write = false };
     }
-    return if (variants == 0)
-        .{ .outcome = .appended, .write = true }
-    else
-        .{ .outcome = .conflict, .write = variants < 2 };
+    return .{ .outcome = .conflict, .write = true };
 }
 
 fn classifyPending(
-    pending: []const usage_report.PendingMarker,
+    index: *const RecordIndex,
     marker: usage_report.PendingMarker,
 ) AppendDecision {
-    var variants: usize = 0;
-    for (pending) |existing| {
-        if (!std.mem.eql(u8, existing.id, marker.id)) continue;
-        if (usage_report.PendingMarker.eql(existing, marker)) {
+    const indexes = index.pending_indexes.get(marker.id) orelse
+        return .{ .outcome = .appended, .write = true };
+    if (usage_report.PendingMarker.eql(index.pending.items[indexes.first], marker)) {
+        return .{ .outcome = .duplicate, .write = false };
+    }
+    if (indexes.second) |second| {
+        if (usage_report.PendingMarker.eql(index.pending.items[second], marker)) {
             return .{ .outcome = .duplicate, .write = false };
         }
-        variants += 1;
+        return .{ .outcome = .conflict, .write = false };
     }
-    return if (variants == 0)
-        .{ .outcome = .appended, .write = true }
-    else
-        .{ .outcome = .conflict, .write = variants < 2 };
+    return .{ .outcome = .conflict, .write = true };
 }
 
 fn eventTimestamp(event: usage_report.ProfileEvent) i64 {
@@ -1483,6 +1675,7 @@ test "profile usage store decodes a large ledger with stable id indexing" {
 }
 
 test "profile usage compaction eligibility requires expired records" {
+    const alloc = std.testing.allocator;
     const now_ms = std.time.ms_per_day * 100;
     var recent_fact = usage_report.GenerationFact{
         .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
@@ -1502,44 +1695,90 @@ test "profile usage compaction eligibility requires expired records" {
         .incidents = &.{},
         .record_count = 2,
     };
-    try std.testing.expect(!hasExpiredRecords(loaded, now_ms));
+    var index = try testIndexFromLoaded(alloc, loaded);
+    defer index.deinit(alloc);
+    try std.testing.expect(!hasExpiredRecords(&index, now_ms));
     try std.testing.expect(!shouldCompactAfterAppend(
         compaction_threshold_bytes + 1,
-        loaded,
+        &index,
         recent_fact.created_at_ms,
         now_ms,
         false,
     ));
     try std.testing.expect(!shouldCompactBeforeAppend(
         max_file_bytes + 1,
-        loaded.record_count,
+        index.record_count,
         1,
-        loaded,
+        &index,
         now_ms,
     ));
-    loaded.facts[0].created_at_ms = now_ms - std.time.ms_per_day * 36;
-    try std.testing.expect(hasExpiredRecords(loaded, now_ms));
+    // A resolved pending marker alone must not trigger an after-append rewrite.
+    var resolved_marker = usage_report.PendingMarker{
+        .id = @constCast("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        .observed_at_ms = now_ms - 1000,
+    };
+    loaded.pending = (&resolved_marker)[0..1];
+    loaded.record_count += 1;
+    index.deinit(alloc);
+    index = try testIndexFromLoaded(alloc, loaded);
+    try std.testing.expect(!shouldCompactAfterAppend(
+        compaction_threshold_bytes + 1,
+        &index,
+        now_ms,
+        now_ms,
+        false,
+    ));
+    loaded.pending = &.{};
+    // Records age past retention continuously. One that only just crossed it
+    // can be reclaimed at capacity, but must not rewrite the ledger after
+    // every append.
+    loaded.facts[0].created_at_ms = now_ms - retention_ms - std.time.ms_per_hour;
+    index.deinit(alloc);
+    index = try testIndexFromLoaded(alloc, loaded);
+    try std.testing.expect(hasExpiredRecords(&index, now_ms));
+    try std.testing.expect(!shouldCompactAfterAppend(
+        compaction_threshold_bytes + 1,
+        &index,
+        now_ms,
+        now_ms,
+        false,
+    ));
+    loaded.facts[0].created_at_ms = now_ms - retention_ms - compaction_slack_ms - 1;
+    index.deinit(alloc);
+    index = try testIndexFromLoaded(alloc, loaded);
+    try std.testing.expect(hasExpiredRecords(&index, now_ms));
     try std.testing.expect(shouldCompactAfterAppend(
         compaction_threshold_bytes + 1,
-        loaded,
+        &index,
         now_ms - 1,
         now_ms,
         false,
     ));
     try std.testing.expect(shouldCompactBeforeAppend(
         max_file_bytes + 1,
-        loaded.record_count,
+        index.record_count,
         1,
-        loaded,
+        &index,
         now_ms,
     ));
     try std.testing.expect(shouldCompactBeforeAppend(
         0,
         max_records,
         1,
-        loaded,
+        &index,
         now_ms,
     ));
+}
+
+fn testIndexFromLoaded(alloc: Allocator, loaded: Loaded) !RecordIndex {
+    var index: RecordIndex = .{};
+    errdefer index.deinit(alloc);
+    index.coverage_started_at_ms = loaded.coverage_started_at_ms;
+    index.record_count = loaded.record_count;
+    for (loaded.facts) |fact| try absorbRecord(&index, alloc, .{ .generation = fact });
+    for (loaded.pending) |marker| try absorbRecord(&index, alloc, .{ .pending = marker });
+    for (loaded.incidents) |incident| try absorbRecord(&index, alloc, .{ .incident = incident });
+    return index;
 }
 
 test "profile usage record capacity is checked before append" {
@@ -1673,4 +1912,181 @@ test "profile usage store refuses a symlinked ledger leaf" {
     );
     defer alloc.free(outside_bytes);
     try std.testing.expectEqualStrings("outside", outside_bytes);
+}
+
+test "profile usage store merges foreign appends incrementally" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var first = try Store.initFromHome(alloc, home);
+    defer first.deinit(alloc);
+    var second = try Store.initFromHome(alloc, home);
+    defer second.deinit(alloc);
+
+    var fact_one = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer fact_one.deinit(alloc);
+    var fact_two = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW", 2000, 20);
+    defer fact_two.deinit(alloc);
+    var fact_three = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAX", 3000, 30);
+    defer fact_three.deinit(alloc);
+
+    try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_one));
+    try std.testing.expectEqual(AppendOutcome.appended, try second.appendFact(alloc, fact_two));
+    // The first store's index is stale here; the duplicate verdict must come
+    // from the incrementally absorbed tail.
+    try std.testing.expectEqual(AppendOutcome.duplicate, try first.appendFact(alloc, fact_one));
+    try std.testing.expectEqual(@as(usize, 1), first.index.?.incremental_absorbs);
+    try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_three));
+
+    var loaded = try first.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), loaded.facts.len);
+    var ids = std.StringHashMap(void).init(alloc);
+    defer ids.deinit();
+    for (loaded.facts) |fact| try ids.put(fact.id, {});
+    try std.testing.expect(ids.contains("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    try std.testing.expect(ids.contains("gen_01ARZ3NDEKTSV4RRFFQ69G5FAW"));
+    try std.testing.expect(ids.contains("gen_01ARZ3NDEKTSV4RRFFQ69G5FAX"));
+}
+
+test "profile usage index survives appends through allocators without a stable identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+
+    var fact = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer fact.deinit(alloc);
+    try std.testing.expectEqual(AppendOutcome.appended, try store.appendFact(alloc, fact));
+    // Only the resident index carries this value; a rebuild resets it.
+    store.index.?.incremental_absorbs = 7;
+
+    // `std.heap.c_allocator.ptr` is undefined, so release builds can hand
+    // the store a different pointer on every call.
+    var call_alloc = std.heap.c_allocator;
+    call_alloc.ptr = @ptrFromInt(0x1000);
+    try std.testing.expectEqual(AppendOutcome.duplicate, try store.appendFact(call_alloc, fact));
+    try std.testing.expectEqual(@as(usize, 7), store.index.?.incremental_absorbs);
+}
+
+test "abandoning the profile usage lock ends a wait on another holder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var holder = try Store.initFromHome(alloc, home);
+    defer holder.deinit(alloc);
+    var exiting = try Store.initFromHome(alloc, home);
+    defer exiting.deinit(alloc);
+
+    var first = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer first.deinit(alloc);
+    var second = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW", 2000, 20);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(AppendOutcome.appended, try holder.appendFact(alloc, first));
+
+    const Worker = struct {
+        store: *Store,
+        fact: usage_report.GenerationFact,
+        started: std.atomic.Value(bool) = .init(false),
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .seq_cst);
+            _ = self.store.appendFact(std.heap.c_allocator, self.fact) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+    var worker = Worker{ .store = &exiting, .fact = second };
+    {
+        var lock = try holder.acquireLock();
+        defer lock.release();
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        while (!worker.started.load(.seq_cst)) std.Thread.yield() catch {};
+        // Well inside the lock deadline, so only the abandon can end the wait.
+        io_mod.sleep(50 * std.time.ns_per_ms);
+        exiting.abandonLock();
+        thread.join();
+    }
+
+    try std.testing.expectEqual(@as(?anyerror, error.UsageLockAbandoned), worker.result);
+    var loaded = try holder.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
+}
+
+test "profile usage store caps incident records in the ledger file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+
+    var fact = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer fact.deinit(alloc);
+    try std.testing.expectEqual(AppendOutcome.appended, try store.appendFact(alloc, fact));
+
+    var appended: usize = 0;
+    for (0..max_file_incidents + 4) |i| {
+        const outcome = try store.appendEvent(alloc, .{ .incident = .{
+            .occurred_at_ms = @intCast(10_000 + i),
+            .completeness = .incomplete,
+        } });
+        if (outcome == .appended) appended += 1;
+    }
+    try std.testing.expectEqual(max_file_incidents, appended);
+
+    var loaded = try store.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(max_file_incidents, loaded.incidents.len);
+}
+
+test "profile usage store fully re-parses after a foreign replace fools the length check" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var first = try Store.initFromHome(alloc, home);
+    defer first.deinit(alloc);
+
+    var fact_one = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer fact_one.deinit(alloc);
+    var fact_two = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW", 2000, 20);
+    defer fact_two.deinit(alloc);
+
+    try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_one));
+    const absorbs_before = first.index.?.incremental_absorbs;
+
+    // A foreign process compacts and then appends, growing the file while
+    // replacing the bytes the resident index parsed.
+    var profile = try tmp.dir.openDir(io_mod.getIo(), ".fx", .{ .iterate = true });
+    defer profile.close(io_mod.getIo());
+    var contents: std.Io.Writer.Allocating = .init(alloc);
+    defer contents.deinit();
+    try writeCoverage(&contents.writer, 1);
+    try writeGeneration(&contents.writer, fact_two);
+    try writeGeneration(&contents.writer, fact_two);
+    var file = try profile.createFile(io_mod.getIo(), usage_file, .{
+        .permissions = private_file_permissions,
+        .truncate = true,
+    });
+    try file.writeStreamingAll(io_mod.getIo(), contents.written());
+    file.close(io_mod.getIo());
+
+    try std.testing.expectEqual(AppendOutcome.appended, try first.appendFact(alloc, fact_one));
+    try std.testing.expectEqual(absorbs_before, first.index.?.incremental_absorbs);
+
+    var loaded = try first.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), loaded.facts.len);
 }

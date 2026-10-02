@@ -11,13 +11,20 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-fx is a coding agent harness and CLI written in Zig, optimized for research and embeddability as part of larger systems.
+fx is a coding agent CLI written in Zig: a small native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
 
-It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and 7.8 MiB binary.
+## Highlights
 
-For end users, its CLI output style and form factor aim to be closer to a Unix shell than a heavy "IDE in the terminal" TUI.
+- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
+- **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
+- **Shell-like output:** inline rendering that preserves your terminal scrollback
+- **Extensible:** skills, MCP servers, and subagents
 
-It's open source (Apache-2.0), model-agnostic, and suitable for both local and cloud inference.
+<p>
+  <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
+  <a href="https://github.com/vercel-labs/fx/releases/latest"><img alt="fx CLI release" src="https://img.shields.io/github/v/release/vercel-labs/fx.svg?style=for-the-badge&amp;labelColor=000000&amp;label=release" height="28"></a>
+  <a href="https://github.com/vercel-labs/fx/blob/main/LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/vercel-labs/fx.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
+</p>
 
 ## Install
 
@@ -25,89 +32,122 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
 
-## Run fx
+## Get started
 
-Sign in with Vercel AI Gateway:
+Sign in with one of:
 
-```bash
-fx login
-```
+- `fx login`: Vercel AI Gateway
+- `fx login codex`: ChatGPT subscription (OpenAI Codex OAuth)
+- `fx login grok`: Grok subscription (xAI OAuth)
+- `fx setup`: AI Gateway API key
 
-Or use an eligible ChatGPT subscription through OpenAI Codex OAuth:
+fx loads Grok models from your subscription's live catalog, so new supported models appear without a static model list. Public xAI metadata enriches image support but does not filter subscription models.
 
-```bash
-fx login codex
-fx
-```
+Codex uses HTTP streaming by default. To require the experimental WebSocket transport, start fx with `FX_CODEX_TRANSPORT=websocket`. WebSocket sessions retain compatible connections and continuation state; concurrent requests use separate ordered lanes rather than sharing one response stream. Each session identity retains at most four lanes by default. Set `FX_CODEX_WEBSOCKET_MAX_LANES` to a positive integer to choose a different limit.
 
-Or use an eligible Grok subscription through xAI OAuth:
-
-```bash
-fx login grok
-fx
-```
-
-`fx login codex` and `fx login grok` select that provider and a model from its authenticated catalog. Inside fx, open `/setup` and choose **Model provider** to move between Gateway, Codex, and Grok. `/model` lists the active provider's fetched models. Subscription model IDs are the raw IDs returned by each authenticated catalog. Use `/logout codex` or `/logout grok` to remove that subscription session without affecting other providers; choosing it again from **Model provider** starts sign-in.
-
-The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
-
-Codex uses HTTP streaming by default. To require the WebSocket transport, start fx with `FX_CODEX_TRANSPORT=websocket`. WebSocket sessions retain compatible connections and continuation state; concurrent requests use separate ordered lanes rather than sharing one response stream. Each session identity retains at most four lanes by default. Set `FX_CODEX_WEBSOCKET_MAX_LANES` to a positive integer to choose a different limit.
-
-The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
-
-To use an AI Gateway API key instead:
-
-```bash
-fx setup
-```
-
-Run fx from a project:
+Then start the interactive shell from a project:
 
 ```bash
 cd your_project
 fx
 ```
 
-The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
-
-The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "workspace": true
-  }
-}
-```
-
-List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
-
-```bash
-fx session resume last
-fx session resume --id <id>
-```
-
-Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
-
-Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
-
-Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.
-
-Use `fx ask` for a single request:
+Or make a one-shot request:
 
 ```bash
 fx ask "explain the changes in this repository"
 ```
 
-With `--json`, `output` contains accumulated assistant Markdown across the request, while `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
+Inside the shell, run `/help` to browse interactive commands.
 
-Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
+In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
+fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
 
-fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow safety review based on the current user request and the exact pending action. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
+## Images
 
-JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow configured approval prompts when stdin is a TTY. Automatic safety review never opens that prompt. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.
+Paste an image, attach one with `fx ask --image PATH`, or ask fx to `read_file` a PNG, JPEG, GIF, or WebP. File-backed attachments retain the original image. Before each model request, it checks the complete image count and sends only images that fit: at most 8000 pixels per side with 20 or fewer images, or 2000 pixels per side with more than 20. The encoded per-image limit is 5 MiB.
 
-Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
+When a file-backed image cannot be sent, the model receives its source path and the reason. It can use an image tool already on your system, such as `sips` on macOS or `ffmpeg` on Linux, to save a smaller **new** file and read that copy. fx does not automatically install image tools or overwrite the original. If no usable file or tool is available, the model should ask you for a smaller copy or permission before installing software.
+
+## Documentation
+
+Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
+
+## Custom model connections
+
+Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, in `~/.fx/settings.json`, then select one for the profile or a single invocation:
+
+```bash
+fx provider local
+FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
+```
+
+See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
+
+## Ultrafast mode
+
+Ultrafast mode is off by default. It requests OpenAI's higher-cost Gateway service tier with `openai.serviceTier: "ultrafast"` for models whose Gateway metadata advertises Ultra eligibility. `ultrafast_requested` in `fx status --json` and `/status` reports the request, not a guarantee that a provider served the tier.
+
+Set a profile default in `~/.fx/settings.json`:
+
+```jsonc
+{
+  "provider": "gateway",
+  "models": { "gateway": "openai/gpt-6-astra" },
+  "ultrafast_mode": true
+}
+```
+
+Use it explicitly in an interactive session, a one-shot request, or ACP:
+
+```bash
+fx --ultrafast
+fx ask --ultrafast "review this change"
+fx acp --ultrafast
+```
+
+Use `/ultrafast on`, `/ultrafast off`, or `/ultrafast status` in the shell. The Settings menu includes an Ultra mode row. `FX_ULTRAFAST=1` and `--ultrafast` are process-local opt-ins and are not persisted. `FX_ULTRAFAST=0`, `--no-ultrafast`, and `/ultrafast off` explicitly disable it. A resumed session keeps its saved request unless a higher-precedence explicit disable applies.
+
+Ultra mode is available only through the Vercel AI Gateway's OpenAI service tier. Gateway metadata currently marks Astra eligible. fx does not select Ultra automatically, and switching models clears an existing Ultra request. Subagents inherit the parent turn's request; an explicit parent disable and capability checks override an existing child preference. Background side calls, including titles, reviews, and compaction, do not use Ultra mode.
+
+## Gateway provider routing
+
+When the active model goes through the Vercel AI Gateway, one model is often served by several providers (for example Anthropic directly, AWS Bedrock, or Google Vertex). fx can tell the gateway which providers to use, in what order:
+
+```jsonc
+// ~/.fx/settings.json
+{
+  "provider_order": ["bedrock", "anthropic"], // try Bedrock first, then Anthropic
+  "provider_strict": false                     // true restricts requests to only these providers
+}
+```
+
+Both keys also work in a committed project `.fx.json`, and per launch:
+
+```bash
+fx --provider-order azure,openai --provider-strict
+fx ask --provider-order bedrock "review this change"
+FX_PROVIDER_ORDER=vertex FX_PROVIDER_STRICT=1 fx
+```
+
+Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). An empty `provider_order` in a higher-precedence layer clears a list set by a lower one. Routing applies to gateway requests only; custom model connections ignore it.
+
+## Themes
+
+fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
+
+## Context compaction
+
+When a conversation fills the model's context, fx compacts it so the work can continue. The newest few turns stay unchanged. Every compacted turn keeps your messages and the assistant's final reply word for word. The conversation's own model adds a short note on what the assistant did in between, and a line for each tool call: fx writes what the call was from the call itself, like `shell zig build test (failed, exit 1, 3120 bytes)`, and the model adds why it was used and what it showed. The model also keeps numbered entries for your rules, quoted word for word, and for facts, decisions, status and open questions, plus a list of the skills and MCP tools used. Entries are never rewritten: a later entry can say it replaces an earlier one. At the next compaction, the one before it is saved whole with an ID like `L2`, and in its place the agent sees a short summary the model writes of all earlier compactions, plus their rules, status and open entries still in force, word for word. The turns of earlier compactions leave the agent's view however many compactions a session has; only those kept entries grow with it. In a session that is not saved, nothing can be stored, so earlier compactions stay in view. fx checks every new note and entry, and marks without removing one that names no source, quotes words you did not write, states a path, number, version or quoted text found in none of the compacted turns and tool calls, names an ID that does not exist, or calls a failed tool call a success; turns the model skipped, or a missing summary of earlier compactions, are asked for once more. Only when the compacted conversation would leave too little room to continue are its longest texts shortened to their start and end, each naming the saved turn that keeps it whole. Every compacted turn is saved word for word with an ID like `M3`, every tool call with its input and output as the model saw them, plus the handle of any full output saved separately, with an ID like `T12`, and every earlier compaction with an ID like `L2`. The agent can search them by text or open one by ID with `read_tool_result`; a search also says how many saved records hold all of its words, and which came first and last.
+
+Automatic compaction asks the model right after the conversation, exactly as the agent was about to send it and with the same settings, so the provider can reuse what it has cached. When that request does not fit or fails, and when you run `/compact` to compact now, fx writes the turns out in a separate request at the model's lowest reasoning; turns too large for one such request go oldest first, in as many requests as it takes. If a separate request fails or comes back empty on AI Gateway, fx retries it once with a model from another provider.
+
+Automatic compaction starts when a request reaches 80 percent of the model's usable input. Set `auto_compact_percent` in `~/.fx/settings.json` to any value from 10 to 80, or `FX_AUTO_COMPACT_PERCENT` for a single launch:
+
+```jsonc
+// ~/.fx/settings.json
+{ "auto_compact_percent": 60 }
+```
 
 ## Embed fx
 
@@ -119,15 +159,81 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
-The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
+ACP clients can keep their MCP tools loaded on every turn, steer a running turn, supply a session system prompt, serve MCP servers over the ACP connection, and choose each session's workspace. See [ACP embedding](CONTRIBUTING.md#acp-embedding).
 
-## Extend fx
+The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Inside fx, `/mcp add <name> <command> [args...]` saves a local server and `/mcp add --transport http <name> <url>` saves a remote Streamable HTTP server. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
+## Connect your Slack account
 
-## Documentation
+Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.
+The command saves Slack's MCP URL and the public fx Client ID to your profile,
+opens the fx.sh authorization flow, and connects Slack after you consent. Keep
+fx running while you authorize in a browser on the same computer. In an fx
+session, Slack's tools become available without a restart. The **Servers** tab
+in `/mcp` also offers **Add Slack** with the `s` key.
 
-Read the [fx documentation](https://fx.sh/docs).
+You don't need to edit `~/.fx/mcp.json` or run `fx slack install` to connect your
+personal account. Workspace app approval may still be required. fx reports
+`Slack connected. You can now use Slack.` after the connection succeeds.
+
+Running the command again uses an existing working connection or starts
+missing authorization. It restores a missing fx Client ID and preserves other
+servers, timeouts, and explicit scope overrides. A conflicting Slack endpoint,
+Client ID, or authentication configuration stops setup with guidance instead of
+being overwritten. Use `/mcp auth slack --open` to reauthorize an existing
+configuration. Removing and re-adding the fx preset restores its configuration;
+it does not revoke credentials. Use `/mcp logout slack` to sign out.
+
+## Slack workspace installation
+
+Run `fx slack install` to install the fx bot in the configured Vercel Slack
+workspace. Keep the command running and authorize Slack in a browser on the same
+computer. The HTTPS callback at fx.sh returns the authorization to the CLI;
+PKCE state and the verifier stay in memory. The companion web bridge must be
+deployed and configured first.
+
+After the CLI saves the installation, the browser returns to an fx.sh confirmation
+page. You can close that tab or refresh it after the command exits.
+
+`fx slack status --json` reports local installation metadata without tokens.
+Plain-text output omits Slack IDs and shows expiration as a readable UTC date
+and time. JSON output retains the IDs and Unix timestamps for scripts.
+`fx slack refresh` rotates the local bot credentials when needed. Credentials
+live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
+or background refresh service is created. An expired refresh token requires
+installation again. This workspace operation is separate from each employee's
+MCP user authorization. Employees connect their own account with
+`/mcp add slack` in an fx session (or `fx mcp add slack` from a terminal).
+For `https://mcp.slack.com/mcp`, the CLI recognizes the fx app by its public
+Client ID and uses the HTTPS callback for personal login. Changing that Client
+ID requires a CLI update. OAuth uses the canonical form of Slack's advertised
+resource, `https://mcp.slack.com/`, while the MCP transport remains at
+`https://mcp.slack.com/mcp`. First login and reauthorization request the full shared
+`user_scopes` list from fx.sh. If local `scopes` are configured, they must include
+every shared scope; extra local scopes are not requested. A narrower or explicitly
+empty list stops authorization before opening the browser, leaving the configuration
+and stored credentials unchanged. Remove the override only if you want to authorize
+the full shared scope set. Per-user read-only subsets are not supported for the fx app. Saved scopes,
+Slack's advertised capabilities, and scope challenges cannot expand this
+request. The shared list contains nine personal scopes configured for fx and
+advertised by Slack MCP; changing it requires a deliberate configuration update
+and any necessary Slack approval. This does not revoke
+permissions on previously issued tokens or change token refresh behavior. It
+opens an ephemeral loopback listener instead of the configured `callback_port`,
+keeps PKCE and personal tokens in the CLI, and shows “Slack connected” after
+saving to the existing MCP credential store. Other MCP providers and different
+Slack app Client IDs retain their direct callback behavior without contacting
+fx.sh. Fx app authorization requires fx.sh to be available; an unavailable
+metadata endpoint returns `SlackBridgeUnavailable`. Deploy the web
+personal-authorization routes and scope metadata before releasing this CLI.
+Missing or invalid shared scopes stop authorization rather than falling back
+to Slack's broader capabilities. Keep the registered
+localhost callback for older clients until they have upgraded. Slack workspace
+approval requirements still apply to personal authorization.
+
+Bot installation does not establish whether
+Slack will display a hoverable “Sent using @fx” attribution; that requires a
+live message test.
 
 ## Build from source
 
@@ -142,12 +248,13 @@ zig build -Doptimize=ReleaseSafe
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 
+## Security
+
+Report security vulnerabilities through the [contact page](https://fx.sh/contact) instead of a public issue.
+
 ## License
 
-[Apache-2.0](LICENSE)
-
-Third-party licenses and attributions are listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[Apache-2.0](LICENSE). Third-party licenses and attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Credits
 

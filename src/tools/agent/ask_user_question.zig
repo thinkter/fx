@@ -191,7 +191,7 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
 
 fn dupeTerminalSafeQuestionText(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     if (text_utils.isTerminalSafe(text)) return arena.dupe(u8, text);
-    const encoded = try text_utils.encodeTerminalSafe(arena, text, std.math.maxInt(usize));
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, text, std.math.maxInt(usize));
     return encoded.bytes;
 }
 
@@ -275,11 +275,11 @@ const TerminalSafeRequester = struct {
         const self: *TerminalSafeRequester = @ptrCast(@alignCast(raw_ctx.?));
         self.called = true;
         if (entries.len == 1 and
-            std.mem.eql(u8, entries[0].question, "Q\\x0a\\x1b[31m?") and
+            std.mem.eql(u8, entries[0].question, "Q \\x1b[31m?") and
             entries[0].options.len == 2 and
-            std.mem.eql(u8, entries[0].options[0].label, "Alpha\\x0aFake") and
+            std.mem.eql(u8, entries[0].options[0].label, "Alpha Fake") and
             entries[0].options[0].description != null and
-            std.mem.eql(u8, entries[0].options[0].description.?, "Desc\\x09Gap") and
+            std.mem.eql(u8, entries[0].options[0].description.?, "Desc Gap") and
             std.mem.eql(u8, entries[0].options[1].label, "\\x1b[31mRed\\x1b[0m"))
         {
             self.saw_terminal_safe = true;
@@ -350,7 +350,7 @@ test "ask_user_question normalizes descriptions and encodes ordered answers" {
     try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
 }
 
-test "ask_user_question encodes model-controlled prompt text for terminal display" {
+test "ask_user_question flattens model-controlled prompt text for terminal display" {
     const alloc = std.testing.allocator;
     var requester = TerminalSafeRequester{};
     const output = try executeWithRequester(
@@ -367,7 +367,7 @@ test "ask_user_question encodes model-controlled prompt text for terminal displa
     try std.testing.expect(requester.called);
     try std.testing.expect(requester.saw_terminal_safe);
     try std.testing.expectEqualStrings(
-        "[{\"question\":\"Q\\\\x0a\\\\x1b[31m?\",\"answer\":\"Alpha\\\\x0aFake\"}]",
+        "[{\"question\":\"Q \\\\x1b[31m?\",\"answer\":\"Alpha Fake\"}]",
         output,
     );
 }
@@ -424,6 +424,7 @@ test "ask_user_question noninteractive returns sentinel before parsing" {
     defer result.deinit(alloc);
 
     switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
         .success => |body| try std.testing.expectEqualStrings(not_available_sentinel, body),
         .failure => return error.TestExpectedEqual,
     }

@@ -2,13 +2,54 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const default_startup_timeout_ms: u32 = 10_000;
+pub const default_startup_timeout_ms: u32 = 30_000;
 pub const default_operation_timeout_ms: u32 = 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 
+test "MCP default startup timeout allows thirty-second cold starts" {
+    try std.testing.expectEqual(@as(u32, 30_000), default_startup_timeout_ms);
+}
+
+pub const max_profile_config_warning_key_bytes: usize = 128;
+
+pub const ProfileConfigWarningCause = enum {
+    ignored_mcp_servers_alias,
+    suspicious_server_key,
+    suspicious_key_scan_indeterminate,
+};
+
+pub const ProfileConfigWarning = struct {
+    cause: ProfileConfigWarningCause,
+    key_bytes: [max_profile_config_warning_key_bytes]u8 = undefined,
+    key_len: u16 = 0,
+    additional_matches: usize = 0,
+
+    pub fn init(
+        cause: ProfileConfigWarningCause,
+        key_value: ?[]const u8,
+        additional_matches: usize,
+    ) ProfileConfigWarning {
+        var result = ProfileConfigWarning{
+            .cause = cause,
+            .additional_matches = additional_matches,
+        };
+        if (key_value) |value| {
+            const len = @min(value.len, max_profile_config_warning_key_bytes);
+            @memcpy(result.key_bytes[0..len], value[0..len]);
+            result.key_len = @intCast(len);
+        }
+        return result;
+    }
+
+    pub fn key(self: *const ProfileConfigWarning) ?[]const u8 {
+        return if (self.key_len == 0) null else self.key_bytes[0..self.key_len];
+    }
+};
+
 pub const ProfileConfigDiagnostic = union(enum) {
     clear,
+    warning: ProfileConfigWarning,
     failed: anyerror,
 };
 
@@ -38,6 +79,8 @@ pub const McpAuthConfig = struct {
     client_secret_env: ?[]u8 = null,
     client_metadata_url: ?[]u8 = null,
     scopes: [][]u8 = &.{},
+    scopes_configured: bool = false,
+    callback_port: ?u16 = null,
 
     pub fn deinit(self: *McpAuthConfig, alloc: Allocator) void {
         if (self.resource) |value| alloc.free(value);
@@ -141,17 +184,36 @@ pub const McpTransport = enum { stdio, http, sse };
 pub const ConfigSource = enum {
     profile,
     acp,
+    workspace,
 };
 
 pub const ConfigScope = enum {
     profile,
     acp_session,
+    workspace,
 };
 
 pub fn sourceAllowsScope(source: ConfigSource, scope: ConfigScope) bool {
     return switch (source) {
         .profile => scope == .profile,
         .acp => scope == .acp_session,
+        .workspace => scope == .workspace,
+    };
+}
+
+pub const WorkspaceAdmission = enum {
+    pending,
+    approved,
+    rejected,
+};
+
+pub fn sourceAllowsWorkspaceAdmission(
+    source: ConfigSource,
+    admission: ?WorkspaceAdmission,
+) bool {
+    return switch (source) {
+        .workspace => admission != null,
+        .profile, .acp => admission == null,
     };
 }
 
@@ -173,9 +235,18 @@ pub const McpServerConfig = struct {
     source: ConfigSource = .profile,
     scope: ConfigScope = .profile,
     required: bool = false,
+    /// Advertise this server's tool schemas on every model turn instead of
+    /// loading them on demand through capability search.
+    always_loaded: bool = false,
+    /// Host-issued registration for a server the host serves over its own
+    /// connection. Such a server speaks modern MCP through the runtime's
+    /// message carrier; `url` is only a placeholder.
+    acp_server_id: ?[]const u8 = null,
     transport: McpTransport = .stdio,
     command: ?[]const u8 = null,
     args: []const []const u8 = &.{},
+    /// Working directory for a stdio server; null inherits fx's own.
+    cwd: ?[]const u8 = null,
     url: ?[]const u8 = null,
     env: []McpEnvVar = &.{},
     headers: []McpHttpHeader = &.{},
@@ -184,6 +255,7 @@ pub const McpServerConfig = struct {
     auth: ?McpAuthConfig = null,
     allow_stored_credentials: bool = false,
     enabled: bool = true,
+    workspace_admission: ?WorkspaceAdmission = null,
     startup_timeout_ms: u32 = default_startup_timeout_ms,
     operation_timeout_ms: u32 = default_operation_timeout_ms,
     restart_limit: u8 = default_restart_limit,
@@ -206,7 +278,9 @@ pub const McpServerConfig = struct {
         alloc.free(self.name);
         if (self.command) |command| alloc.free(command);
         freeOwnedStrings(alloc, self.args);
+        if (self.cwd) |cwd| alloc.free(cwd);
         if (self.url) |url| alloc.free(url);
+        if (self.acp_server_id) |server_id| alloc.free(server_id);
         freeEnvVars(alloc, self.env);
         freeHttpHeaders(alloc, self.headers);
         freeHttpHeaderEnv(alloc, self.header_env);
@@ -240,6 +314,21 @@ test "MCP server configuration exposes only the active transport target" {
     try std.testing.expectError(error.McpInvalidServerConfig, empty_remote.remoteUrl());
 }
 
+test "profile config warning owns a bounded key inline" {
+    const warning = ProfileConfigWarning.init(
+        .suspicious_server_key,
+        "MCP-Servers",
+        2,
+    );
+    try std.testing.expectEqualStrings("MCP-Servers", warning.key().?);
+    try std.testing.expectEqual(@as(usize, 2), warning.additional_matches);
+    try std.testing.expect(ProfileConfigWarning.init(
+        .suspicious_key_scan_indeterminate,
+        null,
+        0,
+    ).key() == null);
+}
+
 test "MCP server configuration deinit owns present empty targets" {
     const alloc = std.testing.allocator;
     var config: McpServerConfig = .{
@@ -251,10 +340,28 @@ test "MCP server configuration deinit owns present empty targets" {
 }
 
 test "MCP configuration sources admit only their product scope" {
-    try std.testing.expect(sourceAllowsScope(.profile, .profile));
-    try std.testing.expect(sourceAllowsScope(.acp, .acp_session));
-    try std.testing.expect(!sourceAllowsScope(.profile, .acp_session));
-    try std.testing.expect(!sourceAllowsScope(.acp, .profile));
+    for ([_]ConfigSource{ .profile, .acp, .workspace }) |source| {
+        for ([_]ConfigScope{ .profile, .acp_session, .workspace }) |scope| {
+            const expected = switch (source) {
+                .profile => scope == .profile,
+                .acp => scope == .acp_session,
+                .workspace => scope == .workspace,
+            };
+            try std.testing.expectEqual(expected, sourceAllowsScope(source, scope));
+        }
+    }
+}
+
+test "workspace admission is present exactly for workspace source" {
+    for ([_]ConfigSource{ .profile, .acp, .workspace }) |source| {
+        for ([_]?WorkspaceAdmission{ null, .pending, .approved, .rejected }) |admission| {
+            const expected = if (source == .workspace) admission != null else admission == null;
+            try std.testing.expectEqual(
+                expected,
+                sourceAllowsWorkspaceAdmission(source, admission),
+            );
+        }
+    }
 }
 
 pub fn freeOwnedStrings(alloc: Allocator, values: []const []const u8) void {

@@ -24,7 +24,7 @@ Requirements:
 
 * interactive terminal for manual shell testing
 
-* a Vercel OAuth session via `fx login` for model-backed flows. macOS Keychain API keys (via `fx setup`), `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
+* a model connection for model-backed flows. [Custom model connections](README.md#custom-model-connections) support local and remote endpoints. Vercel OAuth via `fx login`, macOS Keychain API keys via `fx setup`, `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
 
 Common commands:
 
@@ -39,7 +39,7 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting, the public-surface audit, and the compactor boundary check run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
 
 Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
@@ -72,6 +72,8 @@ Every PR must carry exactly one label that describes its primary intent:
 * `type: security`: fixes or hardens a security boundary
 
 If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
+
+If an AI coding agent writes any of your contribution's prose, including the PR title and description, commit messages, documentation, and issues, it must use the `technical-writer` skill in `.fx/skills/technical-writer/`.
 
 ## Repo Shape
 
@@ -119,13 +121,15 @@ duplicate, stale, and unclassified files without running the full PGSO gate.
 
 Config precedence (highest wins):
 
-1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
+1. Environment variables such as `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
 2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
 3. `~/.fx/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `auto_compact_percent`, `update_channel`, `permission_mode`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+
+`skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.
 
 Runtime state lives under `~/.fx/`:
 
@@ -139,7 +143,7 @@ Runtime state lives under `~/.fx/`:
 
 Sessions are global and portable across workspaces. Each session tracks a `workspace_root` that updates when resumed from a different directory.
 
-Subagent children are ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and their own history. The `subagent/` directory is per session on both sides of the relationship: a parent records create-operation identities there, and a child records its own control state there.
+Subagent children are internal ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and history. The parent owns one bounded `subagent/children.json` registry; each child carries only an immutable owner marker. Child sessions are hidden from ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child for that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
 
 ## Skills
 
@@ -155,31 +159,84 @@ There are two distinct skill categories in `fx`:
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
 
+## Slack installation testing
+
+`src/core/slack/install.zig` owns workspace bot installation, local credential
+persistence, and explicit refresh. The web bridge contract is fixed to
+`https://fx.sh/api/slack/install/config`, `/api/slack/install`, and
+`/api/slack/oauth/callback`. Employee MCP authentication is separate.
+
+Build with `zig build`, then run `cd tests/e2e && bun test slack-install.test.ts`.
+The fixture exercises the freshly built binary and real loopback sockets without
+live Slack credentials. `FX_E2E_SLACK_ORIGIN` accepts only an HTTP `127.0.0.1`
+origin with a non-privileged port, serving public metadata plus mocked
+`/api/oauth.v2.access` and `/api/auth.test` responses. Production uses pinned
+Slack endpoints. Local records bind to the bridge origin to prevent fixture
+commands from refreshing production credentials. `FX_NO_OPEN_BROWSER=1` prints
+the start URL for headless operation; authorization still requires a browser on
+the same computer as the listener.
+
+This E2E owner is verification-only in the PGSO corpus because it covers a rare
+workspace setup operation and security boundaries. Live Slack authorization and
+message attribution are not deterministic tests.
+
 ## MCP
 
-fx negotiates MCP `2026-07-28` over local stdio and stateless Streamable HTTP.
-Version-scoped adapters retain legacy stdio,
-`2025-11-25`/`2025-06-18`/`2025-03-26` Streamable HTTP, and deprecated
-`2024-11-05` HTTP+SSE. Native sessions load runnable MCP configuration only
-from the trusted profile:
+Native fx connections use MCP v1 initialization by default over stdio,
+Streamable HTTP, and deprecated `2024-11-05` HTTP+SSE. Servers using the newer
+`2026-07-28` discovery lifecycle opt in with
+`FX_MCP_PROTOCOL_VERSION=2026-07-28` in their configured `environment` map.
+The SDK's host-owned client controls its own protocol negotiation. Native
+sessions load trusted MCP configuration from the profile:
 
 * `~/.fx/mcp.json`
 
+They also read Claude-compatible workspace configuration from:
+
+* `<workspace>/.mcp.json`
+
 Project `.fx.json` does not define runnable MCP commands, URLs, env, or secrets.
+The profile file reads top-level `mcp` and accepts `mcpServers` as a
+compatibility alias; `mcp` wins when both exist, and every write uses `mcp`.
+Suspicious server-like unsupported keys produce a bounded warning and block
+profile mutation instead of being overwritten. The workspace file reads only
+top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
+bounded no-follow regular file. Profile entries win native name collisions;
+ACP request entries win ACP name collisions without deduplicating the request
+array. Workspace entries are always optional and never load stored credentials.
+Approved workspace `command`, `args`, `env`, and HTTP header values expand
+`${VAR}` and `${VAR:-default}` from the fx process environment. Pending and
+rejected entries do not read environment values. Missing required variables
+leave an approved server unloaded and appear in the `/mcp` and `/mcp list`
+menu without exposing values.
+
+Interactive sessions keep pending workspace servers disconnected and request
+project trust before any project-defined process or network effect. Pending
+resource, prompt, completion, and authentication commands require explicit
+`/mcp trust approve <name>` and a retry. Rejected servers remain disconnected.
+Choices live only in profile `settings.json` under the canonical workspace key,
+using `enabledMcpjsonServers`, `disabledMcpjsonServers`, and
+`enableAllProjectMcpServers`. Repository files cannot persist their own
+approval. `fx ask` and ACP skip pending workspace servers. Noninteractive users
+approve them first with `fx mcp trust approve <name>`; rejected servers remain
+disabled.
 
 The core feature surface is Tools, Resources and Resource Templates, Prompts,
 Completion, pagination, cache-aware discovery, subscriptions, progress,
 cancellation, and form or URL elicitation. Keep modern and legacy protocol
 behavior in their existing version-scoped modules.
 
-Tool schemas without `$schema` use JSON Schema 2020-12. fx also accepts the
-canonical 2020-12 declaration and the canonical Draft 7 declaration used by
-legacy SDKs, evaluates each with dialect-specific semantics, and rejects other
-dialects or references that would require network fetching before publication.
+fx bounds schema size and structure before publication. It accepts schemas
+without `$schema`, the canonical JSON Schema 2020-12 declaration, and the
+canonical Draft 7 declaration used by legacy SDKs; other declared dialects are
+rejected. fx does not resolve network references or evaluate semantic schema
+assertions. Servers validate their tool arguments and results.
 
 The interactive surface supports:
 
-* `/mcp list`
+* `/mcp`
+
+* `/mcp list` (opens the same server menu)
 
 * `/mcp resource list <server>`
 
@@ -207,26 +264,103 @@ The interactive surface supports:
 
 * `/mcp logout <name>`
 
+* `/mcp trust approve <name>`
+
+* `/mcp trust reject <name>`
+
+* `/mcp trust approve-all`
+
+* `/mcp trust reset`
+
 * `/mcp path`
 
+The noninteractive MCP surface supports:
+
+* `fx mcp add <name> <command> [args...]`
+
+* `fx mcp add --transport http <name> <url>`
+
+* `fx mcp auth <name>`
+
+* `fx mcp list`
+
+* `fx mcp logout <name>`
+
+* `fx mcp path`
+
+* `fx mcp remove <name>`
+
+* `fx mcp trust approve <name>`
+
+* `fx mcp trust reject <name>`
+
+* `fx mcp trust approve-all`
+
+* `fx mcp trust reset`
+
 The local form saves a stdio command. The HTTP form saves a remote Streamable
-HTTP endpoint. Both update `~/.fx/mcp.json` and evaluate the replacement MCP
-runtime immediately.
+HTTP endpoint. List reads effective profile and workspace configuration plus
+stored authentication state without connecting servers. Path prints the profile
+configuration path. Remove uses the same locked canonical profile writer as
+add. Trust updates the canonical workspace entry in profile settings. Auth and
+logout run the existing remote credential lifecycle. None of these commands
+constructs the TUI or contacts the Gateway.
+
+The default MCP startup timeout is 30 seconds and remains overridable per
+server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
+without `--cidfile` receive a private cidfile so fx can remove the container
+after shutdown or startup failure. An explicit cidfile remains user-owned.
+
+When a stdio server closes its connection before answering `initialize`, for
+example because its process exited, the reported failure names the exit code
+or signal and includes a bounded, terminal-safe excerpt of the server's stderr
+with secrets masked. A startup timeout names the limit that ran out, plus an
+earlier launch's exit when there was one, and names the `startup_timeout_ms`
+key when that setting set the limit. When a server writes a stdout line that
+is not an MCP message, such as a banner, the failure quotes the start of that
+line. A startup restart runs only when it could change the outcome: a server
+that closed its connection at every offered protocol version is not
+restarted, and neither is one whose startup deadline has already passed. A
+server that fx stopped because of invalid output still gets its restart. The
+model sees the same reason when it searches a named server that is down, or
+when a tool call finds its server stopped and the relaunch fails.
+
+MongoDB Atlas Managed MCP configuration service accounts use the OAuth
+client-credentials grant. fx does not implement that grant directly. Use
+MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited
+`MDB_MCP_API_CLIENT_ID` and `MDB_MCP_API_CLIENT_SECRET` environment variables.
+The Atlas App Connection browser flow is user-delegated access and must not be
+treated as equivalent to configuration service-account credentials.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and
 private-cache identity changes invalidate prior private state. macOS persists
 OAuth credentials in Keychain and migrates the private profile credential file
-only after verified publication. Other platforms use the `0600` credential file
+only after verified publication. If the user account has no default Keychain,
+macOS falls back to the same `0600` credential file used on other platforms
 under the `0700` profile directory. `FX_DISABLE_KEYCHAIN=1` selects that portable
 backend explicitly for deterministic tests and local troubleshooting.
 
 Servers are optional by default. Required startup failures block the first TUI
 or `fx ask` model request; optional failures publish a reduced, degraded
-capability set. One-shot `fx ask` starts required servers before its first model
-request and defers optional servers until the turn first performs an MCP
-operation or delegates MCP capability to a child. `/mcp list` renders a bounded,
-secret-free health snapshot.
+capability set. Terminal `fx ask` completes admitted MCP discovery before its
+first model request. JSON and other headless asks start required servers first
+and defer optional servers until the turn performs an MCP operation or delegates
+MCP capability to a child. Server-filtered searches, selected tools, and feature
+operations activate only their target; a broad search activates the broader
+catalog. Each server owns its startup and recovery progress. Connection deadlines
+cover discovery, fallback, and restarts together. Interactive authentication and
+logout change only the affected connection. `/mcp` and `/mcp list` open the same
+bounded, secret-free menu, which refreshes its live health snapshot while open.
+Noninteractive `fx mcp list` renders the health snapshot to stdout.
+
+Search and explicit selection share bounded schema publication. Definitions are
+checked against their runtime, connection, catalog, and credential generations
+before execution. Tool argument JSON must be bounded and object-shaped; semantic
+schema assertions belong to the server. Image results use the shared tool-result,
+provider, and versioned history paths. Saved native images use managed result
+artifacts that `read_tool_result` can load without repeating the original tool.
+
 `/mcp reload` evaluates a replacement before publication, so invalid config or
 a required-server failure leaves the prior runtime callable.
 
@@ -235,11 +369,72 @@ persistent subagents receive an immutable, permission-filtered view of the
 parent or ACP session's admitted MCP tools, resources, prompts, and completion
 capability. Missing, revoked, stale, or closed authority fails before transport.
 
+ACP clients can also serve an MCP server over the ACP connection itself, as
+described in the MCP-over-ACP RFD, by declaring
+`{"type":"acp","name":"...","serverId":"..."}` in `mcpServers`. fx advertises
+`mcpCapabilities.acp` and sends each modern MCP request as an `mcp/message`
+request with a fresh logical `requestId`; the client answers with a `result` or
+`error` carrier, and timeouts or cancellation send `$/cancel_request`. These
+servers connect from the prompt worker at the start of the first turn, because
+discovery waits for replies that only the connection reader delivers, so a
+server that fails to connect appears in the model's server catalog instead of
+failing session setup. Request-scoped `mcp/message` notifications such as
+progress are not delivered to operations yet.
+
+## ACP Embedding
+
+`fx acp` extends ACP v1 for clients that embed it. Extensions are read and
+written under `_meta.fx`. Start the server with `fx acp --ultrafast` or
+`fx acp --no-ultrafast` to set a process-local default request for sessions
+created by that server; the request still requires a model that advertises
+Ultra eligibility.
+
+* **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
+  are advertised on every turn within the `mcp_selected_schema_bytes` budget.
+  Set `_meta.fx.alwaysLoaded` to `false` on a server entry to load it on demand
+  instead. A model call naming a live MCP tool that is not loaded is loaded and
+  admitted through the normal MCP permission path instead of failing.
+* **Steering:** a `session/prompt` with `_meta.fx.steer` set to `true` while a
+  turn runs joins that turn at its next safe boundary and is replayed as a
+  `user_message_chunk` whose `_meta.fx.steering.requestId` names the request.
+  Its response arrives when that turn ends, with the turn's `stopReason` and
+  `_meta.fx.steering` set to `absorbed`. Steering queued when a turn is
+  cancelled answers `cancelled` with `dropped`; steering that a turn ended
+  without reading returns an error so the client can send it again. Without the
+  opt-in, a second prompt keeps the `Prompt already in progress` error.
+  `session/load` replays absorbed steering in place with a null `requestId`.
+  `initialize` reports support in `agentCapabilities._meta.fx.steering`.
+* **Client system prompt:** `session/new` accepts `systemPrompt` text blocks in
+  `append` mode, as proposed in the client system prompt RFD, and `initialize`
+  advertises `sessionCapabilities.systemPrompt`. `_meta.fx.systemPrompt`
+  accepts the same blocks for SDKs that drop unknown fields. The prompt follows
+  fx's own instructions in the system slot, is stored with the session, and is
+  restored on `session/load` and `session/resume`. Set `_meta.fx.terminal` to
+  `false` on `initialize` when fx is not presented in a terminal; fx then drops
+  its terminal identity and rendering guidance.
+* **Tool call metadata:** each `tool_call` update carries
+  `_meta.fx.toolCall.internal`, which is true for fx's own discovery and
+  bookkeeping steps such as `capability_search`, `mcp_select_tool`, and
+  `read_tool_result`. MCP tool calls add `mcp.server` and `mcp.tool` and use
+  the server's tool title, falling back to the tool's own name. `session/load`
+  replays the same metadata, including for servers that reconnect only on the
+  next turn.
+* **Session workspace:** an absolute `cwd` on `session/new`, `session/load`,
+  or `session/resume` becomes that session's workspace for file access, shell
+  commands, project instructions, project skills, project MCP servers, and the
+  session record. Model, provider, credentials, and permission policy stay as
+  resolved at `initialize` from the launch directory. A client without a
+  project can pass an empty directory it owns.
+* **Profile MCP servers:** ACP sessions use only client-supplied and approved
+  project servers. Set `_meta.fx.profileMcpServers` to `true` on a session
+  request to add the user's `~/.fx/mcp.json` servers. Request entries win name
+  collisions, and profile entries win over project entries.
+
 ## Permissions and Auto Mode
 
 Security is permission-first.
 
-* `permission_mode` controls baseline behavior (`ask`, `auto`, or `yolo`)
+* `permission_mode` controls baseline behavior (`ask`, `auto`, or `full-access`; `yolo` remains an alias)
 
 * `permission` config applies OpenCode-style wildcard rules
 
@@ -251,13 +446,17 @@ Security is permission-first.
 
 * routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
 
-* every unresolved `auto` action receives one narrow safety review after configured policy, saved-session rules, grants, and deterministic safe authority; review input contains the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
+* every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and other static root tools omit task text. Reviewed commands, shell input, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority. Shell input reviews also include the owned receiving session's launch command, working directory, and bounded current screen after verifying session authority, including on resume. The launch command describes startup only; screen content remains untrusted evidence and input still receives its own review
 
-* a `clear` review authorizes only the exact unchanged action; a `caution` or unavailable review holds only that action and returns advice without opening a human permission screen, disabling tools, or ending the turn
+* the reviewer returns `caution` only for concrete prompt injection or malicious activity; destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action; a `caution`, incomplete-evidence result, or unavailable review holds only that action and returns guidance without opening a human permission screen, disabling tools, or ending the turn
 
-* exact cautions are cached only for the current turn; changed actions receive a new review, unavailable reviews are not cached as security judgments, and legacy `permission_request_id` input is rejected without prompting
+* exact cautions and deterministic incomplete-evidence results are cached only for the current turn; an unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn and changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the current attempt's deadline. A transport timeout, transient transport failure, or failed transport call is retried once with a fresh 30-second deadline; permanent transport failures, valid cautions, and cancellation are never retried. Legacy `permission_request_id` input is rejected without prompting
 
-* the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
+* host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations and handling instructions as document or test data are not standalone proof of prompt injection
+
+* execution-memory schema 10 preserves review-feedback provenance while reading older schemas with an unmarked default. Conversation records use optional metadata for marked holds. Older builds may reject the new saved metadata or recovery checkpoints; do not downgrade an active session without preserving its files
+
+* the sandbox backend is configured independently; full access uses an effective backend of `none` without rewriting the saved sandbox setting
 
 Do not add new sensitive tool behavior without integrating it into `src/core/permissions/permissions.zig`.
 
@@ -305,10 +504,15 @@ test("my scenario", async () => {
 
 ### Tape-based test (replay a real capture)
 
-For bugs reported by a user, have them run fx with `FX_RECORD=<path>`. Drop the tape in `tests/e2e/tapes/<name>.fxtape` and assert against `fx replay --golden`:
+For bugs reported by a user, have them run the built binary with an exact
+`FX_RECORD=<path>`, or use `FX_DEBUG_RECORD=1` for an automatic private tape.
+`FX_DEBUG_RECORD_SILENT_BANNER=1` hides the developer-only startup notice from
+the inline transcript without disabling capture; Ctrl+O still shows it. Drop
+the tape in `tests/e2e/tapes/<name>.fxtape` and assert against the built replay
+command:
 
 ```bash
-fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
+./zig-out/bin/fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
 ```
 
 Check in the golden file and wire a regression test that re-runs `fx replay` in CI and diffs.
@@ -325,7 +529,7 @@ Check in the golden file and wire a regression test that re-runs `fx replay` in 
 
 * Do not commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`
 
-* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the five exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, catalog menus, the ctrl+x subagent manager, and the hosted child-terminal takeover. The terminal-session owner is entered only from the manager after `TerminalHost` grants the human write lease, has no permanent fx chrome, and must release the lease on detach. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
+* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the three exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, and catalog menus. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
 
 ## Releases
 
@@ -342,6 +546,27 @@ After CI passes for a push to `main`, the dev release workflow publishes commit-
 Release notes are public product copy. Describe user-visible behavior, always spell the product `fx`, and omit contributor attribution, tracker references, repository or website work, delivery infrastructure, CI and test details, branch history, and implementation-only refactors. Use commits and pull requests as research evidence only. Changelog formatting and release-marker rules live in `AGENTS.md`.
 
 Do not create tags manually. The workflow owns tag creation.
+
+### Validate release artifacts without publishing
+
+Run **Actions > Release** on `main` with `validate_only` enabled. This builds
+all four release targets, runs macOS arm64 PGSO qualification, and uses the
+existing `apple-signing` approval to notarize both macOS targets. It does not
+create a tag, publish a GitHub Release, upload to the CDN, or change a channel.
+
+The arm64 validation retains both 4 KiB and 16 KiB signature variants of the
+same PGSO payload for comparison. Intel retains 4 KiB signatures. Download the
+workflow artifacts for matched signed-binary performance checks; notarization
+and smoke checks alone do not establish performance equivalence. Normal release
+runs keep the existing signing default.
+
+To compare the retained signatures on an isolated runner, run **Actions >
+Benchmarks** with `signed_run` set to the successful main validation run ID.
+This mode downloads already-notarized binaries and does not access Apple
+credentials. It records two alternating startup cohorts, an identical-control
+status calibration, and a separate native image-flow memory screen. Review the
+retained measurements before changing release signing defaults; successful
+measurement is not performance approval.
 
 ## Benchmarks
 
@@ -378,6 +603,40 @@ brew install hyperfine             # macOS (one-time)
 CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
+
+`FX_BENCH` exits before the interactive shell starts, so it does not measure
+the time to the first frame. `benchmarks/first_frame.py` does: it launches fx
+on a pseudo-terminal, answers terminal queries like a fast emulator, and
+reports first byte, first frame, exit latency, CPU time, and peak RSS. Pass
+several binaries to compare them under the same machine load:
+
+```bash
+python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin/fx
+python3 benchmarks/first_frame.py --isolated-home --cwd /tmp   # empty profile
+```
+
+By default it uses your own HOME and working directory, which is what users
+feel. It disables auto-upgrade for the measured processes and fails if a
+binary changes during the run. Add `--no-background-reply` to act like a
+terminal that ignores the background color query.
+
+The libfx runtime job measures cold startup, warm prompts, host-tool calls,
+stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
+Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
+native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
+The Node comparison is report-only because Node's bundled fetch client and
+Pi's dispatcher have different warm-request overhead. Both runtimes still
+require valid measurements, 300 samples, and exactly one inference request per
+prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
+Live model latency and bulk-stream throughput remain informational.
+
+```sh
+zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
+node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
+```
+
+Build the SDK artifacts and install the pinned Pi package first, as shown in
+`.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
 
 ## Before Marking a PR Ready
 

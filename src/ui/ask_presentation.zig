@@ -5,6 +5,7 @@ const types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
 const render_engine = @import("render_engine.zig");
 const render_request = @import("render_request.zig");
+const shared_theme = @import("../core/shared/theme.zig");
 const shell_runtime = @import("shell_runtime.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
@@ -398,16 +399,31 @@ fn probeTerminal(
     no_color: bool,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
-    const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
-    ui_render.initTheme(fallback_light, null);
+    // A light/dark pin was applied before presentation setup; leave it alone.
+    const theme_locked = ui_render.themeInputLocked();
+    if (!theme_locked) {
+        const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
+        ui_render.initTheme(fallback_light, null);
+    }
     if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
     terminal.captureOriginalTermios() catch return fallback;
     terminal.enableRawMode() catch return fallback;
     defer terminal.disableRawMode();
 
-    if (!no_color) {
+    if (!no_color and !theme_locked) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
-        ui_render.initTheme(theme.light, theme.rgb);
+        if (shared_theme.sourceName()) |name| {
+            // Custom themes resolve after detection picks the variant, same
+            // rule as the interactive shell.
+            const custom = shared_theme.resolveNamed(std.heap.c_allocator, name, theme.light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch null;
+            if (custom) |resolved| {
+                ui_render.applyTheme(resolved, theme.rgb);
+            } else {
+                ui_render.initTheme(theme.light, theme.rgb);
+            }
+        } else {
+            ui_render.initTheme(theme.light, theme.rgb);
+        }
     }
     return terminal.queryCursorPosition() catch fallback;
 }

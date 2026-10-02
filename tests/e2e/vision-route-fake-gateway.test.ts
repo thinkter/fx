@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -18,11 +20,13 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { jpegHeader, solidPng } from "./fixtures/image-encoding";
+import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
+const KIMI_MODEL = "moonshotai/kimi-k3";
 const IMAGE_PATH = join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png");
 
 type CapturedRequest = {
@@ -115,10 +119,13 @@ function filePartCount(body: string) {
 
 function nativeFileParts(body: string) {
   return promptParts(body).filter(
-    (part): part is Record<string, unknown> & { data: string; mediaType: string } =>
+    (part): part is Record<string, unknown> & { data: { type: string; data: string }; mediaType: string } =>
       part.type === "file" &&
-      typeof part.data === "string" &&
-      typeof part.mediaType === "string",
+      typeof part.mediaType === "string" &&
+      typeof part.data === "object" &&
+      part.data !== null &&
+      (part.data as { type?: unknown }).type === "data" &&
+      typeof (part.data as { data?: unknown }).data === "string",
   );
 }
 
@@ -201,6 +208,7 @@ function expectVisionResponseFormat(body: string, imageCount: number) {
 function startImageGateway(
   responses: Response[],
   onChatRequest?: (index: number, body: string) => void,
+  catalogResponse?: Response,
 ) {
   const chatRequests: CapturedRequest[] = [];
   let catalogRequests = 0;
@@ -210,10 +218,16 @@ function startImageGateway(
       const url = new URL(req.url);
       if (url.pathname === "/coding-agent/v1/models") {
         catalogRequests += 1;
+        if (catalogResponse) return catalogResponse.clone();
         return Response.json({
           data: [
             {
               id: GEMINI_MODEL,
+              type: "language",
+              tags: ["vision", "file-input", "tool-use"],
+            },
+            {
+              id: KIMI_MODEL,
               type: "language",
               tags: ["vision", "file-input", "tool-use"],
             },
@@ -227,6 +241,7 @@ function startImageGateway(
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       chatRequests.push({ body, headers: req.headers });
       onChatRequest?.(chatRequests.length - 1, body);
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
@@ -235,7 +250,7 @@ function startImageGateway(
 
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     chatRequests,
     get catalogRequests() {
       return catalogRequests;
@@ -494,7 +509,7 @@ async function expectChangedCanonicalVisionPathFailure(
 }
 
 function parseFxJson(result: Awaited<ReturnType<typeof runFx>>) {
-  expect(result.code).toBe(0);
+  expect(result.code, result.stdout + result.stderr).toBe(0);
   return JSON.parse(result.stdout.trim()) as {
     output: string;
     exit_code: number;
@@ -973,6 +988,7 @@ describe("Vision route fake Gateway", () => {
       writeFileSync(forbiddenPath, forbiddenContents);
       const gateway = startImageGateway([
         sseToolCall("read_file", { path: forbiddenPath }, "read_before_vision"),
+        sseToolCall("read_file", [], "non_object_before_vision"),
         sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "vision_after_rejection"),
         sseText(VISION_RESULT),
         sseText("Recovered after required Vision rejection"),
@@ -1000,7 +1016,7 @@ describe("Vision route fake Gateway", () => {
         expect(json.output).toContain("Recovered after required Vision rejection");
         expect(json.tool_calls).toContainEqual({ name: "read_file", status: "error" });
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(gateway.chatRequests).toHaveLength(4);
+        expect(gateway.chatRequests).toHaveLength(5);
         expect(gateway.chatRequests[0].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[1].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[1].body).toContain("read_before_vision");
@@ -1008,10 +1024,14 @@ describe("Vision route fake Gateway", () => {
           "Only Vision can be called while attached images are pending.",
         );
         expect(gateway.chatRequests[1].body).not.toContain(forbiddenContents);
-        expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(filePartCount(gateway.chatRequests[2].body)).toBe(1);
-        expect(gateway.chatRequests[3].body).toContain("FX LOGO");
-        expect(gateway.chatRequests[3].body).not.toContain(forbiddenContents);
+        const rejectedCall = JSON.parse(gateway.chatRequests[2].body).prompt
+          .flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : [])
+          .find((part: { toolCallId?: string; type?: string }) => part.type === "tool-call" && part.toolCallId === "non_object_before_vision");
+        expect(rejectedCall.input).toEqual({});
+        expect(gateway.chatRequests[3].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
+        expect(filePartCount(gateway.chatRequests[3].body)).toBe(1);
+        expect(gateway.chatRequests[4].body).toContain("FX LOGO");
+        expect(gateway.chatRequests[4].body).not.toContain(forbiddenContents);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1051,6 +1071,7 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
         expect(gateway.chatRequests[0].body).toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
         expectScopedImageContext(gateway.chatRequests[0].body, fixture);
         expect(gateway.chatRequests[0].body).not.toContain(fixture.imagePath);
       } finally {
@@ -1062,71 +1083,39 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask normalizes encoded-oversized native images on macOS and rejects elsewhere",
+    "fx ask uses Kimi native vision without Vision tool",
     async () => {
       const root = createIsolatedRoot();
-      const oversizedPath = join(root.workspace, "encoded-oversized.png");
-      copyFileSync(IMAGE_PATH, oversizedPath);
-      truncateSync(oversizedPath, (5 * 1024 * 1024 * 3) / 4 + 1);
-      const notice = "Unable to prepare this image for upload. Use a smaller image.";
-      const gateway = startImageGateway(
-        process.platform === "darwin" ? [sseText("Normalized native image answer")] : [],
-      );
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway([sseText("Kimi native image answer")]);
       try {
-        if (process.platform === "darwin") {
-          const result = await runFx(
-            [
-              "ask",
-              "--json",
-              "--no-save",
-              "--no-color",
-              "--image",
-              oversizedPath,
-              "Describe the attached image.",
-            ],
-            {
-              cwd: root.workspace,
-              env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-              timeoutMs: TIMEOUT,
-            },
-          );
-
-          const json = parseFxJson(result);
-          expect(json.output).toContain("Normalized native image answer");
-          expect(json.tool_calls).toHaveLength(0);
-          expect(result.stderr).toBe("");
-          expect(gateway.chatRequests).toHaveLength(1);
-          const parts = nativeFileParts(gateway.chatRequests[0]!.body);
-          expect(parts).toHaveLength(1);
-          expect(parts[0]!.mediaType).toBe("image/jpeg");
-          expect(parts[0]!.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
-          return;
-        }
-
-        const textResult = await runFx(
-          ["ask", "--no-save", "--image", oversizedPath, "Describe the image."],
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
           {
             cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
             timeoutMs: TIMEOUT,
           },
         );
-        expect(textResult.code).toBe(1);
-        expect(textResult.stdout).toBe("");
-        expect(textResult.stderr).toContain(notice);
 
-        const jsonResult = await runFx(
-          ["ask", "--json", "--no-save", "--image", oversizedPath, "Describe the image."],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const errorJson = parseFxErrorJson(jsonResult);
-        expect(errorJson.error).toBe("ImagePreparationFailed");
-        expect(jsonResult.stderr).toBe("");
-        expect(gateway.chatRequests).toHaveLength(0);
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Kimi native image answer");
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(KIMI_MODEL);
+        expect(gateway.chatRequests[0].body).toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
+        expectScopedImageContext(gateway.chatRequests[0].body, fixture);
+        expect(gateway.chatRequests[0].body).not.toContain(fixture.imagePath);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1136,12 +1125,211 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "saved native ID rejection recovers immediately and is filtered after resume",
+    "fx ask withholds byte-oversized native images instead of normalizing or rejecting",
     async () => {
       const root = createIsolatedRoot();
-      const fixture = createScopedImageFixture(root);
+      const oversizedPath = join(root.workspace, "encoded-oversized.png");
+      copyFileSync(IMAGE_PATH, oversizedPath);
+      truncateSync(oversizedPath, (5 * 1024 * 1024 * 3) / 4 + 1);
+      const gateway = startImageGateway([sseText("Byte-oversized native image answer")]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            oversizedPath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Byte-oversized native image answer");
+        expect(json.tool_calls).toHaveLength(0);
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain("This request permits at most 8000 per side and 5 MiB encoded per image.");
+        expect(body).toContain("The original is saved at ");
+        expect(body).toContain("then read_file the copy.");
+        expect(result.stderr).toBe("");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask sends single-request native PNG images byte-for-byte below the 8000-pixel limit",
+    async () => {
+      const root = createIsolatedRoot();
+      const widePath = join(root.workspace, "wide-screenshot.png");
+      const original = solidPng(3420, 2224);
+      writeFileSync(widePath, original);
+      const gateway = startImageGateway([sseText("Wide native image answer")]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            widePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.output).toContain("Wide native image answer");
+        expect(result.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const parts = nativeFileParts(gateway.chatRequests[0]!.body);
+        expect(parts).toHaveLength(1);
+        expect(parts[0]!.mediaType).toBe("image/png");
+        expect(parts[0]!.data.data).toBe(original.toString("base64"));
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
+      const gateway = startImageGateway([sseText("Photo note answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--no-save", "--image", photoPath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Photo note answer");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain(
+          "Use an available image tool to save a smaller copy to a new file ending in .jpg, then read_file the copy.",
+        );
+        expect(result.stderr).toBe("");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "tmux consumes /image when its pasted path becomes a prompt attachment",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
       const gateway = startImageGateway([
-        sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision"),
+        sseText("TUI oversized image recovery answer"),
+        sseText("TUI pasted slash image answer"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      let session: TmuxSession | null = null;
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            FX_AUTO_UPGRADE: "0",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendLiteral("/image ");
+        await session.pasteText(photoPath);
+        const draft = await session.captureFullScrollback();
+        expect(draft).toContain("[Image 1]");
+        expect(draft).not.toContain("/image ");
+        await session.sendText(" Describe the attached image.");
+        await session.waitForText("TUI oversized image recovery answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).toContain("TUI oversized image recovery answer");
+        expect(scrollback).not.toContain("An attached image was not sent");
+        expect(scrollback).not.toContain("[Image #1 not sent");
+
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain("then read_file the copy.");
+
+        await session.pasteText(`/image ${photoPath}`);
+        const secondDraft = await session.captureFullScrollback();
+        expect(secondDraft).toContain("[Image 2]");
+        expect(secondDraft).not.toContain("/image ");
+        await session.sendText(" Describe the second image.");
+        await session.waitForText("TUI pasted slash image answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        expect(gateway.chatRequests).toHaveLength(2);
+        expect(nativeFileParts(gateway.chatRequests[1]!.body)).toHaveLength(0);
+        expect(gateway.chatRequests[1]!.body).toContain("then read_file the copy.");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test.each(["plain", "prose-replay", "mixed-replay"] as const)(
+    "saved unadvertised native Vision rejection recovers and is filtered after resume (%s)",
+    async (shape) => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      if (shape === "mixed-replay") writeFileSync(join(root.workspace, "notes.txt"), "VISION_READ_SENTINEL\n");
+      const gateway = startImageGateway([
+        shape === "plain" ? sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision") : fakeGatewaySse([
+          { type: "reasoning-start", id: "reasoning" },
+          { type: "reasoning-delta", id: "reasoning", delta: "Inspect the available evidence." },
+          { type: "reasoning-end", id: "reasoning", providerMetadata: { vertex: { thoughtSignature: "retained-reasoning-signature" } } },
+          ...(shape === "prose-replay" ? [{ type: "text-delta", id: "intro", delta: "I will inspect the image." }] : []),
+          { type: "tool-call", toolCallId: "native_vision", toolName: "vision", input: { image_ids: [1], focus: "inspect" }, providerMetadata: { vertex: { thoughtSignature: "removed-vision-signature" } } },
+          ...(shape === "mixed-replay" ? [{ type: "tool-call", toolCallId: "retained_read", toolName: "read_file", input: { path: "notes.txt" }, providerMetadata: { vertex: { thoughtSignature: "retained-read-signature" } } }] : []),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
         sseText("Gemini recovered after rejected Vision"),
         sseText("Gemini continued without historical Vision evidence"),
       ]);
@@ -1170,8 +1358,7 @@ describe("Vision route fake Gateway", () => {
         expect(first.stderr).not.toContain("Inspecting images");
         expect(first.stderr).not.toContain("Vision is unavailable right now");
         expect(gateway.chatRequests).toHaveLength(2);
-        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
-        expect(gateway.chatRequests[0].body).toContain('"paths":{"type":"array"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
         expect(gateway.chatRequests[0].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[0].body).toContain('"type":"file"');
 
@@ -1199,6 +1386,9 @@ describe("Vision route fake Gateway", () => {
         });
         expect(rejectionOutput as string).not.toContain(fixture.imagePath);
         expect(filePartCount(recoveryRequest.body)).toBe(1);
+        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "events.jsonl");
+        const originalEvents = readFileSync(eventsPath, "utf8");
+        if (shape !== "plain") expect(originalEvents).toContain("removed-vision-signature");
 
         const resumed = await runFx(
           [
@@ -1226,12 +1416,22 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(3);
         const resumedRequest = gateway.chatRequests[2];
         expect(filePartCount(resumedRequest.body)).toBe(1);
-        expect(resumedRequest.body).toContain('"name":"vision"');
-        expect(resumedRequest.body).toContain('"paths":{"type":"array"');
+        expect(resumedRequest.body).not.toContain('"name":"vision"');
         expect(resumedRequest.body).not.toContain('"toolChoice":{"type":"required"}');
         expect(resumedRequest.body).not.toContain('"toolName":"vision"');
         expect(resumedRequest.body).not.toContain("native_vision");
         expect(resumedRequest.body).not.toContain("Vision is unavailable for this request.");
+        expect(resumedRequest.body).not.toContain("removed-vision-signature");
+        if (shape !== "plain") expect(resumedRequest.body).toContain("retained-reasoning-signature");
+        if (shape === "prose-replay") expect(resumedRequest.body).toContain("I will inspect the image.");
+        if (shape === "mixed-replay") {
+          expect(resumedRequest.body).toContain("retained-read-signature");
+          expect(resumedRequest.body).toContain("VISION_READ_SENTINEL");
+          const parts = promptParts(resumedRequest.body);
+          expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(1);
+          expect(parts.filter((part) => part.type === "tool-result")).toHaveLength(1);
+        }
+        expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
         for (const request of gateway.chatRequests) {
           expect(request.headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
           expect(request.body).not.toContain(fixture.imagePath);
@@ -1433,7 +1633,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "text-only GLM ask skips image capability and Vision IO",
+    "text-only GLM ask resolves context capacity and exposes Vision without Vision IO",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([sseText("text only answer")]);
@@ -1450,10 +1650,150 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.exit_code).toBe(0);
         expect(json.output).toContain("text only answer");
-        expect(gateway.catalogRequests).toBe(0);
+        expect(gateway.catalogRequests).toBe(1);
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
         expect(gateway.chatRequests[0].body).not.toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "text-only Kimi ask resolves capability and hides Vision",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startImageGateway([sseText("Kimi text only answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--no-save", "--no-color", "Reply exactly OK."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Kimi text only answer");
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(KIMI_MODEL);
+        expect(gateway.chatRequests[0].body).not.toContain('"type":"file"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "catalog failure hides Vision and rejects unresolved image input",
+    async () => {
+      const textRoot = createIsolatedRoot();
+      const textGateway = startImageGateway(
+        [sseText("text answer without Vision")],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const textResult = await runFx(
+          ["ask", "--json", "--no-save", "--no-color", "Reply exactly OK."],
+          {
+            cwd: textRoot.workspace,
+            env: fakeGatewayEnv(textRoot, textGateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const textJson = parseFxJson(textResult);
+        expect(textJson.exit_code).toBe(0);
+        expect(textJson.output).toContain("text answer without Vision");
+        expect(textGateway.catalogRequests).toBe(1);
+        expect(textGateway.chatRequests).toHaveLength(1);
+        expect(textGateway.chatRequests[0].body).not.toContain('"name":"vision"');
+      } finally {
+        textGateway.stop();
+        rmSync(textRoot.root, { recursive: true, force: true });
+      }
+
+      const imageRoot = createIsolatedRoot();
+      const fixture = createScopedImageFixture(imageRoot);
+      const imageGateway = startImageGateway(
+        [],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const imageResult = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: imageRoot.workspace,
+            env: fakeGatewayEnv(imageRoot, imageGateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const imageJson = parseFxErrorJson(imageResult);
+        expect(imageJson.error).toContain("ModelImageCapabilityUnavailable");
+        expect(imageGateway.catalogRequests).toBe(1);
+        expect(imageGateway.chatRequests).toHaveLength(0);
+      } finally {
+        imageGateway.stop();
+        rmSync(imageRoot.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "catalog failure explains unresolved image capability in text mode",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway(
+        [],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toBe(
+          "fx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
+        );
+        expect(result.stderr).not.toContain("ModelImageCapabilityUnavailable");
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(0);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1613,8 +1953,7 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests[0].body).toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[0].body).toContain("[Image #1]");
         expect(gateway.chatRequests[3].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(gateway.chatRequests[3].body).toContain('"name":"vision"');
-        expect(gateway.chatRequests[3].body).toContain('"paths":{"type":"array"');
+        expect(gateway.chatRequests[3].body).not.toContain('"name":"vision"');
         expect(gateway.chatRequests[3].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(gateway.chatRequests[3].body).not.toContain('"toolName":"vision"');
         expect(gateway.chatRequests[3].body).not.toContain("first image evidence");
@@ -1711,8 +2050,7 @@ describe("Vision route fake Gateway", () => {
         expect(nativeJson.tool_calls).toHaveLength(0);
         expect(gateway.chatRequests).toHaveLength(1);
         expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
-        expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
-        expect(gateway.chatRequests[0].body).toContain('"paths":{"type":"array"');
+        expect(gateway.chatRequests[0].body).not.toContain('"name":"vision"');
         expect(gateway.chatRequests[0].body).not.toContain('"toolChoice":{"type":"required"}');
         expect(filePartCount(gateway.chatRequests[0].body)).toBe(5);
         expect(gateway.chatRequests[0].body).toContain("Legacy first image: [Image #1]");
@@ -2907,3 +3245,120 @@ describe("Vision route fake Gateway", () => {
     30_000,
   );
 });
+
+for (const sourceChange of ["removed", "changed", "saved snapshot missing", "saved snapshot corrupt"] as const) {
+  test(`recovery preserves captured image identity when ${sourceChange}`, async () => {
+    const root = createIsolatedRoot();
+    const input = join(root.workspace, "input.png");
+    const original = writeMarkedImage(input, "ORIGINAL_RECOVERY_INPUT");
+    const digest = createHash("sha256").update(Buffer.from(original, "base64")).digest("hex");
+    const gateway = startImageGateway([
+      sseText("INVALID_FINAL_WITHOUT_VISION"),
+      sseToolCall("vision", { image_ids: [1], focus: "describe" }, "recover_vision"),
+      sseText(VISION_RESULT),
+      sseText("RECOVERY_IMAGE_COMPLETE"),
+    ]);
+    const options = { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT };
+    try {
+      const failed = await runFx(["ask", "--json", "--auto", "--image", input, "Describe the saved image."], options);
+      expect(failed.code).toBe(1);
+      expect(failed.stdout).toContain("RequiredVisionToolCallMissing");
+      const sessions = join(root.home, ".fx", "sessions");
+      const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
+      expect(id).toBeDefined();
+      const checkpointPath = join(sessions, id, "recovery.json");
+      const checkpointBytes = readFileSync(checkpointPath);
+      const image = JSON.parse(checkpointBytes.toString()).checkpoint.user.images[0];
+      const snapshot = join(sessions, id, image.snapshot_path);
+      expect(image.id).toBe(1);
+      expect(image.snapshot_sha256).toBe(digest);
+      expect(readFileSync(snapshot).toString("base64")).toBe(original);
+      if (sourceChange === "removed") rmSync(input);
+      else if (sourceChange === "changed") writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
+      else if (sourceChange === "saved snapshot missing") rmSync(snapshot);
+      else writeFileSync(snapshot, "corrupted saved bytes");
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "--continue-recovery"], options);
+      if (sourceChange.startsWith("saved snapshot")) {
+        expect(resumed.code).toBe(1);
+        expect(resumed.stdout).toContain(sourceChange.endsWith("missing") ? "MissingImageSnapshot" : "ImageSnapshotCorrupt");
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(readFileSync(checkpointPath).equals(checkpointBytes)).toBe(true);
+        return;
+      }
+      expect(parseFxJson(resumed).output).toContain("RECOVERY_IMAGE_COMPLETE");
+      expect(gateway.chatRequests).toHaveLength(4);
+      const parts = nativeFileParts(gateway.chatRequests[2]!.body);
+      expect(parts).toHaveLength(1);
+      expect(createHash("sha256").update(Buffer.from(parts[0]!.data.data, "base64")).digest("hex")).toBe(digest);
+      const history = readFileSync(join(sessions, id, "events.jsonl"), "utf8");
+      expect(history).toContain(digest);
+      expect(readFileSync(snapshot).toString("base64")).toBe(original);
+      expect(existsSync(checkpointPath)).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+}
+
+test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and cold restart", async () => {
+  const root = createIsolatedRoot();
+  const input = join(root.workspace, "input.png");
+  const original = writeMarkedImage(input, "TUI_RECOVERY_INPUT");
+  const gateway = startImageGateway([
+    sseText("INVALID_FINAL_WITHOUT_VISION"),
+    sseToolCall("vision", { image_ids: [1], focus: "describe" }, "recover_vision"),
+    sseText(VISION_RESULT),
+    sseText("TUI_RECOVERY_IMAGE_COMPLETE"),
+    sseToolCall("vision", { image_ids: [2], focus: "describe new image" }, "new_vision"),
+    sseText(visionResult(2, "second image")),
+    sseText("TUI_NEW_IMAGE_COMPLETE"),
+  ]);
+  let session: TmuxSession | null = null;
+  const env = fakeGatewayEnv(root, gateway, GLM_MODEL);
+  try {
+    session = await TmuxSession.create({ cmd: FX_BIN, cwd: root.workspace, env, isolated: true, remainOnExit: true });
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText(`/image ${input}`);
+    await session.waitForText("attached image:", TIMEOUT);
+    await session.sendText("Describe this image.");
+    await session.waitForText("RequiredVisionToolCallMissing", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    const sessions = join(root.home, ".fx", "sessions");
+    const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
+    const checkpoint = JSON.parse(readFileSync(join(sessions, id, "recovery.json"), "utf8")).checkpoint;
+    const snapshot = join(sessions, id, checkpoint.user.images[0].snapshot_path);
+    expect(readFileSync(snapshot).toString("base64")).toBe(original);
+    await session.sendText("/quit");
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect(session.paneStatus().status).toBe(0);
+    await session.kill();
+    session = null;
+    rmSync(input);
+    session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
+    await session.waitForStableComposer(TIMEOUT);
+    // A pending recovery checkpoint continues automatically on resume.
+    await session.waitForText(/continues\s+automatically/, TIMEOUT);
+    await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);
+    writeMarkedImage(input, "NEW_IMAGE_AFTER_RECOVERY");
+    await session.sendText(`/image ${input}`);
+    await session.waitForText("attached image:", TIMEOUT);
+    await session.sendText("Describe the new image.");
+    await session.waitForText("TUI_NEW_IMAGE_COMPLETE", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).not.toContain("ImageSnapshotPathUnsafe");
+    expect(scrollback).not.toContain("DuplicateImageId");
+    expect(gateway.chatRequests).toHaveLength(7);
+    await session.sendText("/quit");
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect(session.paneStatus().status).toBe(0);
+    expect(readFileSync(snapshot).toString("base64")).toBe(original);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);

@@ -1089,10 +1089,7 @@ function isFooterHintRow(line: string): boolean {
 function hasTranscriptViewerFooter(grid: string[]): boolean {
   for (let row = 0; row + 2 < grid.length; row += 1) {
     const navigation = semanticText(grid[row] ?? "").trim();
-    if (
-      navigation !== "┃ Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close" &&
-      navigation !== "┃ Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close"
-    ) {
+    if (navigation !== "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close") {
       continue;
     }
     if (isSemanticBlank(grid[row + 1] ?? "") && isFooterHintRow(grid[row + 2] ?? "")) {

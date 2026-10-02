@@ -73,6 +73,10 @@ pub const ResumeProjection = struct {
         return entry_id;
     }
 
+    pub fn setCreatedAtMs(self: *ResumeProjection, created_at_ms: i64) void {
+        if (created_at_ms > 0) self.created_at_ms = created_at_ms;
+    }
+
     pub fn appendNotice(self: *ResumeProjection, notice: types.SemanticNotice) !u32 {
         const owned = try types.dupeSemanticNotice(self.alloc, notice);
         errdefer types.freeSemanticNotice(self.alloc, owned);
@@ -187,6 +191,10 @@ pub const ResumeProjection = struct {
         } });
     }
 
+    pub fn appendTurnSummary(self: *ResumeProjection, summary: types.TurnSummary) !void {
+        _ = try self.runtime.appendTurnSummaryEntry(self.alloc, summary);
+    }
+
     pub fn appendCommandOutput(
         self: *ResumeProjection,
         lifecycle_id: ?types.ToolLifecycleId,
@@ -233,6 +241,20 @@ pub const ResumeProjection = struct {
             call,
             activity_kind,
             result,
+        );
+    }
+
+    pub fn setHistoricalToolCommandMetadata(
+        self: *ResumeProjection,
+        entry_id: u32,
+        display: []const u8,
+        action_label: []const u8,
+    ) !void {
+        try self.runtime.setToolCommandMetadataForEntry(
+            self.alloc,
+            entry_id,
+            display,
+            action_label,
         );
     }
 
@@ -314,7 +336,7 @@ pub const ResumeProjection = struct {
         const wrapped = try diff.wrapWithMarkers(c_alloc, id, payload.preview);
         defer c_alloc.free(wrapped);
         _ = try self.appendRawClassified(wrapped, .diff_block);
-        try self.pending_diffs.append(c_alloc, .{ .id = id, .full = payload.full });
+        try self.pending_diffs.append(c_alloc, .{ .id = id, .full = payload.full, .deferred = payload.deferred });
         c_alloc.free(payload.preview);
         owns_payload = false;
         self.next_diff_id += 1;
@@ -666,6 +688,35 @@ test "resume projection uses its explicit timestamp for command output" {
         command_entries += 1;
     }
     try std.testing.expect(command_entries > 0);
+}
+
+test "resume projection preserves turn timestamps and usage rows" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout.cols = 80;
+    defer source.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    projection.setCreatedAtMs(100);
+    _ = try projection.appendUserTurn(.{ .text = @constCast("prompt") });
+    projection.setCreatedAtMs(250);
+    try projection.appendAssistantText("response");
+    const summary = types.TurnSummary{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+    try projection.appendTurnSummary(summary);
+
+    try std.testing.expectEqual(@as(i64, 100), projection.runtime.entries.items[0].createdAtMs());
+    try std.testing.expectEqual(@as(i64, 250), projection.runtime.entries.items[1].createdAtMs());
+    try std.testing.expectEqual(@as(i64, 250), projection.runtime.entries.items[2].createdAtMs());
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.turn_summary,
+        projection.runtime.entries.items[2].raw_bytes.class,
+    );
 }
 
 test "live resume projection preserves an incomplete command block" {

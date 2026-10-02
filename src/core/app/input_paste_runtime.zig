@@ -1,4 +1,5 @@
 const std = @import("std");
+const file_picker_path = @import("../input/file_picker_path.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -23,6 +24,30 @@ fn normalizeApprovalAmendmentPasteInPlace(bytes: []u8) []u8 {
     return normalized;
 }
 
+fn isBareImageSlashPrefix(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    return std.mem.eql(u8, trimmed, "/image") or std.mem.eql(u8, trimmed, "/img");
+}
+
+fn pastedImageSlashPrefixLen(text: []const u8) ?usize {
+    const trimmed = std.mem.trimStart(u8, text, " \t");
+    for ([_][]const u8{ "/image", "/img" }) |command| {
+        if (!std.mem.startsWith(u8, trimmed, command)) continue;
+        var index = text.len - trimmed.len + command.len;
+        if (index >= text.len or (text[index] != ' ' and text[index] != '\t')) continue;
+        while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
+        return index;
+    }
+    return null;
+}
+
+test "bare image slash prefix excludes image paths and other commands" {
+    try std.testing.expect(isBareImageSlashPrefix("/image "));
+    try std.testing.expect(isBareImageSlashPrefix("  /img\t"));
+    try std.testing.expect(!isBareImageSlashPrefix("/image photo.png"));
+    try std.testing.expect(!isBareImageSlashPrefix("/images clear"));
+}
+
 const ImagePasteStage = struct {
     replacement: std.ArrayList(u8) = .empty,
     images: std.ArrayList(types.ImageAttachment) = .empty,
@@ -37,6 +62,37 @@ const ImagePasteStage = struct {
         self.tokens.deinit(alloc);
     }
 };
+
+fn stripPastedImageSlashPrefix(stage: *ImagePasteStage) bool {
+    const prefix_len = pastedImageSlashPrefixLen(stage.replacement.items) orelse return false;
+    if (stage.tokens.items.len == 0 or stage.tokens.items[0].span.raw_start != prefix_len) return false;
+
+    const remaining = stage.replacement.items.len - prefix_len;
+    std.mem.copyForwards(u8, stage.replacement.items[0..remaining], stage.replacement.items[prefix_len..]);
+    stage.replacement.items.len = remaining;
+    for (stage.tokens.items) |*token| {
+        token.span.raw_start -= prefix_len;
+        token.span.raw_end -= prefix_len;
+    }
+    return true;
+}
+
+test "pasted image slash removes only a prefix before a captured path" {
+    const alloc = std.testing.allocator;
+    var stage: ImagePasteStage = .{};
+    defer stage.deinit(alloc);
+    try stage.replacement.appendSlice(alloc, "/image [Image #1] Describe");
+    try stage.tokens.append(alloc, .{ .id = 1, .span = .{ .raw_start = 7, .raw_end = 17 } });
+    try std.testing.expect(stripPastedImageSlashPrefix(&stage));
+    try std.testing.expectEqualStrings("[Image #1] Describe", stage.replacement.items);
+    try std.testing.expectEqual(entity_spans.Span{ .raw_start = 0, .raw_end = 10 }, stage.tokens.items[0].span);
+
+    stage.replacement.clearRetainingCapacity();
+    stage.tokens.clearRetainingCapacity();
+    try stage.replacement.appendSlice(alloc, "/image missing.png");
+    try std.testing.expect(!stripPastedImageSlashPrefix(&stage));
+    try std.testing.expectEqualStrings("/image missing.png", stage.replacement.items);
+}
 
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
@@ -83,6 +139,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 debug_trace.logf(
                     "input",
                     "event=esc_clear_disarmed reason=pending_gesture_reset",
+                    .{},
+                );
+            }
+            if (gesture_reset.cleared_escape_interrupt) {
+                debug_trace.logf(
+                    "input",
+                    "event=esc_interrupt_disarmed reason=pending_gesture_reset",
                     .{},
                 );
             }
@@ -289,14 +352,28 @@ pub fn PasteEditRuntime(comptime App: type) type {
             }
         }
 
+        /// The model picker lends the composer out as its query box: the
+        /// catalog, then a Ctrl+P flow's inline stages. An image attached
+        /// there would outlive the query, so image input stays out of it.
+        pub fn modelPickerBorrowsComposer(app: *const App) bool {
+            if (comptime @hasField(@TypeOf(app.input_runtime), "model_picker_draft")) {
+                if (app.input_runtime.model_picker_draft != null) return true;
+            }
+            if (comptime !@hasField(App, "model_cache")) return false;
+            return app.model_cache.menu.active;
+        }
+
         pub fn finalizePastedBlock(app: *App, max_input_len: usize) !void {
             if (app.input_runtime.paste.buffer.items.len == 0) return;
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
-                try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
-                app.input_runtime.paste.buffer.clearRetainingCapacity();
-                return;
+                if (!modelPickerBorrowsComposer(app)) {
+                    try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
+                    app.input_runtime.paste.buffer.clearRetainingCapacity();
+                    return;
+                }
+                debug_trace.logf("input", "image path paste kept as text reason=model_picker_borrows_composer", .{});
             }
 
             const text = try app.alloc.dupe(u8, app.input_runtime.paste.buffer.items);
@@ -379,10 +456,10 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 i = image_attachments.nextShellTokenEnd(bytes, start);
                 const raw = bytes[start..i];
                 if (image_attachments.splitImagePathToken(raw)) |token| {
-                    const maybe_img = image_attachments.loadUserImageAttachment(
+                    const maybe_img = image_attachments.load_inline_image_attachment(
                         app.alloc,
                         app.workspace_root,
-                        token.path,
+                        token,
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         error.ImageTooLarge => blk: {
@@ -429,6 +506,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 }
             }
             try stage.replacement.appendSlice(app.alloc, bytes[prev..]);
+            if (app.input_runtime.edit_state.input.items.len == 0 and
+                app.pending_images.items.len == 0 and
+                stripPastedImageSlashPrefix(&stage))
+            {
+                debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_slash_command", .{});
+            }
 
             const image_count = stage.images.items.len;
             const start = if (app.input_runtime.edit_state.selectionRange()) |selection|
@@ -487,7 +570,15 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 );
             }
 
-            const structured_start = start;
+            const consume_image_slash = app.pending_images.items.len == 0 and
+                app.input_runtime.edit_state.selectionRange() == null and
+                start == app.input_runtime.edit_state.input.items.len and
+                isBareImageSlashPrefix(app.input_runtime.edit_state.input.items);
+            if (consume_image_slash) {
+                debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_image_attachment", .{});
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            }
+            const structured_start: usize = if (consume_image_slash) 0 else start;
             std.debug.assert(try replacement.replaceSelectionOrInsertSliceBounded(
                 app.alloc,
                 stage.replacement.items,
@@ -547,7 +638,19 @@ pub fn PasteEditRuntime(comptime App: type) type {
             const input = app.input_runtime.edit_state.input.items;
             var index = @min(start, input.len);
             const limit = @min(end, input.len);
+            var paths: file_picker_path.Iterator = .{ .text = input };
+            var protected = paths.next();
             while (index < limit) : (index += 1) {
+                while (protected) |path| {
+                    if (index < path.end) break;
+                    protected = paths.next();
+                }
+                if (protected) |path| {
+                    if (index >= path.start) {
+                        index = path.end - 1;
+                        continue;
+                    }
+                }
                 if (input[index] != '$') continue;
                 const query_start = index + 1;
                 const query_end = skillTokenEnd(input, query_start);

@@ -8,6 +8,11 @@ pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";
+/// Side folders older v2 sessions kept (D27): v1's per-session layout, one
+/// folder per session id. A session moves out on its first open (D47).
+pub const session_files_dir_name = "session-files";
+/// Hosted terminal state of v2 sessions, one folder per session id (D45).
+pub const terminal_dir_name = "terminal";
 pub const prompt_history_file_name = "history.jsonl";
 pub const usage_file_name = "usage.jsonl";
 pub const usage_recovery_dir_name = "usage-recovery";
@@ -18,7 +23,6 @@ pub const mcp_credentials_file_name = "credentials.json";
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
 const managed_skills_dir_name = "skills";
-const memories_file_name = "memories.json";
 const logs_dir_name = "logs";
 const trace_log_file_name = "trace.log";
 const recordings_dir_name = "recordings";
@@ -60,10 +64,6 @@ pub fn chatgptAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, chatgpt_auth_file_name });
 }
 
-pub fn grokAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, root_dir_name, grok_auth_file_name });
-}
-
 pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, api_key_file_name });
 }
@@ -76,10 +76,6 @@ pub fn promptHistoryPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, prompt_history_file_name });
 }
 
-pub fn memoriesPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, root_dir_name, memories_file_name });
-}
-
 pub fn backupsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, backups_dir_name });
 }
@@ -90,6 +86,13 @@ pub fn logsDir(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn traceLogPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, logs_dir_name, trace_log_file_name });
+}
+
+pub const diagnostics_dir_name = "diagnostics";
+pub const last_shutdown_report_file_name = "last-shutdown.json";
+
+pub fn lastShutdownReportPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, diagnostics_dir_name, last_shutdown_report_file_name });
 }
 
 pub fn recordingsDir(alloc: Allocator, home: []const u8) ![]u8 {
@@ -148,10 +151,6 @@ test "profile path helpers preserve current default locations" {
     const history = try promptHistoryPath(alloc, "/tmp/fake-home");
     defer alloc.free(history);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/history.jsonl", history);
-
-    const memories = try memoriesPath(alloc, "/tmp/fake-home");
-    defer alloc.free(memories);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/memories.json", memories);
 
     const backups = try backupsDir(alloc, "/tmp/fake-home");
     defer alloc.free(backups);
