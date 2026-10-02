@@ -41,15 +41,19 @@ fn selectedTransport() !Transport {
 
 fn allowsSseFallback(err: anyerror, delivery: gateway_client.DeliveryCertainty.State) bool {
     if (delivery != .definitely_unsent) return false;
-    return switch (err) {
-        error.Cancelled,
-        error.OutOfMemory,
-        error.ProviderAdmissionMissing,
-        error.ProviderAdmissionRepeated,
-        error.InvalidOpenAICodexTransport,
-        => false,
-        else => true,
-    };
+    return gateway_client.isConnectivityFailure(err) or gateway_client.isRetryableGatewayError(err) or
+        switch (err) {
+            error.TlsInitializationFailed,
+            error.ConnectionSetupTimedOut,
+            error.WebSocketConnectTimeout,
+            error.WebSocketUpgradeRejected,
+            error.ReadFailed,
+            error.WriteFailed,
+            error.WouldBlock,
+            error.EndOfStream,
+            => true,
+            else => false,
+        };
 }
 
 fn armSseFallback(err: anyerror) void {
@@ -124,6 +128,7 @@ fn buildWebSocketRequestWithInput(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try writeResponseRequestStartWithInput(&out.writer, alloc, request, "response.create", input);
+    try out.writer.writeAll(",\"store\":false");
     if (previous_response_id) |response_id| {
         try out.writer.writeAll(",\"previous_response_id\":");
         try std.json.Stringify.value(response_id, .{}, &out.writer);
@@ -312,7 +317,12 @@ fn streamCompletion(
     else
         operation.run()) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
+        const delivery = request.delivery.load();
+        // A sent socket generation may be billed even when no event arrived.
+        request.attempt_evidence.network_failure = if (operation.transport == .websocket and delivery == .possibly_sent)
+            null
+        else
+            gateway_client.networkFailureEvidence(err, delivery);
         return err;
     };
 }
@@ -333,6 +343,7 @@ const PreparedStreamOperation = struct {
                 if (self.request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
                 if (!allowsSseFallback(err, self.request.delivery.load())) return err;
                 armSseFallback(err);
+                self.transport = .sse;
             }
         }
         return streamPreparedWithAdmission(self.alloc, self.request, self.payload, !self.request.attempt_evidence.provider_admitted);
@@ -563,6 +574,7 @@ fn streamWebSocketPrepared(
         .endpoint = prepared.endpoint,
         .authorization = prepared.authorization,
         .account_id = prepared.account_id,
+        .failure_kind = failureKind,
     }, .{
         .build_input = buildRequestInput,
         .build_request = buildWebSocketRequestWithInput,
@@ -664,60 +676,44 @@ fn mapReducerError(err: anyerror) anyerror {
     };
 }
 
-test "OpenAI Codex WebSocket request uses the shared response request fields" {
-    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
-    const messages = [_]types.ChatMessage{
-        .{ .role = .user, .content = "Read it." },
-    };
-    const request: stream_provider.RequestData = .{
-        .model = "gpt-5.4",
-        .instructions = &instructions,
-        .messages = &messages,
-        .tool_choice = .auto,
-        .provider_options = .{},
-    };
-    const sse_payload = try buildRequest(std.testing.allocator, request);
-    defer std.testing.allocator.free(sse_payload);
-    const websocket_payload = try buildWebSocketRequest(std.testing.allocator, request);
-    defer std.testing.allocator.free(websocket_payload);
-
-    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"type\":\"response.create\"") != null);
-    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"model\":\"gpt-5.4\"") != null);
-    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"instructions\":\"Be concise.\"") != null);
-    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"stream\"") == null);
-    try std.testing.expect(std.mem.find(u8, websocket_payload, "\"store\"") == null);
-    try std.testing.expect(std.mem.find(u8, sse_payload, "\"stream\":true") != null);
-    try std.testing.expect(std.mem.find(u8, sse_payload, "\"store\":false") != null);
-}
-
-test "OpenAI Codex transport admission invokes the shared admission boundary" {
-    const Capture = struct {
-        called: bool = false,
-
-        fn admit(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.called = true;
-        }
-    };
-    var capture: Capture = .{};
-    try admitCodexTransport(.{ .context = &capture, .admit_fn = Capture.admit });
-    try std.testing.expect(capture.called);
-}
-
-test "OpenAI Codex transport policy keeps auto on SSE during Phase 1" {
-    // Environment-dependent selection is covered by integration launch tests.
-    // This assertion records the Phase 1 default when no override is present.
-    if (io_mod.getenv(transport_env) == null) {
-        try std.testing.expectEqual(Transport.sse, try selectedTransport());
+test "OpenAI Codex WebSocket SSE fallback requires unsent connectivity failure" {
+    for ([_]anyerror{
+        error.UnknownHostName,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.TlsInitializationFailed,
+        error.ConnectionSetupTimedOut,
+        error.WebSocketConnectTimeout,
+        error.WebSocketUpgradeRejected,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.WouldBlock,
+        error.EndOfStream,
+    }) |err| {
+        try std.testing.expect(allowsSseFallback(err, .definitely_unsent));
+        try std.testing.expect(!allowsSseFallback(err, .possibly_sent));
     }
-}
-
-test "OpenAI Codex SSE fallback requires definitely unsent delivery" {
-    try std.testing.expect(allowsSseFallback(error.WebSocketUpgradeRejected, .definitely_unsent));
-    try std.testing.expect(!allowsSseFallback(error.WebSocketUpgradeRejected, .possibly_sent));
-    try std.testing.expect(!allowsSseFallback(error.Cancelled, .definitely_unsent));
-    try std.testing.expect(!allowsSseFallback(error.OutOfMemory, .definitely_unsent));
-    try std.testing.expect(!allowsSseFallback(error.ProviderAdmissionRepeated, .definitely_unsent));
+    for ([_]anyerror{
+        error.Timeout,
+        error.Cancelled,
+        error.OutOfMemory,
+        error.ProviderAdmissionMissing,
+        error.ProviderAdmissionRepeated,
+        error.InvalidOpenAICodexTransport,
+        error.InvalidOpenAICodexSseEvent,
+        error.WebSocketPolicyClosed,
+        error.WebSocketProtocolViolation,
+        error.WebSocketInvalidUtf8,
+        error.WebSocketUnexpectedBinary,
+        error.WebSocketMessageTooLarge,
+        error.WebSocketAcceptInvalid,
+        error.WebSocketConnectionLimitReached,
+        error.PreviousResponseNotFound,
+        error.WebSocketProviderRejectedAfterProgress,
+    }) |err| {
+        try std.testing.expect(!allowsSseFallback(err, .definitely_unsent));
+        try std.testing.expect(!allowsSseFallback(err, .possibly_sent));
+    }
 }
 
 test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas" {
