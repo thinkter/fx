@@ -819,10 +819,19 @@ const StalledWriteFixture = struct {
         if (self.thread) |thread| {
             const listener = std.Io.net.Stream{ .socket = self.server.socket };
             listener.shutdown(self.io(), .both) catch {};
+            self.wake_accept();
             thread.join();
             self.thread = null;
         }
         self.server.deinit(self.io());
+    }
+
+    fn wake_accept(self: *@This()) void {
+        var wake_io_backend: std.Io.Threaded = .init_single_threaded;
+        const zio = wake_io_backend.io();
+        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.server.socket.address.getPort()) };
+        var wake_stream = address.connect(zio, .{ .mode = .stream }) catch return;
+        wake_stream.close(zio);
     }
 
     fn run(self: *@This()) void {
@@ -1012,6 +1021,8 @@ const LoopbackWebSocketFixture = struct {
         if (self.thread) |thread| {
             const listener = std.Io.net.Stream{ .socket = self.server.socket };
             listener.shutdown(self.io(), .both) catch {};
+            // Darwin listener shutdown does not release a blocked accept.
+            self.wake_accept();
             thread.join();
             self.thread = null;
         }
@@ -1023,6 +1034,14 @@ const LoopbackWebSocketFixture = struct {
             if (peer.thread) |thread| thread.join();
         }
         self.server.deinit(self.io());
+    }
+
+    fn wake_accept(self: *@This()) void {
+        var wake_io_backend: std.Io.Threaded = .init_single_threaded;
+        const zio = wake_io_backend.io();
+        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.server.socket.address.getPort()) };
+        var wake_stream = address.connect(zio, .{ .mode = .stream }) catch return;
+        wake_stream.close(zio);
     }
 
     fn hold(self: *@This()) void {
