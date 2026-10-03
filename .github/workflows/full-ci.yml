@@ -31,4 +31,4 @@ jobs:
       - run: bun install --frozen-lockfile
         working-directory: tests/e2e
       - name: Trace permission input and committed frames
-        run: bun test --preload ./fx-fixture-diagnostic-preload.ts --max-concurrency 1 --rerun-each 10 tests/e2e/tui-permissions.test.ts --test-name-pattern 'diff counts are monochrome'
+        run: bun test --preload ./fx-fixture-diagnostic-preload.ts --max-concurrency 1 --rerun-each 3 tests/e2e/tui-permissions.test.ts
