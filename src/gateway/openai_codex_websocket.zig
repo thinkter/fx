@@ -270,7 +270,7 @@ const WebSocketBridge = struct {
         return self.observed_progress or reducer.response_started or
             reducer.text_bytes != 0 or reducer.content.items.len != 0 or
             reducer.tools.items.len != 0 or reducer.reasoning_items.items.len != 0 or
-            reducer.reasoning_bytes != 0;
+            reducer.message_items.items.len != 0 or reducer.reasoning_bytes != 0;
     }
 
     fn rejection_result(self: *const @This(), config: ConnectionConfig, status: u16) !stream_provider.Result {

@@ -1034,7 +1034,7 @@ interface CodexWebSocketFixtureOptions {
   rejection?: {
     code: "previous_response_not_found" | "websocket_connection_limit_reached" | "wrapped_status";
     requests: number[];
-    progress?: "content" | "reasoning" | "tool-start" | "response.created";
+    progress?: "content" | "reasoning" | "tool-start" | "message-start" | "response.created";
     status?: number;
     statusField?: "status" | "status_code";
   };
@@ -1153,6 +1153,12 @@ function startFakeCodexWebSocket(options: CodexWebSocketFixtureOptions = {}) {
               type: "response.output_item.added",
               output_index: 0,
               item: { type: "function_call", call_id: "call_rejected", name: "read_file" },
+            }));
+          } else if (rejection.progress === "message-start") {
+            ws.send(JSON.stringify({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { type: "message", id: "msg_started", role: "assistant", content: [] },
             }));
           } else if (rejection.progress === "response.created") {
             ws.send(JSON.stringify({ type: "response.created", response: { id: "resp_started", status: "in_progress" } }));
@@ -6996,7 +7002,7 @@ for (const code of ["previous_response_not_found", "websocket_connection_limit_r
     }
   }, 60_000);
 
-  for (const progress of ["content", "reasoning", "tool-start", "response.created"] as const) {
+  for (const progress of ["content", "reasoning", "tool-start", "message-start", "response.created"] as const) {
     tmuxTest(`Codex WebSocket ${code} after ${progress} retains progress without replay`, async () => {
       home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-progress-rejection-"));
       stderrPath = join(home, "stderr.log");
@@ -7148,6 +7154,46 @@ for (const { status, statusField, cause } of [
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       release();
+      codex.stop();
+    }
+  }, 60_000);
+
+  tmuxTest(`Codex WebSocket wrapped ${status} after message-start never replays accepted generation`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-websocket-message-status-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexWebSocket({
+      rejection: { code: "wrapped_status", requests: [1], progress: "message-start", status, statusField },
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", codex_model: "gpt-5.6-sol",
+      }) + "\n", { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_CODEX_TRANSPORT: "websocket",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(`Do not replay the accepted message before wrapped ${status}.`);
+      await session.waitForText("WebSocketProviderRejectedAfterProgress", TIMEOUT);
+      expect(codex.envelopes).toHaveLength(1);
+      expect(codex.upgradeRequests).toBe(1);
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(0);
+      await session.sendKeys("C-u");
+      await session.sendText("Complete a separate turn after the accepted message rejection.");
+      await session.waitForText("CODEX_WEBSOCKET_OK_2", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      expect(codex.envelopes.map((envelope) => envelope.connectionId)).toEqual([1, 2]);
+      expect(codex.envelopes[1].body.previous_response_id).toBeUndefined();
+      expect(JSON.stringify(codex.envelopes[1].body.input)).toContain("Complete a separate turn");
+      expect(codex.httpResponseRequests).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
       codex.stop();
     }
   }, 60_000);
